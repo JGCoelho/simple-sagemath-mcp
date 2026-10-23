@@ -1,0 +1,213 @@
+{
+  "tools": [
+    {
+      "description": "Run Sage/Python in the long-lived kernel: stdout, then the repr of the last expression (or '(no output)'). Code runs on the kernel's main thread, one job at a time, so cysignals Sage code works; state persists per session. timeout_s is NOT a computation limit: on expiry you get the partial output and a job id, and the job keeps running (collect it with poll). timeout_s=0 returns at once. A submitted job waits behind the running one (\"[queued: another job is running]\"); if that one holds the GIL the submit itself is refused after ~10 s (\"[kernel busy ...]\", the job was not submitted) -- check status or interrupt, then retry.",
+      "inputSchema": {
+        "properties": {
+          "code": {
+            "description": "Code to execute.",
+            "type": "string"
+          },
+          "preparse": {
+            "default": true,
+            "description": "Apply the Sage preparser (2^10 -> 1024, R.<x> = ...). false runs raw Python (2^10 is XOR).",
+            "type": "boolean"
+          },
+          "session": {
+            "default": "default",
+            "description": "Namespace to run in. State persists per session between exec calls.",
+            "type": "string"
+          },
+          "timeout_s": {
+            "default": 120,
+            "description": "Seconds to wait for the result; 0 = return at once. Never cancels the job.",
+            "type": "number"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "type": "object"
+      },
+      "name": "exec"
+    },
+    {
+      "description": "Collect a job started by exec. since = the offset the previous call printed (0 to start), so you get only new output. wait_s blocks until the job finishes or that many seconds pass (0 = return immediately, the default).",
+      "inputSchema": {
+        "properties": {
+          "job_id": {
+            "description": "Job id such as j7.",
+            "type": "string"
+          },
+          "since": {
+            "default": 0,
+            "description": "Character offset already consumed; the previous call prints the next value.",
+            "type": "integer"
+          },
+          "wait_s": {
+            "default": 0,
+            "description": "Block up to this many seconds waiting for the job to finish (0 = return immediately, the default).",
+            "type": "number"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "type": "object"
+      },
+      "name": "poll"
+    },
+    {
+      "description": "Empty a session's namespace but keep the session (see drop).",
+      "inputSchema": {
+        "properties": {
+          "session": {
+            "default": "default",
+            "description": "Namespace to run in. State persists per session between exec calls.",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "reset"
+    },
+    {
+      "description": "Free idle sessions; refuses one with a queued/running job (kept, and the job id is reported). all=true drops every idle session.",
+      "inputSchema": {
+        "properties": {
+          "all": {
+            "default": false,
+            "description": "Drop every session that has no queued/running job.",
+            "type": "boolean"
+          },
+          "sessions": {
+            "description": "Session names to drop.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "drop"
+    },
+    {
+      "description": "Kernel state (running / busy / not running) with pid and uptime, one line per session with its name count, active jobs, the last error, the log path.",
+      "inputSchema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "name": "status"
+    },
+    {
+      "description": "SIGINT the running computation: the job fails with KeyboardInterrupt and the session KEEPS its state -- the first thing to try for a runaway job. Refused when the running job belongs to another MCP client; a no-op when idle: SIGINT can never kill the kernel. force=true is the last resort instead: stop the whole kernel (graceful shutdown, then SIGTERM, then SIGKILL), losing every session's variables -- for a computation that ignores SIGINT, e.g. a wedged C-level loop. The next exec starts a fresh kernel and says so; if the signal fails the state files are kept and the pid reported, so a live kernel is never orphaned.",
+      "inputSchema": {
+        "properties": {
+          "force": {
+            "default": false,
+            "description": "Stop the kernel itself (all state is lost), not just the job.",
+            "type": "boolean"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "name": "interrupt"
+    },
+    {
+      "description": "Run a file that already exists and return its output inline: exit code, duration, stdout and stderr. Nothing is copied or stored -- the file you name is the file that runs, with cwd = its own directory. lang=auto guesses from the extension and honours a #! for executables; lang=python uses Sage's own interpreter (so `from sage.all import *` works) and lang=sage shells out to `sage`. A non-zero exit or a timeout is an error, with the output attached; the timeout kills the whole process group.",
+      "inputSchema": {
+        "properties": {
+          "args": {
+            "description": "Arguments appended to the command line.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "cwd": {
+            "description": "Working directory (default: the file's own directory).",
+            "type": "string"
+          },
+          "lang": {
+            "description": "Interpreter; auto uses the extension, then the #! line.",
+            "enum": [
+              "auto",
+              "bash",
+              "python",
+              "sage",
+              "exec"
+            ],
+            "type": "string"
+          },
+          "path": {
+            "description": "The file to run (absolute or relative to this server's cwd).",
+            "type": "string"
+          },
+          "stdin": {
+            "description": "Text fed to the file on stdin.",
+            "type": "string"
+          },
+          "timeout_s": {
+            "default": 120,
+            "description": "Seconds before the process group is killed.",
+            "type": "number"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "run_file"
+    },
+    {
+      "description": "Jupyter notebook helper for the kernels SageMath ships. check: validate and summarise. extract: print the code cells. clear: strip outputs (atomically). run: execute with nbconvert (atomically, to <name>.out.ipynb unless out/in_place is given) and report how many cells ended in error.",
+      "inputSchema": {
+        "properties": {
+          "action": {
+            "enum": [
+              "check",
+              "run",
+              "clear",
+              "extract"
+            ],
+            "type": "string"
+          },
+          "cell_timeout_s": {
+            "default": 120,
+            "description": "Per-cell execution timeout for run.",
+            "type": "number"
+          },
+          "in_place": {
+            "default": false,
+            "description": "Overwrite the input notebook.",
+            "type": "boolean"
+          },
+          "out": {
+            "description": "Output path for run/clear (default: <name>.out.ipynb for run, the input file for clear).",
+            "type": "string"
+          },
+          "path": {
+            "description": ".ipynb file.",
+            "type": "string"
+          },
+          "timeout_s": {
+            "description": "Overall wall clock budget for run.",
+            "type": "number"
+          }
+        },
+        "required": [
+          "action",
+          "path"
+        ],
+        "type": "object"
+      },
+      "name": "notebook"
+    }
+  ]
+}

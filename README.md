@@ -39,12 +39,12 @@ any registration at any time with `./install.sh --check` or
 | tool | params (required → `*`) | returns |
 | --- | --- | --- |
 | `exec` | `code`*, `session`="default", `timeout_s`=120 (0 = return at once), `preparse`=true | stdout, then the repr of the last expression; on timeout the partial output plus a job id to `poll` |
-| `poll` | `job_id`*, `session`="default", `wait_s`=0, `since`=0 | new output since the offset, ending in `[job finished in 6.0s]` or `[still running 12s; …]` |
+| `poll` | `job_id`*, `wait_s`=0, `since`=0 | new output since the offset, ending in `[job finished in 6.0s]` or `[still running 12s; …]` |
 | `status` | — | kernel/session/job/client state, last error, log path |
 | `interrupt` | `force`=false | `SIGINT` the running job (it fails with `KeyboardInterrupt`, variables are kept); `force=true` stops the kernel and loses them |
 | `reset` / `drop` | `session`; `sessions`=[], `all`=false | empty a namespace; free idle sessions (refuses a busy one) |
 | `run_file` | `path`*, `lang`="auto", `args`=[], `timeout_s`=120, `stdin`, `cwd` | exit code and duration, then stdout/stderr inline; a non-zero exit is an error carrying both |
-| `notebook` | `action`*, `path`*, `out`, `in_place`, `cell_timeout_s`=120 | `check` / `extract` / `clear` / `run`; advertised only when `nbformat`+`nbconvert`+`nbclient` import |
+| `notebook` | `action`*, `path`*, `out`, `in_place`, `cell_timeout_s`=120, `timeout_s` | `check` / `extract` / `clear` / `run`; advertised only when `nbformat`+`nbconvert`+`nbclient` import |
 
 ## Why `poll` exists
 

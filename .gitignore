@@ -12,3 +12,6 @@ venv/
 
 # development log, kept locally only
 PLAN.md
+
+# local implementation workflow (see .workflow/)
+.workflow/
