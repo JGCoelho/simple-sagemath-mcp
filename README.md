@@ -7,7 +7,7 @@ two file tools that need Sage's own environment — `run_file` (execute a file
 the agent already wrote, inline results) and `notebook` (drive the Jupyter
 kernel SageMath ships).
 
-PDFs are a separate server, `pdf-mcp`.
+PDFs are a separate server, `pdf-mcp`.  MIT licensed; Python 3.7+, stdlib only.
 
 Stdio JSON-RPC 2.0, one JSON object per line; every tool result is
 `{"content":[{"type":"text","text":"..."}]}`, failures add `"isError": true`.
@@ -85,9 +85,11 @@ sage_client.py  spawn/lock/connect; KernelBusy vs unreachable; 64 MB read cap
 sage_kernel.py  the long-lived Sage process: main-thread executor + job router
 runfile.py      `run_file`: execute an existing file, output inline, nothing stored
 nbrun.py        `notebook`: check / extract / clear / run (nbconvert, atomic)
+selftest.py     `--check`: spawn, initialize, tools/list, `2+2`, kill -- 7 checks
 tests/acceptance.py            63 checks driving the server over stdio
 tests/interrupt_ownership.sage 10 checks: only a job's own client may SIGINT it
-install.sh      (re)register in mcp.json; drop stale modules from an old install
+install.sh      (re)register in mcp.json, then prove it works; drop stale modules
+pyproject.toml  `pip install .` / `pip install git+...` (MIT, stdlib only)
 ```
 
 `run_file` never writes anything: the agent creates the file with its own
@@ -131,25 +133,55 @@ advertised.
 
 ## Install
 
+Two ways, both ending in the same stdio server:
+
 ```bash
-./install.sh
+pip install git+https://github.com/JGCoelho/simple-sagemath-mcp   # console scripts
+./install.sh                                                      # from a checkout
 ```
 
-It picks the first interpreter that can `import sage.all` (or `$SAGE_PYTHON`),
-copies nothing when the server already lives in the target directory, and then:
+- **pip** installs `simple-sage-mcp` (and `simple-sage-mcp-check`) into
+  whichever environment you pip into. That environment must be Sage's, or point
+  `SAGE_PYTHON` at Sage's interpreter: the console script is only as capable as
+  the kernel it can spawn.
+- **`./install.sh`** picks the first interpreter that can `import sage.all` (or
+  `$SAGE_PYTHON`), copies nothing when the server already lives in the target
+  directory, and then **verifies the result** by spawning the server against a
+  throwaway state dir and running `2+2` through it. If that fails it prints the
+  kernel log and exits non-zero, so a mis-registration cannot pass silently.
 
-- **Pi**: writes the `sage` entry into `~/.pi/agent/mcp.json` and prints the
-  `AGENTS.md` section to paste in. Restart Pi to pick up the new tools.
+Then:
+
+- **Pi**: `install.sh` writes the `sage` entry into `~/.pi/agent/mcp.json` and
+  prints the `AGENTS.md` section to paste in. Restart Pi to pick up the tools.
 - **Any other client**: if there is no `mcp.json` next to the install target, it
   prints the JSON block to add to your client's config (see
   `example.mcp.json`). Point `command` at Sage's python and `args[0]` at
   `sage_mcp.py`; that is the whole configuration.
+- **Afterwards, whenever in doubt** — a different machine, an edited config, an
+  agent reporting trouble:
+
+```bash
+./install.sh --check                       # tests the registration in mcp.json
+python selftest.py --config ~/.config/mcp.json
+simple-sage-mcp-check /path/python /path/sage_mcp.py
+```
+
+`--check` reads the `sage` entry that is actually configured and drives it over
+stdio: spawn, `initialize`, `tools/list`, `exec` of `2+2`, `status`, `kill` —
+7 checks, every failure printed with the kernel log that explains it (the usual
+cause is a `command` that is not Sage's interpreter). It runs against
+`$TMPDIR/sage-selftest-*`, so the live kernel is never touched.
 
 ```bash
 SAGE_PYTHON=/path/to/sage-env/bin/python ./install.sh   # choose the interpreter
 ./install.sh /opt/sage-mcp                              # install elsewhere
 PI_AGENT_DIR=/tmp/fakeagent ./install.sh                # scratch agent dir
 ```
+
+## License
+
+MIT — see `LICENSE`.
 
 ## Configuration
 

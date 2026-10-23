@@ -84,9 +84,11 @@ def resolve_python():
     candidates = [sys.executable]
     sage_bin = shutil.which("sage")
     if sage_bin:
-        candidates.append(
-            os.path.join(os.path.dirname(os.path.realpath(sage_bin)), "python")
-        )
+        # prefix layouts (conda, source builds) call it `python`; distro
+        # packages ship `python3` only, next to the same `sage`
+        beside = os.path.dirname(os.path.realpath(sage_bin))
+        candidates.append(os.path.join(beside, "python"))
+        candidates.append(os.path.join(beside, "python3"))
     for candidate in candidates:
         if candidate and os.path.exists(candidate) and _sage_ish(candidate):
             return os.path.abspath(candidate)
