@@ -1,0 +1,19 @@
+{
+  "_comment": [
+    "Example entry for an MCP client. Replace the two paths with the absolute",
+    "paths on your machine: `command` must be an interpreter that can import",
+    "sage.all (Sage's own python), and `args[0]` is this server's sage_mcp.py.",
+    "On a Debian/Ubuntu sage install that is usually /usr/bin/python3 and",
+    "/opt/sage/bin/sage; with conda it is <env>/bin/python.  install.sh fills",
+    "this in for you."
+  ],
+  "mcpServers": {
+    "sage": {
+      "command": "/path/to/sage-env/bin/python",
+      "args": ["/path/to/sage-mcp/sage_mcp.py"],
+      "env": {
+        "SAGE_CWD": "/tmp"
+      }
+    }
+  }
+}
