@@ -3,15 +3,17 @@
 
 Non-obvious rules encoded here (each one was a bug):
 
-* A **busy** kernel is not a dead kernel.  If the TCP port accepts a
+* A **busy** kernel is not a dead kernel.  If the Unix socket accepts a
   connection but ``hello``/the op times out, the kernel is alive and merely
   holding the GIL inside a computation: raise :class:`KernelBusy` and NEVER
-  respawn (that would orphan a live kernel and start a second one on a new
-  port).
+  respawn (that would orphan a live kernel and start a second one).
+* The socket lives in a directory that must be owned by us and mode 0700.
+  ``/tmp`` is sticky, not protective: another user can create
+  ``/tmp/sage-mcp-<uid>`` first and would then own the socket path.
 * Spawning is serialised with ``O_CREAT|O_EXCL`` on ``spawn.lock``; a second
   client waits for the first one's kernel.  The lock is reclaimed only when its
   mtime is older than the wait budget.
-* Only a port file written *after* this spawn began is trusted
+* Only a state file written *after* this spawn began is trusted
   (``started >= spawn_mark - 5`` plus a pid match).
 * A dead launcher is reported immediately (``proc.poll()``) together with the
   last ~12 lines of ``kernel.log``, not as a generic timeout.
@@ -23,6 +25,7 @@ import json
 import os
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -34,8 +37,11 @@ MAX_RESPONSE = 64 * 1024 * 1024  # rule 19
 SPAWN_TIMEOUT = 180.0  # rule 14: how long we wait for a launcher
 SPAWN_LOCK = "spawn.lock"
 STATE_NAME = "kernel.json"
+SOCK_NAME = "kernel.sock"  # AF_UNIX: no TCP port, nothing another user can dial
 RUNNING_NAME = "running.json"  # written by the kernel: the job executing now
 LOG_NAME = "kernel.log"
+DIR_MODE = 0o700
+SUN_PATH_MAX = 100  # Linux sun_path is 108 bytes including the trailing NUL
 HELLO_TIMEOUT = 5.0
 OP_TIMEOUT = 30.0
 CONNECT_TIMEOUT = 3.0
@@ -59,6 +65,54 @@ def default_state_dir():
     if override:
         return os.path.abspath(os.path.expanduser(override))
     return os.path.join("/tmp", "sage-mcp-%d" % os.getuid())
+
+
+def private_dir(path):
+    """Create the state dir as 0700 and refuse to use one that is not ours.
+
+    A kernel in a directory another user owns means they can read the socket
+    path (and the state file) and talk to the kernel: local code execution as
+    us.  The sticky bit on /tmp does not prevent them from creating the
+    directory name first, so ownership is verified, not assumed.
+    """
+    try:
+        os.makedirs(path, mode=DIR_MODE, exist_ok=True)
+    except OSError as exc:
+        raise KernelError("cannot create the state directory %s: %s" % (path, exc))
+    try:
+        st = os.lstat(path)
+    except OSError as exc:
+        raise KernelError("cannot inspect the state directory %s: %s" % (path, exc))
+    if not stat.S_ISDIR(st.st_mode):
+        raise KernelError(
+            "the state path %s exists but is not a directory (a symlink or a file); "
+            "refusing to put a kernel there" % (path,)
+        )
+    if st.st_uid != os.getuid():
+        raise KernelError(
+            "the state directory %s belongs to uid %d, not to us (uid %d); refusing "
+            "to run a kernel in a directory another user controls"
+            % (path, st.st_uid, os.getuid())
+        )
+    if stat.S_IMODE(st.st_mode) != DIR_MODE:
+        try:
+            os.chmod(path, DIR_MODE)
+        except OSError as exc:
+            raise KernelError(
+                "the state directory %s is %03o and cannot be made private (%s)"
+                % (path, stat.S_IMODE(st.st_mode), exc)
+            )
+
+
+def check_sock_path(path):
+    """AF_UNIX paths have a hard byte limit; fail with advice, not errno 90."""
+    length = len(os.fsencode(path))
+    if length > SUN_PATH_MAX:
+        raise KernelError(
+            "the kernel socket path is %d bytes, over the %d-byte AF_UNIX limit:\n%s\n"
+            "Set SAGE_MCP_STATE to a shorter directory."
+            % (length, SUN_PATH_MAX, path)
+        )
 
 
 def _sage_ish(path):
@@ -136,13 +190,15 @@ def tail_log(path, lines=12):
 
 
 def _is_our_kernel(pid, state_path):
-    """Guard against pid reuse: a stale port file must not point at a stranger."""
+    """Guard against pid reuse: a stale state file must not point at a stranger."""
     try:
         with open("/proc/%d/cmdline" % int(pid), "rb") as fh:
             cmd = fh.read().replace(b"\0", b" ").decode("utf-8", "replace")
     except OSError:
         return False
-    return "sage_kernel.py" in cmd and os.path.basename(state_path) in cmd
+    # The full path, not its basename: two state dirs both pass
+    # `--state-file .../kernel.json`, and a basename match would confuse them.
+    return "sage_kernel.py" in cmd and state_path in cmd
 
 
 class Client:
@@ -150,8 +206,10 @@ class Client:
 
     def __init__(self, state_dir=None):
         self.state_dir = os.path.abspath(state_dir or default_state_dir())
-        os.makedirs(self.state_dir, exist_ok=True)
+        private_dir(self.state_dir)
         self.state_path = os.path.join(self.state_dir, STATE_NAME)
+        self.sock_path = os.path.join(self.state_dir, SOCK_NAME)
+        check_sock_path(self.sock_path)
         self.lock_path = os.path.join(self.state_dir, SPAWN_LOCK)
         self.log_path = os.path.join(self.state_dir, LOG_NAME)
         self.python = resolve_python()
@@ -171,12 +229,24 @@ class Client:
                 data = json.load(fh)
         except (OSError, ValueError):
             return None
-        if not isinstance(data, dict) or "port" not in data or "pid" not in data:
+        if not isinstance(data, dict) or "pid" not in data:
             return None
         return data
 
+    def _write_state(self, payload):
+        tmp = self.state_path + ".tmp.%d" % os.getpid()
+        with open(tmp, "w") as fh:
+            json.dump(payload, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, self.state_path)
+
     def _unlink_state(self):
-        for path in (self.state_path, os.path.join(self.state_dir, RUNNING_NAME)):
+        for path in (
+            self.state_path,
+            os.path.join(self.state_dir, RUNNING_NAME),
+            self.sock_path,
+        ):
             try:
                 os.unlink(path)
             except OSError:
@@ -187,19 +257,19 @@ class Client:
         state = self.read_state()
         if state is None:
             raise KernelDown("no kernel state file at %s" % self.state_path)
-        return self._roundtrip_state(state, payload, timeout)
+        return self._roundtrip_state(payload, timeout)
 
-    def _roundtrip_state(self, state, payload, timeout):
+    def _roundtrip_state(self, payload, timeout):
         if isinstance(payload, dict):
             payload.setdefault("client", self.client_id)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
-            sock = socket.create_connection(
-                ("127.0.0.1", int(state["port"])), timeout=CONNECT_TIMEOUT
-            )
+            sock.settimeout(CONNECT_TIMEOUT)
+            sock.connect(self.sock_path)
         except OSError as exc:
+            sock.close()
             raise KernelDown(
-                "cannot connect to kernel pid %s on port %s: %s"
-                % (state.get("pid"), state.get("port"), exc)
+                "cannot connect to the kernel socket %s: %s" % (self.sock_path, exc)
             )
         try:
             sock.settimeout(timeout)
@@ -263,7 +333,7 @@ class Client:
         state = state or self.read_state()
         if state is None:
             raise KernelDown("no kernel state file at %s" % self.state_path)
-        reply = self._roundtrip_state(state, {"op": "hello"}, timeout)
+        reply = self._roundtrip_state({"op": "hello"}, timeout)
         if not reply.get("ok"):
             raise KernelDown("hello failed: %s" % (reply.get("error"),))
         return reply
@@ -304,6 +374,13 @@ class Client:
                     return state, False, "busy"
                 except KernelDown as exc:
                     if _alive(pid):
+                        if "sock" not in state:
+                            raise KernelDown(
+                                "kernel pid %s is alive but was started by a pre-Unix-socket "
+                                "version of this server (%s); stop it once with "
+                                "interrupt(force=true) — its variables cannot be handed "
+                                "over to the new transport" % (pid, exc)
+                            )
                         raise KernelDown(
                             "kernel pid %s is alive but not accepting connections "
                             "(%s); refusing to start a second kernel — use `kill`"
@@ -320,6 +397,11 @@ class Client:
             else:
                 reason = "no kernel was running"
         state = self._spawn(reason)
+        if state.pop("_adopted", False):
+            reason = (
+                "the state file was missing; the live kernel (pid %s) was adopted"
+                % (state.get("pid"),)
+            )
         self._ever_ready = True
         return state, was_ready, reason
 
@@ -366,6 +448,45 @@ class Client:
                     "timed out waiting for the spawn lock at %s" % self.lock_path
                 )
 
+    def _adopt_lost_state(self):
+        """Adopt a live kernel whose state file vanished instead of spawning a twin.
+
+        The socket is the truth: `hello` returns everything the state file held,
+        so the missing file can be rebuilt.  A busy kernel cannot answer, and
+        its pid cannot be read from the socket -- then report rather than guess.
+        """
+        if not os.path.exists(self.sock_path):
+            return None
+        try:
+            reply = self._roundtrip_state({"op": "hello"}, HELLO_TIMEOUT)
+        except KernelBusy:
+            raise KernelDown(
+                "a kernel is already listening on %s but is busy and its state file "
+                "is missing, so it cannot be adopted yet; wait for it to go idle, or "
+                "stop it with interrupt(force=true)" % self.sock_path
+            )
+        except KernelDown:
+            return None  # stale socket name left by a dead kernel
+        pid = reply.get("pid")
+        if not pid or not _is_our_kernel(pid, self.state_path):
+            # Something is listening but we cannot verify it as ours.  Do not
+            # unlink its socket and do not spawn a twin: say so.
+            raise KernelDown(
+                "a kernel is listening on %s (pid %r) but its command line does "
+                "not match this state file; refusing to adopt or replace it"
+                % (self.sock_path, pid)
+            )
+        state = {
+            "pid": int(pid),
+            "started": reply.get("started") or time.time(),
+            "sock": self.sock_path,
+            "log": reply.get("log") or self.log_path,
+            "version": 1,
+        }
+        self._write_state(state)
+        state["_adopted"] = True
+        return state
+
     def _spawn_locked(self, reason):
         mark = time.time()
         deadline = mark + SPAWN_TIMEOUT
@@ -374,7 +495,10 @@ class Client:
             state = self._wait_for_foreign_kernel(deadline)
             return state
         try:
-            self._unlink_state()  # rule 13: never adopt a stale port file
+            adopted = self._adopt_lost_state()
+            if adopted is not None:
+                return adopted
+            self._unlink_state()  # rule 13: never adopt a stale state file
             env = os.environ.copy()
             env["PATH"] = os.path.dirname(self.python) + os.pathsep + env.get("PATH", "")
             env.setdefault("SAGE_MCP_STATE", self.state_dir)
@@ -553,7 +677,7 @@ class Client:
             )
         # Ask nicely first; it may be wedged, so this is best-effort only.
         try:
-            self._roundtrip_state(state, {"op": "shutdown"}, 1.5)
+            self._roundtrip_state({"op": "shutdown"}, 1.5)
         except KernelError:
             pass
         if self._wait_gone(pid, 3.0):
@@ -647,7 +771,7 @@ class Client:
                 "error": "stale state file (pid reuse)",
             }
         try:
-            reply = self._roundtrip_state(state, {"op": "status"}, timeout)
+            reply = self._roundtrip_state({"op": "status"}, timeout)
         except KernelBusy:
             return {
                 "state": "busy",

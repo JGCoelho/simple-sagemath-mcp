@@ -1,5 +1,7 @@
 # simple-sage-mcp
 
+*Shared by design, serialised by necessity.*
+
 An MCP server that gives an agent a **persistent SageMath kernel** over stdio: one
 long-lived Sage process it can run code in, interrupt, inspect and stop -- without
 hanging the agent and without orphaning a kernel.
@@ -81,8 +83,9 @@ do it explicitly: `interrupt` first, then `poll` to collect the
 ## Architecture
 
 The server is stdio JSON-RPC 2.0, one object per line, stdlib only. `sage_mcp.py`
-is the front end; `sage_client.py` spawns and talks to the kernel over a loopback
-socket under a lock, and distinguishes *busy* (alive, not answering: a running
+is the front end; `sage_client.py` spawns and talks to the kernel over a Unix
+domain socket inside a private (0700) state directory, under a lock, and
+distinguishes *busy* (alive, not answering: a running
 computation holds the GIL) from *gone* (never respawn a busy kernel -- that is how
 you lose twenty minutes of work). `sage_kernel.py` is the long-lived Sage
 process: it runs jobs on its **main thread** (that is what makes `cysignals`-based
@@ -90,7 +93,19 @@ Sage -- Singular, PARI, GAP -- behave), publishes the running job to
 `running.json` so `status` and `interrupt` work while the socket is blocked, and
 refuses to let a job's failure take the kernel with it.
 
-Two details that are easy to get wrong and are load-bearing here:
+**Why the protocol is hand-rolled.** The stdio layer is a few hundred lines of
+`json.dumps` over a pipe, which is what makes `pip install` enough: the server
+must run under Sage's *own* interpreter, where every dependency is another thing
+that can fail to build or clash with the Sage environment. The price is that only
+what these tools need is implemented -- `initialize`, `tools/list`,
+`tools/call`, `ping` and empty `resources`/`prompts` lists. There is no capability
+negotiation, no progress notifications, no tool annotations, no
+`structuredContent`, and `notifications/cancelled` is deliberately ignored (a
+timeout is not a cancel). Descriptions and text results carry that semantic load
+instead. An `mcp`-SDK proxy can be put in front if the newer bits are needed; the
+wire is plain JSON-RPC 2.0 and the tools are ordinary functions.
+
+Three details that are easy to get wrong and are load-bearing here:
 
 - **`SIGINT` cannot kill the kernel.** An interrupt outside a job is logged and
   ignored, and only the client that owns the running job may send it, so a
@@ -98,11 +113,16 @@ Two details that are easy to get wrong and are load-bearing here:
 - **Stopping is honest.** `interrupt(force=true)` tries a graceful shutdown, then
   `SIGTERM`, then `SIGKILL`, and if the signal fails it keeps the state files and
   reports the pid rather than pretending the kernel is gone.
+- **The socket is private.** It is an `AF_UNIX` socket, not a TCP port, so there
+  is nothing on loopback for another local user to dial. The state directory is
+  created `0700` and must be owned by you: on a shared machine `/tmp` lets
+  someone else create `/tmp/sage-mcp-$UID` first, so ownership is checked (and a
+  loosened mode is tightened) before a kernel is allowed to run there.
 
 Kernels are shared, not per-call: several Pi sessions or subagents drive one
 kernel, jobs queue on it, and it stops when the last server exits. State lives in
-`${SAGE_MCP_STATE:-/tmp/sage-mcp-$UID}` (`kernel.json`, `running.json`,
-`kernel.log`), never in the package directory.
+`${SAGE_MCP_STATE:-/tmp/sage-mcp-$UID}` (`kernel.sock`, `kernel.json`,
+`running.json`, `kernel.log`), never in the package directory.
 
 `run_file` runs a file the agent already wrote, through Sage's interpreter, with
 `cwd` set to that file's directory and nothing copied or stored -- `lang=python`
@@ -113,7 +133,7 @@ Jupyter kernel can outlive the run and would keep the call looking hung).
 ## Requirements
 
 - Linux.
-- Python 3.7+ that can `import sage.all` -- Sage's *own* interpreter, whose `bin/`
+- Python 3.8+ that can `import sage.all` -- Sage's *own* interpreter, whose `bin/`
   also holds the `sage` binary (that directory is prepended to `PATH`, because
   `import sage.all` loads Singular from there). Conda environments, source builds
   and distro packages all qualify; `SAGE_PYTHON` overrides the choice.
@@ -128,13 +148,13 @@ interpreter (they ship with SageMath); without them the tool is not advertised.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `SAGE_PYTHON` | our own interpreter, else the python beside `sage` on `PATH` | interpreter used to spawn the kernel (must import `sage.all`) |
-| `SAGE_MCP_STATE` | `/tmp/sage-mcp-$UID` | port/pid files, `running.json`, `kernel.log` |
+| `SAGE_MCP_STATE` | `/tmp/sage-mcp-$UID` | socket/pid files, `running.json`, `kernel.log` (created `0700`) |
 | `SAGE_CWD` | the server's cwd | working directory for `exec` and `run_file` |
 
 ## Tests
 
 ```bash
-# 64 checks, over MCP stdio, ~60 s
+# 67 checks, over MCP stdio, ~60 s
 /path/to/sage-env/bin/python tests/acceptance.py
 
 # 10 checks, as a Sage script, ~10 s (Sage's own interpreter: it must be on PATH
@@ -144,11 +164,12 @@ PATH=/path/to/sage-env/bin:$PATH \
 ```
 
 `acceptance.py` drives the server over stdio and checks the invariants that are
-easy to regress: busy-vs-dead, spawn serialisation, stale port files, dead
+easy to regress: busy-vs-dead, spawn serialisation, stale socket/state files, dead
 launchers, an honest stop, output caps, `since` offsets, kernel.log isolation,
-shared-kernel ownership, `run_file`'s interpreter selection, cwd, args, stdin,
-timeout and truncation rules, the notebook cycle, and that stdout carried nothing
-but JSON-RPC. `selftest.py` is the 7-check version used by `install.sh --check`.
+shared-kernel ownership, the socket's privacy, `run_file`'s interpreter selection,
+cwd, args, stdin, timeout and truncation rules, the notebook cycle, and that
+stdout carried nothing but JSON-RPC. `selftest.py` is the 7-check version used by
+`install.sh --check`.
 
 ## License
 

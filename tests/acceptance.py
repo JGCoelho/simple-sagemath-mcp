@@ -12,6 +12,7 @@ import os
 import queue
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -661,6 +662,26 @@ def client_invariants(workdir):
     client = sc.Client(state_dir)
     state, _, _ = client.ensure()
     pid = state["pid"]
+
+    # security: the kernel is reachable only through a private AF_UNIX socket
+    dir_mode = stat.S_IMODE(os.stat(state_dir).st_mode)
+    sock_mode = os.stat(client.sock_path).st_mode
+    record(
+        "security: state dir is private (0700)",
+        dir_mode == 0o700,
+        "mode=%03o path=%s" % (dir_mode, state_dir),
+    )
+    record(
+        "security: kernel serves an AF_UNIX socket, no TCP port",
+        stat.S_ISSOCK(sock_mode) and state.get("sock") == client.sock_path,
+        "state=%r mode=%s" % (state, sock_mode),
+    )
+    os.chmod(state_dir, 0o755)
+    sc.Client(state_dir)  # constructing a client repairs the permissions
+    record(
+        "security: a loosened state dir is tightened back to 0700",
+        stat.S_IMODE(os.stat(state_dir).st_mode) == 0o700,
+    )
     client.op(
         "submit",
         wait=5,
@@ -691,17 +712,17 @@ def client_invariants(workdir):
     record("rule 11: kernel recovered after interrupt", client.status_snapshot()["state"] == "running")
     client.kill()
 
-    # rule 13: a stale port file is not adopted
+    # rule 13: a stale socket file is not adopted
     stale_dir = os.path.join(workdir, "stale")
     os.makedirs(stale_dir, exist_ok=True)
-    bogus = socket.socket()
-    bogus.bind(("127.0.0.1", 0))
-    bogus.listen(1)
+    bogus_path = os.path.join(stale_dir, "kernel.sock")
+    bogus = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    bogus.bind(bogus_path)  # bound but not listening: connect() is refused
     with open(os.path.join(stale_dir, "kernel.json"), "w") as fh:
         json.dump(
             {
                 "pid": os.getpid(),
-                "port": bogus.getsockname()[1],
+                "sock": bogus_path,
                 "started": time.time() - 5000,
                 "version": 1,
             },
@@ -710,12 +731,12 @@ def client_invariants(workdir):
     stale_client = sc.Client(stale_dir)
     state, restarted, reason = stale_client.ensure()
     record(
-        "rule 13: stale port file is replaced, not adopted",
+        "rule 13: stale socket/state files are replaced, not adopted",
         state["pid"] != os.getpid()
-        and state["port"] != bogus.getsockname()[1]
+        and state["sock"] == bogus_path
         and "stale" in (reason or ""),
-        "reason=%r pid=%s port=%s (stale pid=%s port=%s)"
-        % (reason, state.get("pid"), state.get("port"), os.getpid(), bogus.getsockname()[1]),
+        "reason=%r pid=%s sock=%s (stale pid=%s)"
+        % (reason, state.get("pid"), state.get("sock"), os.getpid()),
     )
     stale_client.kill()
     bogus.close()
@@ -754,7 +775,15 @@ def client_invariants(workdir):
         ],
     )
     with open(os.path.join(kill_dir, "kernel.json"), "w") as fh:
-        json.dump({"pid": 999999999, "port": 1, "started": time.time(), "version": 1}, fh)
+        json.dump(
+            {
+                "pid": 999999999,
+                "sock": os.path.join(kill_dir, "kernel.sock"),
+                "started": time.time(),
+                "version": 1,
+            },
+            fh,
+        )
     kill_client = sc.Client(kill_dir)
     result = kill_client.kill()
     record(

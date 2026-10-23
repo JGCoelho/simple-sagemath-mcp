@@ -5,9 +5,9 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "simple-sage-mcp"
 version = "1.0.0"
-description = "A small MCP server for one persistent SageMath kernel: nine tools, honest busy/timeout/interrupt semantics."
+description = "A small MCP server for one persistent SageMath kernel: eight tools, honest busy/timeout/interrupt semantics."
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.8"
 license = { text = "MIT" }
 authors = [{ name = "JGCoelho", email = "josegustavocoelho@gmail.com" }]
 keywords = ["mcp", "sagemath", "sage", "model-context-protocol", "computer-algebra"]

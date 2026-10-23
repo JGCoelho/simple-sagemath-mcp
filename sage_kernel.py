@@ -26,7 +26,9 @@ import json
 import os
 import queue
 import signal
+import socket
 import socketserver
+import stat
 import sys
 import threading
 import time
@@ -62,9 +64,12 @@ _SHUTDOWN = threading.Event()
 
 STATE_FILE = None
 RUNNING_FILE = "running.json"  # lives next to the state file
+SOCK_NAME = "kernel.sock"
+SOCK_PATH = None
+DIR_MODE = 0o700
+SUN_PATH_MAX = 100  # Linux sun_path is 108 bytes including the trailing NUL
 LOG_PATH = None
 SAGE_VERSION = "?"
-PORT = None
 
 
 def _log(msg):
@@ -75,6 +80,82 @@ def _log(msg):
             _LOG.flush()
     except Exception:
         pass
+
+
+def _private_dir(path):
+    """Create our state directory as 0700 and refuse one we do not own.
+
+    The socket is only as private as the directory holding it: on a shared
+    machine /tmp lets another user create /tmp/sage-mcp-<uid> first, and a
+    kernel there would hand them a code-execution channel.  The client checks
+    this too; the kernel checks it again because it can be started by hand.
+    """
+    try:
+        os.makedirs(path, mode=DIR_MODE, exist_ok=True)
+        st = os.lstat(path)
+    except OSError as exc:
+        raise SystemExit("sage-mcp kernel: unusable state directory %s: %s" % (path, exc))
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise SystemExit(
+            "sage-mcp kernel: refusing state directory %s (not a directory we own)" % path
+        )
+    if stat.S_IMODE(st.st_mode) != DIR_MODE:
+        try:
+            os.chmod(path, DIR_MODE)
+        except OSError as exc:
+            raise SystemExit(
+                "sage-mcp kernel: cannot make state directory %s private: %s" % (path, exc)
+            )
+
+
+def _check_sock_path(path):
+    if len(os.fsencode(path)) > SUN_PATH_MAX:
+        raise SystemExit(
+            "sage-mcp kernel: socket path is %d bytes, over the %d-byte AF_UNIX "
+            "limit: %s (set SAGE_MCP_STATE to a shorter directory)"
+            % (len(os.fsencode(path)), SUN_PATH_MAX, path)
+        )
+
+
+def _remove_socket():
+    if SOCK_PATH:
+        try:
+            os.unlink(SOCK_PATH)
+        except OSError:
+            pass
+
+
+def _bind_server(path):
+    """Bind the AF_UNIX socket; clear a name only when it is provably dead."""
+    if os.path.exists(path):
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(1.0)
+        try:
+            probe.connect(path)
+        except (ConnectionRefusedError, FileNotFoundError):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        except OSError as exc:
+            # A timeout here means SOMETHING accepted the connection (a busy
+            # kernel's listen backlog). Never unlink what we cannot prove dead.
+            raise SystemExit(
+                "sage-mcp kernel: %s already exists and could not be proven dead "
+                "(%s); refusing to start a second kernel on it" % (path, exc)
+            )
+        else:
+            raise SystemExit(
+                "sage-mcp kernel: another kernel is already listening on %s" % path
+            )
+        finally:
+            probe.close()
+    server = _Server(path, _Handler)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return server
 
 
 # --------------------------------------------------------------------------
@@ -545,7 +626,7 @@ def op_status(req):
     return {
         "ok": True,
         "pid": os.getpid(),
-        "port": PORT,
+        "sock": SOCK_PATH,
         "started": STARTED,
         "uptime_s": round(time.time() - STARTED, 1),
         "sessions": sessions,
@@ -590,6 +671,7 @@ def op_shutdown(req):
 def _shutdown_soon():
     _SHUTDOWN.set()
     time.sleep(0.2)
+    _remove_socket()
     os._exit(0)
 
 
@@ -614,7 +696,7 @@ _DISPATCH = {
     "hello": lambda req: {
         "ok": True,
         "pid": os.getpid(),
-        "port": PORT,
+        "sock": SOCK_PATH,
         "started": STARTED,
         "log": LOG_PATH,
         "sage_version": SAGE_VERSION,
@@ -703,9 +785,15 @@ class _Handler(socketserver.StreamRequestHandler):
             pass
 
 
-class _Server(socketserver.ThreadingTCPServer):
-    allow_reuse_address = True
+class _Server(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
+
+    def server_close(self):
+        super().server_close()
+        try:
+            os.unlink(self.server_address)
+        except OSError:
+            pass
 
     def handle_error(self, request, client_address):
         _log("connection error from %r:\n%s" % (client_address, traceback.format_exc()))
@@ -718,7 +806,7 @@ def _write_state(path):
     tmp = path + ".tmp.%d" % os.getpid()
     payload = {
         "pid": os.getpid(),
-        "port": PORT,
+        "sock": SOCK_PATH,
         "started": STARTED,
         "log": LOG_PATH,
         "version": 1,
@@ -731,13 +819,16 @@ def _write_state(path):
 
 
 def main():
-    global _LOG, STATE_FILE, LOG_PATH, SAGE_VERSION, PORT
+    global _LOG, STATE_FILE, LOG_PATH, SAGE_VERSION, SOCK_PATH
     ap = argparse.ArgumentParser(description="sage-mcp kernel")
-    ap.add_argument("--state-file", required=True, help="where to publish {pid,port}")
+    ap.add_argument("--state-file", required=True, help="where to publish {pid,sock}")
     ap.add_argument("--log-file", default=None, help="redirect kernel stdout/stderr here")
     args = ap.parse_args()
 
     STATE_FILE = os.path.abspath(args.state_file)
+    SOCK_PATH = os.path.join(os.path.dirname(STATE_FILE), SOCK_NAME)
+    _private_dir(os.path.dirname(STATE_FILE))
+    _check_sock_path(SOCK_PATH)
     if args.log_file:
         LOG_PATH = os.path.abspath(args.log_file)
         fd = os.open(LOG_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
@@ -761,7 +852,11 @@ def main():
 
     # SIGINT keeps its default meaning (KeyboardInterrupt on the main thread);
     # SIGTERM exits promptly even mid-job, which is what `kill` relies on.
-    signal.signal(signal.SIGTERM, lambda *a: os._exit(0))
+    def _on_term(*_args):
+        _remove_socket()
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, _on_term)
 
     try:
         exec("from sage.all import *", _BASE)
@@ -776,10 +871,12 @@ def main():
     # rewrites time.sleep(0.4) for it, and the sleep patch lives on it.
     _BASE.setdefault("time", time)
 
-    server = _Server(("127.0.0.1", 0), _Handler)
-    PORT = server.server_address[1]
+    server = _bind_server(SOCK_PATH)
     _write_state(STATE_FILE)
-    _log("listening on 127.0.0.1:%d, state=%s, sage=%s" % (PORT, STATE_FILE, SAGE_VERSION))
+    _log(
+        "listening on unix:%s, state=%s, sage=%s"
+        % (SOCK_PATH, STATE_FILE, SAGE_VERSION)
+    )
 
     thread = threading.Thread(target=server.serve_forever, name="conn", daemon=True)
     thread.start()
@@ -787,6 +884,11 @@ def main():
     try:
         _executor_main()
     finally:
+        try:
+            server.server_close()
+        except Exception:
+            pass
+        _remove_socket()
         _log("kernel exiting")
 
 
