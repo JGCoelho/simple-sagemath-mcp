@@ -316,7 +316,7 @@ class Client:
             killed = self._killed_pid
             self._killed_pid = None
             if killed:
-                reason = "the previous kernel (pid %s) was stopped with kill" % (killed,)
+                reason = "the previous kernel (pid %s) was force-stopped with interrupt(force=true)" % (killed,)
             else:
                 reason = "no kernel was running"
         state = self._spawn(reason)
@@ -632,7 +632,7 @@ class Client:
             snapshot = {"state": "absent", "log": self.log_path, "path": self.state_path}
             if self._killed_pid:
                 snapshot["note"] = (
-                    "the previous kernel (pid %s) was stopped with kill"
+                    "the previous kernel (pid %s) was force-stopped"
                     % (self._killed_pid,)
                 )
             return snapshot

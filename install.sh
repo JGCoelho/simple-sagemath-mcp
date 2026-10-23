@@ -167,7 +167,7 @@ fi
 
 echo
 echo "done. Restart the client (in Pi: restart or reload MCP servers):"
-echo "  exec poll reset drop status interrupt kill run_file notebook"
+echo "  exec poll reset drop status interrupt run_file notebook"
 echo
 echo "Verify with:"
 echo "  ./install.sh --check                     (re-test this registration)"

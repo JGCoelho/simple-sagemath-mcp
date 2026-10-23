@@ -1,187 +1,127 @@
-# sage-mcp
+# simple-sage-mcp
 
-An MCP server that gives an agent a **persistent Sage** it can interrupt, poll
-and kill, without ever hanging or orphaning a kernel. Nine tools: the kernel
-itself (`exec`, `poll`, `reset`, `drop`, `status`, `interrupt`, `kill`) plus the
-two file tools that need Sage's own environment — `run_file` (execute a file
-the agent already wrote, inline results) and `notebook` (drive the Jupyter
-kernel SageMath ships).
+An MCP server that gives an agent a **persistent SageMath kernel** over stdio: one
+long-lived Sage process it can run code in, interrupt, inspect and stop -- without
+hanging the agent and without orphaning a kernel.
 
-PDFs are a separate server, `pdf-mcp`.  MIT licensed; Python 3.7+, stdlib only.
+## Quickstart
 
-Stdio JSON-RPC 2.0, one JSON object per line; every tool result is
-`{"content":[{"type":"text","text":"..."}]}`, failures add `"isError": true`.
-Nothing but JSON-RPC is ever written to the server's stdout.
+SageMath must be installed and its own interpreter must be able to `import
+sage.all` (`SAGE_PYTHON` overrides the choice). Then, from a checkout:
+
+```bash
+./install.sh
+```
+
+That finds a working interpreter, writes the `sage` entry into the `mcp.json` next
+to the install target (if there is one), and then **proves the registration
+works** by spawning the server and running `2+2` through it. Any other MCP client
+just needs the block it prints:
+
+```json
+{
+  "mcpServers": {
+    "sage": {
+      "command": "/path/to/sage-env/bin/python",
+      "args": ["/path/to/sage-mcp/sage_mcp.py"],
+      "env": {"SAGE_CWD": "/tmp"}
+    }
+  }
+}
+```
+
+`pip install git+https://github.com/JGCoelho/simple-sagemath-mcp` works too, and
+adds the `simple-sage-mcp` and `simple-sage-mcp-check` commands. Verify any
+registration, at any time:
+
+```bash
+./install.sh --check
+simple-sage-mcp-check /path/to/python /path/to/sage_mcp.py
+```
 
 ## Tools
 
 | tool | params (required → `*`) | returns |
 | --- | --- | --- |
-| `exec` | `code`*, `session`="default", `timeout_s`=120 (0 = return at once), `preparse`=true | stdout, then the repr of the last expression; `(no output)` if neither; on timeout the partial stdout + `[still running: 1.0s]` + `[job_id j7 — call poll ...]`; after a respawn the output is prefixed `[kernel restarted: ...]` |
-| `poll` | `job_id`*, `since`=0, `wait_s`=0 | new stdout + `[job finished in 3.0s]` / `[still running 12.3s; poll again with since=57]` / `[queued: another job is running]` / the error |
-| `reset` | `session`="default" | `session 'x' reset (namespace empty)` |
-| `drop` | `sessions`=[…], `all`=false | `dropped: …` / `kept 'x': job j3 …` / `not found: …` / `remaining: …` |
-| `status` | — | `kernel: running, up 12s (pid 4242)`, one `session <name>: N names` line per session, `active jobs: …`, `last error: …`, `log: <path>` |
-| `interrupt` | — | `SIGINT sent …` (the job gets `KeyboardInterrupt`, the session keeps its variables) |
-| `kill` | — | `kernel stopped; the next exec starts a fresh one …`, or the honest failure plus the pid |
-| `run_file` | `path`*, `lang`=`auto`\|`bash`\|`python`\|`sage`\|`exec`, `args`, `timeout_s`=120, `stdin`, `cwd` | the head line (`exit=0  hello.sh  0.1s  bash hello.sh`), `cwd=` `lang=`, then `--- stdout ---` and, if any, `--- stderr ---` |
-| `notebook` | `action`* ∈ `check`,`run`,`clear`,`extract`; `path`*, `out`, `in_place`=false, `cell_timeout_s`=120, `timeout_s` | `OK   <file> v4.5 kernel=sagemath cells=3 (code=2, with-output=0)`, `wrote <file> (cells with errors: N)`, `cleared outputs in N code cells`, or the code cells |
+| `exec` | `code`*, `session`="default", `timeout_s`=120 (0 = return at once), `preparse`=true | stdout, then the repr of the last expression; `(no output)` if neither; on timeout the partial stdout + `[still running: 1.0s]` + `[job_id j7 — call poll …]`; after a respawn the output is prefixed `[kernel restarted: …]` |
+| `poll` | `job_id`*, `session`="default", `wait_s`=0, `since`=0 | new output since the offset, then `[job finished in 6.0s]` or `[still running 12s; poll again with since=…]` |
+| `status` | — | one line of truth: running/up, busy, not running, or unreachable, plus sessions, active jobs, live clients, last error, log path |
+| `interrupt` | `force`=false | without `force`: `SIGINT` to the running job (it fails with `KeyboardInterrupt`, the session keeps its variables); with `force=true`: the kernel is stopped and every variable is lost |
+| `reset` | `session`="default" | namespace emptied (`False`), session entry kept |
+| `drop` | `sessions`=[], `all`=false | frees idle sessions; refuses one that still has a queued or running job |
+| `run_file` | `path`*, `lang`="auto", `args`=[], `timeout_s`=120, `stdin`, `cwd` | `exit=0  script.sh  0.1s  bash script.sh` + `--- stdout ---` (+ `--- stderr ---`); non-zero exit is an error with the output attached |
+| `notebook` | `action`*, `path`*, `out`, `in_place`, `cell_timeout_s`=120 | `check` / `extract` / `clear` / `run` (`run` reports how many cells ended in error); only advertised when `nbformat`+`nbconvert`+`nbclient` are importable |
 
-`notebook` is only advertised when `nbformat`+`nbconvert`+`nbclient` import.
+## Why `poll` exists
 
-## Why it is built this way
+`exec` has a timeout, and that timeout **does not cancel anything**. It is the
+point of the design: a Gröbner basis, a factorization or a graph enumeration that
+takes twenty minutes is normal work for Sage, and the usual MCP answer -- give up
+when the call times out -- either throws that work away or, worse, leaves it
+running with no way to read the result.
 
-* **User code runs on the main thread, one job at a time.** Sage's cysignals
-  layer calls `sig_on()`, which is main-thread-only: `factor()` on a worker
-  thread raises `SignalError: Segmentation fault`. Connection threads only
-  enqueue jobs and read state.
-* **`timeout_s` is not a computation limit.** The job keeps running; `poll`
-  collects it. Nothing kills a job for being slow.
-* **Per-job output routing.** `sys.stdout`/`sys.stderr` are replaced by routers
-  that append to the *currently running job's* buffer and fall back to the real
-  stream when idle, so `print()` never leaks into MCP stdout. The kernel's own
-  log goes to the original stderr (`kernel.log`), never through the router.
-* **`SIGINT` cannot kill the kernel.** An interrupt outside a job is logged and
-  ignored; inside a job it becomes that job's `KeyboardInterrupt`. An interrupt
-  while a job is still queued does not cancel it.
-* **No job may kill the kernel** (`except BaseException`, traceback into
-  `job.error`, `job.done.set()` in a `finally`).
-* **Preparse, then split the trailing expression**: `preparse(source, True)`,
-  strip a leading BOM, `ast.parse(mode="exec")`, pop a trailing `ast.Expr`,
-  `exec` the rest and `eval`/`repr` the tail. A `SyntaxError` carries the
-  *preparsed* source — the only way to debug a bad rewrite.
-* **Caps:** `repr` at 4000 chars, job output at 4 MB (with a notice), client
-  response read at 64 MB.
-* **`time.sleep` is patched** to accept floats: the preparser turns
-  `time.sleep(0.4)` into `sleep(RealNumber('0.4'))` and `__index__` would round
-  that to 0, making the sleep return instantly.
-* **Sessions are never evicted on their own.** `reset` empties a namespace but
-  keeps the entry; `drop` is the only way to free one and it refuses a session
-  with a queued or running job (`kept[name] = job_id`).
-* **A busy kernel is not a dead kernel.** If the port accepts but `hello`
-  times out, the kernel is alive and holding the GIL: `KernelBusy`, which never
-  triggers a respawn (that would orphan a live kernel *and* start a second one
-  on a new port).
-* **Spawn is serialised** with `O_CREAT|O_EXCL` on `spawn.lock`; a second client
-  waits for the first one's kernel. The lock is reclaimed only when its mtime is
-  older than the wait budget.
-* **Only a port file written after this spawn began is trusted**
-  (`started >= spawn_mark - 5`, plus a pid *and* `/proc/<pid>/cmdline` match):
-  a stale file that survives deletion is not evidence of *our* kernel.
-* **A dead launcher is reported immediately** (`proc.poll()`) with the last ~12
-  lines of `kernel.log`, not as a generic timeout after 180 s.
-* **`kill` is honest.** If the signal fails the state files are deliberately
-  left alone and the pid is reported, so a live kernel is never orphaned (and a
-  second one never spawned next to it).
-* **Several MCP servers share one kernel.** Each carries a client id, the kernel
-  reports who is still connected (`status`), and a server exits without killing
-  a job another one is collecting.
-
-## Layout
+So `exec` returns a job id instead, and `poll(job_id, since=N)` hands back the
+output produced since offset `N`:
 
 ```
-sage_mcp.py     MCP stdio server, JSON-RPC 2.0, the nine tools
-sage_client.py  spawn/lock/connect; KernelBusy vs unreachable; 64 MB read cap
-sage_kernel.py  the long-lived Sage process: main-thread executor + job router
-runfile.py      `run_file`: execute an existing file, output inline, nothing stored
-nbrun.py        `notebook`: check / extract / clear / run (nbconvert, atomic)
-selftest.py     `--check`: spawn, initialize, tools/list, `2+2`, kill -- 7 checks
-tests/acceptance.py            63 checks driving the server over stdio
-tests/interrupt_ownership.sage 10 checks: only a job's own client may SIGINT it
-install.sh      (re)register in mcp.json, then prove it works; drop stale modules
-pyproject.toml  `pip install .` / `pip install git+...` (MIT, stdlib only)
+exec  → prints "starting", [still running: 1.0s], [job_id j3 — call poll …]   (since=15)
+poll(job_id="j3", since=15) → "done", [job finished in 41.0s]
 ```
 
-`run_file` never writes anything: the agent creates the file with its own
-tools (bash, an editor, a heredoc) and passes the path; that file is what runs,
-with `cwd` = its own directory, so relative paths inside it behave as written.
-`lang=python` is Sage's interpreter, which is the whole point of routing this
-through the Sage server: `from sage.all import *` works without a venv dance.
-`notebook run` writes atomically (temp file + `os.replace`) and the nbconvert
-child writes to a *file*, never a pipe: a Jupyter kernel can outlive the run
-and would keep an inherited pipe open, making the call look hung after the
-notebook was already written.
+Nothing is lost between the two calls: the kernel keeps the job's output, so
+polling is incremental rather than a re-run, and the job survives the agent
+ending its turn -- even an MCP restart, since a new server adopts the surviving
+kernel instead of spawning a second one. `wait_s` blocks for the remaining time
+when you would rather do that than poll in a loop.
 
-## Runtime state
+The alternative semantics would be to kill the job on timeout. If you want that,
+do it explicitly: `interrupt` first, then `poll` to collect the
+`KeyboardInterrupt`. Silence is never interpreted as "cancel".
 
-State lives outside the package directory (which may be read-only):
+## Architecture
 
-```
-${SAGE_MCP_STATE:-/tmp/sage-mcp-$UID}/kernel.json   {pid, port, started}
-                                     /spawn.lock
-                                     /kernel.log
-```
+The server is stdio JSON-RPC 2.0, one object per line, stdlib only. `sage_mcp.py`
+is the front end; `sage_client.py` spawns and talks to the kernel over a loopback
+socket under a lock, and distinguishes *busy* (alive, not answering: a running
+computation holds the GIL) from *gone* (never respawn a busy kernel -- that is how
+you lose twenty minutes of work). `sage_kernel.py` is the long-lived Sage
+process: it runs jobs on its **main thread** (that is what makes `cysignals`-based
+Sage -- Singular, PARI, GAP -- behave), publishes the running job to
+`running.json` so `status` and `interrupt` work while the socket is blocked, and
+refuses to let a job's failure take the kernel with it.
 
-Environment: see [Configuration](#configuration) (`SAGE_MCP_STATE`,
-`SAGE_PYTHON`, `SAGE_CWD`).
+Two details that are easy to get wrong and are load-bearing here:
 
-The kernel is stopped when the MCP server exits cleanly, so no Sage process is
-left behind; if the server is killed hard, the next server adopts the surviving
-kernel (its port file is still valid).
+- **`SIGINT` cannot kill the kernel.** An interrupt outside a job is logged and
+  ignored, and only the client that owns the running job may send it, so a
+  subagent cannot cancel your computation.
+- **Stopping is honest.** `interrupt(force=true)` tries a graceful shutdown, then
+  `SIGTERM`, then `SIGKILL`, and if the signal fails it keeps the state files and
+  reports the pid rather than pretending the kernel is gone.
+
+Kernels are shared, not per-call: several Pi sessions or subagents drive one
+kernel, jobs queue on it, and it stops when the last server exits. State lives in
+`${SAGE_MCP_STATE:-/tmp/sage-mcp-$UID}` (`kernel.json`, `running.json`,
+`kernel.log`), never in the package directory.
+
+`run_file` runs a file the agent already wrote, through Sage's interpreter, with
+`cwd` set to that file's directory and nothing copied or stored -- `lang=python`
+is Sage's python, so `from sage.all import *` just works. `notebook` drives the
+Jupyter kernel SageMath ships, writing atomically and never through a pipe (a
+Jupyter kernel can outlive the run and would keep the call looking hung).
 
 ## Requirements
 
 - Linux.
-- Python 3.7+ that can `import sage.all` — i.e. Sage's *own* interpreter, whose
-  `bin/` also holds the `sage` binary (the interpreter's directory is prepended
-  to `PATH`, because `import sage.all` loads Singular from there).
-- Any MCP client. Nothing here is Pi-specific: it is one stdio server.
+- Python 3.7+ that can `import sage.all` -- Sage's *own* interpreter, whose `bin/`
+  also holds the `sage` binary (that directory is prepended to `PATH`, because
+  `import sage.all` loads Singular from there). Conda environments, source builds
+  and distro packages all qualify; `SAGE_PYTHON` overrides the choice.
+- Any MCP client. Nothing here is Pi-specific: it is one stdio server, no
+  dependencies beyond the standard library.
 
 `notebook` additionally needs `nbformat`+`nbconvert`+`nbclient` in that same
-interpreter (they ship with SageMath); without them the tool is simply not
-advertised.
-
-## Install
-
-Two ways, both ending in the same stdio server:
-
-```bash
-pip install git+https://github.com/JGCoelho/simple-sagemath-mcp   # console scripts
-./install.sh                                                      # from a checkout
-```
-
-- **pip** installs `simple-sage-mcp` (and `simple-sage-mcp-check`) into
-  whichever environment you pip into. That environment must be Sage's, or point
-  `SAGE_PYTHON` at Sage's interpreter: the console script is only as capable as
-  the kernel it can spawn.
-- **`./install.sh`** picks the first interpreter that can `import sage.all` (or
-  `$SAGE_PYTHON`), copies nothing when the server already lives in the target
-  directory, and then **verifies the result** by spawning the server against a
-  throwaway state dir and running `2+2` through it. If that fails it prints the
-  kernel log and exits non-zero, so a mis-registration cannot pass silently.
-
-Then:
-
-- **Pi**: `install.sh` writes the `sage` entry into `~/.pi/agent/mcp.json` and
-  prints the `AGENTS.md` section to paste in. Restart Pi to pick up the tools.
-- **Any other client**: if there is no `mcp.json` next to the install target, it
-  prints the JSON block to add to your client's config (see
-  `example.mcp.json`). Point `command` at Sage's python and `args[0]` at
-  `sage_mcp.py`; that is the whole configuration.
-- **Afterwards, whenever in doubt** — a different machine, an edited config, an
-  agent reporting trouble:
-
-```bash
-./install.sh --check                       # tests the registration in mcp.json
-python selftest.py --config ~/.config/mcp.json
-simple-sage-mcp-check /path/python /path/sage_mcp.py
-```
-
-`--check` reads the `sage` entry that is actually configured and drives it over
-stdio: spawn, `initialize`, `tools/list`, `exec` of `2+2`, `status`, `kill` —
-7 checks, every failure printed with the kernel log that explains it (the usual
-cause is a `command` that is not Sage's interpreter). It runs against
-`$TMPDIR/sage-selftest-*`, so the live kernel is never touched.
-
-```bash
-SAGE_PYTHON=/path/to/sage-env/bin/python ./install.sh   # choose the interpreter
-./install.sh /opt/sage-mcp                              # install elsewhere
-PI_AGENT_DIR=/tmp/fakeagent ./install.sh                # scratch agent dir
-```
-
-## License
-
-MIT — see `LICENSE`.
+interpreter (they ship with SageMath); without them the tool is not advertised.
 
 ## Configuration
 
@@ -194,7 +134,7 @@ MIT — see `LICENSE`.
 ## Tests
 
 ```bash
-# 63 checks, over MCP stdio, ~60 s
+# 64 checks, over MCP stdio, ~60 s
 /path/to/sage-env/bin/python tests/acceptance.py
 
 # 10 checks, as a Sage script, ~10 s (Sage's own interpreter: it must be on PATH
@@ -205,6 +145,11 @@ PATH=/path/to/sage-env/bin:$PATH \
 
 `acceptance.py` drives the server over stdio and checks the invariants that are
 easy to regress: busy-vs-dead, spawn serialisation, stale port files, dead
-launchers, honest kill, output caps, `since` offsets, kernel.log isolation,
-shared-kernel ownership, run_file's interpreter selection, cwd, args, stdin,
-timeout and truncation rules, the notebook cycle, and that stdout carried nothing but JSON-RPC.
+launchers, an honest stop, output caps, `since` offsets, kernel.log isolation,
+shared-kernel ownership, `run_file`'s interpreter selection, cwd, args, stdin,
+timeout and truncation rules, the notebook cycle, and that stdout carried nothing
+but JSON-RPC. `selftest.py` is the 7-check version used by `install.sh --check`.
+
+## License
+
+MIT -- see `LICENSE`.

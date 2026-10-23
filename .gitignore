@@ -9,3 +9,6 @@ venv/
 .DS_Store
 *.swp
 *.bak
+
+# development log, kept locally only
+PLAN.md

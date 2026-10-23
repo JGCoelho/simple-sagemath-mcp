@@ -1,7 +1,7 @@
 ## Sage (MCP: `sage`)
 
 A persistent Sage kernel, not a proof checker. Tools: `exec`, `poll`, `reset`,
-`drop`, `status`, `interrupt`, `kill`, `run_file`, `notebook`.
+`drop`, `status`, `interrupt`, `run_file`, `notebook`.
 
 - `exec(code, session="default", timeout_s=120, preparse=true)` runs Sage code on
   the kernel's main thread; state persists per session between calls. There is no
@@ -18,8 +18,9 @@ A persistent Sage kernel, not a proof checker. Tools: `exec`, `poll`, `reset`,
   KEEPS its variables — the first thing to try for a runaway computation. It
   refuses when the running job belongs to another MCP client (another Pi session
   or subagent), and does nothing when the kernel is idle.
-- `kill` stops the kernel (all variables lost); the next `exec` starts a fresh one
-  and prefixes its output with `[kernel restarted: ...]`.
+- `interrupt(force=true)` stops the kernel instead of the job: all variables are
+  lost, the next `exec` starts a fresh one and prefixes its output with
+  `[kernel restarted: ...]`.
 - `status` shows pid/uptime, live MCP clients, sessions, active jobs, last error
   and the log path (`${SAGE_MCP_STATE:-/tmp/sage-mcp-$UID}/kernel.log`).
 - Sessions are never evicted; use `drop` to free one (it refuses sessions with a
@@ -28,7 +29,7 @@ A persistent Sage kernel, not a proof checker. Tools: `exec`, `poll`, `reset`,
   stopped only when the last of them exits (a subagent finishing cannot kill your
   run).
 - Long jobs: set `timeout_s` generously in the first `exec`.
-- To verify that state was really lost (after `kill`), test `'name' in globals()`:
+- To verify that state was really lost (after `interrupt(force=true)`), test `'name' in globals()`:
   short names such as `n`, `N`, `e`, `i` and `pi` are Sage predefines (`N` is
   `numerical_approx`), so a `NameError` probe can resolve to an unrelated
   function and lie.

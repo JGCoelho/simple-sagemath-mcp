@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """sage_mcp.py -- MCP (stdio, JSON-RPC 2.0) front end for the Sage kernel.
 
-Nine tools: the kernel itself (exec, poll, reset, drop, status, interrupt,
-kill) plus the two tools that need Sage's own interpreter (run_file: execute a
-file the agent already wrote, inline results; notebook: drive the Jupyter kernel
-SageMath ships).  PDFs are a separate server, pdf-mcp.
+Eight tools: the kernel itself (exec, poll, reset, drop, status, interrupt --
+with force=true to stop the kernel, not just the job) plus the two tools that
+need Sage's own interpreter (run_file: execute a file the agent already wrote,
+inline results; notebook: drive the Jupyter kernel SageMath ships).  PDFs are a
+separate server, pdf-mcp.
 
 Rule 15: nothing but JSON-RPC may reach stdout.  The real stdout is captured at
 start-up and every diagnostic is redirected to stderr, so a stray print, a
@@ -333,8 +334,14 @@ def tool_status():
     return "\n".join(lines)
 
 
-def tool_interrupt():
+def tool_interrupt(force=False):
+    """SIGINT the running job; `force` stops the whole kernel instead."""
     client = get_client()
+    if force:
+        result = client.kill()
+        if not result.get("ok"):
+            raise ToolError(result["text"])
+        return result["text"]
     pid, message, refused = client.interrupt()
     if refused:
         raise ToolError(message)
@@ -346,14 +353,6 @@ def tool_interrupt():
         "kept its variables (poll to collect the error); if the kernel was idle the "
         "signal was ignored, because SIGINT cannot kill the kernel.",
     )
-
-
-def tool_kill():
-    client = get_client()
-    result = client.kill()
-    if not result.get("ok"):
-        raise ToolError(result["text"])
-    return result["text"]
 
 
 def tool_run_file(path, lang="auto", args=None, timeout_s=None, stdin=None, cwd=None):
@@ -518,20 +517,24 @@ TOOLS = [
             "SIGINT the running computation: the job fails with KeyboardInterrupt and the "
             "session KEEPS its state -- the first thing to try for a runaway job. Refused "
             "when the running job belongs to another MCP client; a no-op when idle: SIGINT "
-            "can never kill the kernel."
+            "can never kill the kernel. force=true is the last resort instead: stop the "
+            "whole kernel (graceful shutdown, then SIGTERM, then SIGKILL), losing every "
+            "session's variables -- for a computation that ignores SIGINT, e.g. a wedged "
+            "C-level loop. The next exec starts a fresh kernel and says so; if the signal "
+            "fails the state files are kept and the pid reported, so a live kernel is "
+            "never orphaned."
         ),
-        "inputSchema": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "kill",
-        "description": (
-            "Last resort: stop the kernel (a graceful shutdown, then SIGTERM, then "
-            "SIGKILL). All sessions and "
-            "variables are lost; the next exec starts a fresh kernel and says so. If the "
-            "signal fails the state files are kept and the pid reported, so a live kernel "
-            "is never orphaned."
-        ),
-        "inputSchema": {"type": "object", "properties": {}, "required": []},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "force": {
+                    "type": "boolean",
+                    "description": "Stop the kernel itself (all state is lost), not just the job.",
+                    "default": False,
+                }
+            },
+            "required": [],
+        },
     },
     {
         "name": "run_file",
@@ -625,7 +628,6 @@ HANDLERS = {
     "drop": tool_drop,
     "status": tool_status,
     "interrupt": tool_interrupt,
-    "kill": tool_kill,
     "run_file": tool_run_file,
     "notebook": tool_notebook,
 }
@@ -714,8 +716,9 @@ def _handle(msg_id, method, params):
             "instructions": (
                 "A persistent Sage kernel. exec runs code on the kernel's main thread "
                 "(state persists per session); timeout_s never cancels a job -- collect "
-                "it with poll. interrupt keeps the session's variables; kill is the "
-                "last resort. run_file executes a file the agent already wrote and "
+                "it with poll. interrupt keeps the session's variables; interrupt with "
+                "force=true stops the kernel itself, and is the last resort. run_file "
+                "executes a file the agent already wrote and "
                 "returns the output inline (python = Sage's interpreter); notebook "
                 "drives SageMath's Jupyter kernel."
             ),

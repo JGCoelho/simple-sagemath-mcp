@@ -25,7 +25,7 @@ import time
 
 TIMEOUT = 90.0
 TOOL_HEAD = ("initialize", "serverInfo")
-TOOLS = ("exec", "poll", "reset", "drop", "status", "interrupt", "kill", "run_file")
+TOOLS = ("exec", "poll", "reset", "drop", "status", "interrupt", "run_file")
 
 
 class Failed(Exception):
@@ -163,7 +163,7 @@ def check(command, args, timeout=TIMEOUT):
         ]
         record("tools/list", bool(names), ", ".join(names))
         missing = [name for name in TOOLS if name not in names]
-        record("the seven kernel tools are advertised", not missing, ", ".join(missing))
+        record("the kernel tools are advertised", not missing, ", ".join(missing))
 
         reply = server.call(
             "tools/call", {"name": "exec", "arguments": {"code": "print(2+2)"}}
@@ -180,9 +180,11 @@ def check(command, args, timeout=TIMEOUT):
         text, is_error = _text(reply)
         record("status", not is_error and "kernel: running" in text, text.splitlines()[0])
 
-        reply = server.call("tools/call", {"name": "kill", "arguments": {}})
+        reply = server.call(
+            "tools/call", {"name": "interrupt", "arguments": {"force": True}}
+        )
         text, is_error = _text(reply)
-        record("kill", not is_error, text.splitlines()[0] if text else "")
+        record("interrupt(force=true)", not is_error, text.splitlines()[0] if text else "")
         return results
     except Failed as exc:
         record("the server answered the handshake", False, str(exc))

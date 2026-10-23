@@ -518,20 +518,22 @@ def suite(server, workdir):
     server.tool("interrupt")
 
     out, _, _ = server.tool("exec", code="keep_me")
-    record("keep_me survived (5) before kill", out.strip() == "5", out)
+    record("keep_me survived (5) before force-interrupt", out.strip() == "5", out)
 
-    out, is_err, _ = server.tool("kill")
-    record("kill reports the stopped kernel", "kernel stopped" in out, out)
+    out, is_err, _ = server.tool("interrupt", force=True)
+    record(
+        "interrupt(force=true) stops the kernel and says so", "kernel stopped" in out, out
+    )
 
     out, _, _ = server.tool("exec", code="1+1")
     record(
-        "exec after kill: '[kernel restarted: ...]' prefix + fresh namespace",
+        "exec after interrupt(force=true): '[kernel restarted: ...]' + fresh namespace",
         out.startswith("[kernel restarted:") and out.rstrip().endswith("2"),
         out,
     )
     out, _, _ = server.tool("exec", code="keep_me")
     record(
-        "the pre-kill variable is gone after kill",
+        "the pre-force variable is gone after the kernel was stopped",
         "NameError" in out,
         out.splitlines()[-1] if out else "",
     )
@@ -594,10 +596,10 @@ def suite(server, workdir):
     tools = server.call("tools/list")["tools"]
     names = [t["name"] for t in tools]
     record(
-        "tools/list advertises the seven kernel tools plus run_file",
-        names[:8] == ["exec", "poll", "reset", "drop", "status", "interrupt",
-                      "kill", "run_file"]
-        and set(names[8:]) <= {"notebook"},
+        "tools/list advertises the six kernel tools plus run_file",
+        names[:7] == ["exec", "poll", "reset", "drop", "status", "interrupt",
+                      "run_file"]
+        and set(names[7:]) <= {"notebook"},
         ", ".join(names),
     )
     poll_props = [t for t in tools if t["name"] == "poll"][0]["inputSchema"]["properties"]
@@ -610,9 +612,17 @@ def suite(server, workdir):
     )
     descriptions = {t["name"]: t["description"] for t in tools}
     record(
-        "interrupt vs kill documented",
-        "KEEPS" in descriptions["interrupt"] and "Last resort" in descriptions["kill"],
+        "interrupt documents its force=true escape hatch",
+        "KEEPS" in descriptions["interrupt"]
+        and "last resort" in descriptions["interrupt"].lower(),
         "",
+    )
+    interrupt_schema = [t for t in tools if t["name"] == "interrupt"][0]["inputSchema"]
+    record(
+        "interrupt takes only an optional force flag",
+        list(interrupt_schema["properties"]) == ["force"]
+        and interrupt_schema.get("required", []) == [],
+        ", ".join(sorted(interrupt_schema["properties"])),
     )
 
 
