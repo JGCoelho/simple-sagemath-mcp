@@ -22,9 +22,9 @@ prints:
 {
   "mcpServers": {
     "sage": {
-      "command": "/path/to/sage-env/bin/python",
+      "command": "/path/to/python-with-mcp/bin/python",
       "args": ["/path/to/sage-mcp/sage_mcp.py"],
-      "env": {"SAGE_CWD": "/tmp"}
+      "env": {"SAGE_PYTHON": "/path/to/sage-env/bin/python", "SAGE_CWD": "/tmp"}
     }
   }
 }
@@ -66,8 +66,11 @@ The kernel preparses by default, so this is **Sage's REPL**, not Python with
 
 ## Architecture
 
-`sage_mcp.py` is the stdio front end (JSON-RPC 2.0, stdlib only);
-`sage_client.py` talks to the kernel over a private Unix socket, under a lock,
+`sage_mcp.py` is the stdio front end, built on the official MCP Python SDK
+(`MCPServer`, stdio transport) so schemas, argument validation and the protocol
+come from the SDK rather than from hand-rolled JSON-RPC; `sage_client.py` talks to
+the kernel over a private Unix socket (HMAC-authenticated, `0700` directory),
+under a lock,
 distinguishing *busy* (alive, not answering) from *gone* (never respawn a busy
 kernel); `sage_kernel.py` runs jobs on the kernel's **main thread**, so
 `cysignals`-based Sage (Singular, PARI, GAP) behaves, and refuses to let a job's
@@ -76,11 +79,13 @@ which stops when the last server exits. See [DESIGN.md](DESIGN.md) for the rest.
 
 ## Requirements
 
-- Linux, and Python 3.8+ that can `import sage.all` -- Sage's *own* interpreter,
-  whose `bin/` (prepended to `PATH`, since `import sage.all` loads Singular from
-  there) also holds the `sage` binary. Conda, source builds and distro packages
-  qualify; `SAGE_PYTHON` overrides the choice.
-- Any MCP client: one stdio server, nothing beyond the standard library.
+- Linux.
+- **Two interpreters, on purpose.** The *server* is any Python 3.10+ with the
+  `mcp` package (that is all it needs); the *kernel* is Sage's own interpreter,
+  found at runtime by `SAGE_PYTHON`, then `sage -c 'import sys;print(sys.executable)'`,
+  then the python beside `sage` on `PATH`. A Sage crash therefore cannot take the
+  transport down, and `mcp` never has to be installed into the Sage environment.
+- Any MCP client: one stdio server.
 - `notebook` needs `nbformat`+`nbconvert`+`nbclient` in that same interpreter
   (they ship with SageMath).
 
@@ -94,7 +99,7 @@ for `exec` and `run_file`, default the server's cwd).
 ## Tests
 
 ```bash
-# 67 checks over MCP stdio, ~60 s
+# 84 checks over MCP stdio (official client), ~85 s
 /path/to/sage-env/bin/python tests/acceptance.py
 
 # 10 checks as a Sage script, ~10 s (`singular` must be on PATH)
@@ -103,9 +108,11 @@ PATH=/path/to/sage-env/bin:$PATH sage tests/interrupt_ownership.sage
 
 `acceptance.py` checks the invariants that are easy to regress: busy-vs-dead,
 spawn serialisation, stale state files, dead launchers, an honest stop, output
-caps, `since` offsets, log isolation, shared-kernel ownership, socket privacy, the
-`run_file` contract, the notebook cycle, and that stdout carried nothing but
-JSON-RPC. `selftest.py` is the 7-check version behind `install.sh --check`.
+caps, `since` offsets, log isolation, shared-kernel ownership, socket privacy and
+the authkey, adoption across a server restart, the three discovery routes, a
+cancelled `exec` still being recoverable, the `run_file` contract, the notebook
+cycle, and that a handler's stray `print` cannot reach the wire. `selftest.py` is
+the 7-check version behind `install.sh --check`.
 
 ## License
 

@@ -13,9 +13,10 @@ import os
 import shutil
 import signal
 import subprocess
-import sys
 import tempfile
 import time
+
+import sage_client
 
 DEFAULT_TIMEOUT = 120.0
 MAX_TIMEOUT = 3600.0
@@ -30,8 +31,20 @@ class RunError(Exception):
     pass
 
 
+def sage_python():
+    """Sage's own interpreter -- the one that can `import sage.all`.
+
+    Not `sys.executable`: the MCP server may run on a plain Python with only
+    `mcp` installed (PLAN §1.2), while these children need Sage.
+    """
+    try:
+        return sage_client.sage_python()
+    except sage_client.KernelError as exc:
+        raise RunError(str(exc))
+
+
 def sage_binary():
-    candidate = os.path.join(os.path.dirname(sys.executable), "sage")
+    candidate = os.path.join(os.path.dirname(sage_python()), "sage")
     if os.access(candidate, os.X_OK):
         return candidate
     return shutil.which("sage")
@@ -69,14 +82,14 @@ def _command(lang, path):
     if lang == "bash":
         return [shutil.which("bash") or "/bin/bash", path]
     if lang == "python":
-        return [sys.executable, path]
+        return [sage_python(), path]
     if lang == "sage":
         binary = sage_binary()
         if not binary:
             raise RunError(
                 "lang='sage' needs the `sage` command next to this Python (%s); "
                 "use lang='python' and `from sage.all import *` instead"
-                % (os.path.dirname(sys.executable),)
+                % (os.path.dirname(sage_python()),)
             )
         return [binary, path]
     return [path]  # exec: the file's own shebang decides
@@ -88,8 +101,14 @@ def _child_env():
     env["NO_COLOR"] = "1"
     env.setdefault("TERM", "dumb")
     # Sage's CLI shells out to Singular and friends, which live beside it.
+    python = sage_client.resolve_python()  # None: Sage missing, e.g. for lang=bash
     env["PATH"] = os.pathsep.join(
-        p for p in (env.get("PATH", "/usr/bin:/bin"), os.path.dirname(sys.executable)) if p
+        p
+        for p in (
+            env.get("PATH", "/usr/bin:/bin"),
+            os.path.dirname(python) if python else "",
+        )
+        if p
     )
     return env
 

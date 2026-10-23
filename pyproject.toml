@@ -7,7 +7,10 @@ name = "simple-sage-mcp"
 version = "1.0.0"
 description = "A small MCP server for one persistent SageMath kernel: eight tools, honest busy/timeout/interrupt semantics."
 readme = "README.md"
-requires-python = ">=3.8"
+# `mcp` ships the server SDK (pydantic, anyio, jsonschema); it is the only runtime
+# dependency of the MCP side.  Sage is NOT a Python dependency: user code runs in
+# a separate kernel process started with Sage's own interpreter.
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "JGCoelho", email = "josegustavocoelho@gmail.com" }]
 keywords = ["mcp", "sagemath", "sage", "model-context-protocol", "computer-algebra"]
@@ -17,7 +20,11 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Topic :: Scientific/Engineering :: Mathematics",
 ]
-dependencies = []
+dependencies = ["mcp>=2.3,<3"]
+
+[project.optional-dependencies]
+# only the `notebook` tool needs these; it runs under Sage's interpreter
+notebook = ["nbformat>=5"]
 
 [project.urls]
 Homepage = "https://github.com/JGCoelho/simple-sagemath-mcp"

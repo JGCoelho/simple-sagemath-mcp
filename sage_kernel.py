@@ -27,16 +27,20 @@ import os
 import queue
 import signal
 import socket
-import socketserver
 import stat
 import sys
 import threading
 import time
 import traceback
+from multiprocessing.connection import AuthenticationError, Listener
+
+# The authkey helpers are shared with the client: one implementation for both
+# sides of the wire (a hand-started kernel creates the key too).
+from sage_client import load_or_create_key
 
 OUTPUT_CAP = 4 * 1024 * 1024  # chars per job, ~4 MB; hard cap, with notice
 REPR_CAP = 4000  # chars of repr(); unbounded reprs have killed agent contexts
-MAX_REQUEST = 8 * 1024 * 1024  # refuse absurd request lines
+MAX_REQUEST = 8 * 1024 * 1024  # refuse absurd request messages
 
 STARTED = time.time()
 
@@ -125,8 +129,8 @@ def _remove_socket():
             pass
 
 
-def _bind_server(path):
-    """Bind the AF_UNIX socket; clear a name only when it is provably dead."""
+def _bind_server(path, authkey):
+    """Bind the AF_UNIX listener; clear a name only when it is provably dead."""
     if os.path.exists(path):
         probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         probe.settimeout(1.0)
@@ -150,12 +154,14 @@ def _bind_server(path):
             )
         finally:
             probe.close()
-    server = _Server(path, _Handler)
+    # `accept()` runs the challenge/response handshake, so a connection without
+    # the authkey never reaches an op handler.
+    listener = Listener(path, backlog=128, authkey=authkey)
     try:
         os.chmod(path, 0o600)
     except OSError:
         pass
-    return server
+    return listener
 
 
 # --------------------------------------------------------------------------
@@ -737,21 +743,35 @@ def _touch_client(req):
             _CLIENTS[cid] = time.monotonic()
 
 
-class _Handler(socketserver.StreamRequestHandler):
-    # No read timeout: a `wait` op may legitimately block for a long time, and
-    # the thread ends as soon as the peer closes or the reply is written.
-    timeout = None
+class _Handler:
+    """One connection: authenticate (in accept), read one request, write one reply.
+
+    No read timeout: a `wait` op may legitimately block for a long time, and the
+    thread ends as soon as the peer closes or the reply is written.
+    """
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    def _send(self, payload):
+        try:
+            self.conn.send_bytes(
+                json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            )
+        except Exception:
+            pass
 
     def handle(self):
         try:
-            line = self.rfile.readline(MAX_REQUEST)
+            raw = self.conn.recv_bytes(MAX_REQUEST)
         except Exception as exc:
             _log("read error: %r" % (exc,))
             return
-        if not line:
+        if raw is None:
+            self._send({"ok": False, "error": "request larger than %d bytes" % MAX_REQUEST})
             return
         try:
-            req = json.loads(line.decode("utf-8", "replace"))
+            req = json.loads(raw.decode("utf-8", "replace"))
             if not isinstance(req, dict):
                 raise ValueError("request must be a JSON object")
         except Exception as exc:
@@ -776,27 +796,32 @@ class _Handler(socketserver.StreamRequestHandler):
             except Exception:
                 _log("post-reply hook failed:\n" + traceback.format_exc())
 
-    def _send(self, payload):
+
+def _serve_conn(conn):
+    try:
+        _Handler(conn).handle()
+    except Exception:
+        _log("connection error:\n" + traceback.format_exc())
+    finally:
         try:
-            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            self.wfile.write(data + b"\n")
-            self.wfile.flush()
-        except Exception:
-            pass
-
-
-class _Server(socketserver.ThreadingUnixStreamServer):
-    daemon_threads = True
-
-    def server_close(self):
-        super().server_close()
-        try:
-            os.unlink(self.server_address)
+            conn.close()
         except OSError:
             pass
 
-    def handle_error(self, request, client_address):
-        _log("connection error from %r:\n%s" % (client_address, traceback.format_exc()))
+
+def _accept_loop(listener):
+    """One daemon thread per connection; ops block only in their own thread."""
+    while True:
+        try:
+            conn = listener.accept()
+        except AuthenticationError as exc:
+            _log("refused a connection: %s" % (exc,))
+            continue
+        except OSError:
+            return  # the listener was closed: shutting down
+        threading.Thread(
+            target=_serve_conn, args=(conn,), name="conn", daemon=True
+        ).start()
 
 
 # --------------------------------------------------------------------------
@@ -871,21 +896,22 @@ def main():
     # rewrites time.sleep(0.4) for it, and the sleep patch lives on it.
     _BASE.setdefault("time", time)
 
-    server = _bind_server(SOCK_PATH)
+    authkey = load_or_create_key(os.path.dirname(STATE_FILE))
+    listener = _bind_server(SOCK_PATH, authkey)
     _write_state(STATE_FILE)
     _log(
-        "listening on unix:%s, state=%s, sage=%s"
+        "listening on unix:%s (authkey), state=%s, sage=%s"
         % (SOCK_PATH, STATE_FILE, SAGE_VERSION)
     )
 
-    thread = threading.Thread(target=server.serve_forever, name="conn", daemon=True)
+    thread = threading.Thread(target=_accept_loop, args=(listener,), name="conn", daemon=True)
     thread.start()
 
     try:
         _executor_main()
     finally:
         try:
-            server.server_close()
+            listener.close()  # unlinks the AF_UNIX path
         except Exception:
             pass
         _remove_socket()

@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# install.sh -- point an MCP client at this server.  No Pi required: it finds a
-# Python that can `import sage.all`, writes a "sage" entry into an mcp.json next
-# to the target directory when one exists, and otherwise prints the JSON to paste
-# into whatever configuration the client uses.
+# install.sh -- register this Sage MCP server with an MCP client (Pi included).
 #
-#   ./install.sh                             register this folder in place
-#   ./install.sh --check                     test the registration instead
-#   ./install.sh /some/other/dir             copy the tree there and register that
-#   PI_AGENT_DIR=/tmp/fake ./install.sh      register into another agent dir
-#   SAGE_PYTHON=/path/to/python ./install.sh use a specific interpreter
+#   ./install.sh                          register this folder in place
+#   ./install.sh /some/other/dir          copy the tree there and register that
+#   ./install.sh --check                  re-test an existing registration
+#   PI_AGENT_DIR=/tmp/fake ./install.sh   register into another agent dir
+#   SAGE_PYTHON=/path/to/python ./install.sh   use a specific Sage interpreter
 #
-# Requirements: Linux, bash, and SageMath (a `sage` on PATH, or SAGE_PYTHON).
-# Run it with bash; `sh install.sh` re-executes itself under bash below.
+# Two interpreters (see DESIGN.md): the *server* needs `mcp` and any Python
+# >= 3.10; the *kernel* needs Sage, which the server itself discovers at
+# runtime ($SAGE_PYTHON -> `sage -c` -> the python beside `sage`).  This script
+# finds both only to fail early, and bakes the discovered Sage interpreter into
+# the registration as SAGE_PYTHON -- an MCP client often starts a server with a
+# minimal PATH, and a stale SAGE_PYTHON degrades back to discovery.
 if [ -z "${BASH_VERSION:-}" ]; then
   exec bash "$0" "$@"
 fi
@@ -28,148 +29,110 @@ PI_AGENT_DIR="${PI_AGENT_DIR:-$HOME/.pi/agent}"
 DST="${1:-$PI_AGENT_DIR/sage-mcp}"
 MCP_JSON="$(dirname "$DST")/mcp.json"
 
-# --------------------------------------------------------------------------
-# the interpreter: the first candidate that can actually import sage.all
-# --------------------------------------------------------------------------
-candidates=()
-[ -n "${SAGE_PYTHON:-}" ] && candidates+=("$SAGE_PYTHON")
-[ -n "${PYTHON:-}" ] && candidates+=("$PYTHON")
-if command -v sage >/dev/null 2>&1; then
-  # `python` is conda/prefix layouts; distro packages ship `python3` only
-  candidates+=("$(dirname "$(command -v sage)")/python")
-  candidates+=("$(dirname "$(command -v sage)")/python3")
-fi
-command -v python3 >/dev/null 2>&1 && candidates+=("$(command -v python3)")
-command -v python  >/dev/null 2>&1 && candidates+=("$(command -v python)")
-
-PY=""
-for candidate in ${candidates+"${candidates[@]}"}; do
-  [ -x "$candidate" ] || continue
-  if PATH="$(dirname "$candidate"):$PATH" "$candidate" -c 'import sage.all' \
-       >/dev/null 2>&1; then
-    PY="$candidate"
-    break
-  fi
-done
-if [ -z "$PY" ] && [ "$CHECK_ONLY" = 0 ]; then
-  echo "error: no interpreter here can 'import sage.all'." >&2
-  echo "       Install SageMath, or point SAGE_PYTHON at Sage's python, e.g." >&2
-  echo "       SAGE_PYTHON=\$(sage -c 'print(__import__(\"sys\").executable)') ./install.sh" >&2
+die() {
+  echo "error: $*" >&2
   exit 1
-fi
+}
+
+# 1. Sage's interpreter -- the same three routes as sage_client.resolve_python().
+find_sage_python() {
+  local sage_bin="" reported="" dir="" name=""
+  if [ -n "${SAGE_PYTHON:-}" ] && [ -x "${SAGE_PYTHON}" ]; then
+    printf '%s\n' "${SAGE_PYTHON}"
+    return 0
+  fi
+  sage_bin="$(command -v sage || true)"
+  [ -n "$sage_bin" ] || return 1
+  reported="$("$sage_bin" -c 'import sys;print(sys.executable)' 2>/dev/null | tail -n 1 || true)"
+  if [ -n "$reported" ] && [ -x "$reported" ]; then
+    printf '%s\n' "$reported"
+    return 0
+  fi
+  dir="$(dirname "$(readlink -f "$sage_bin")")"
+  for name in python python3; do
+    if [ -x "$dir/$name" ]; then
+      printf '%s\n' "$dir/$name"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# 2. The server's interpreter: one that can `import mcp`.
+find_server_python() {
+  local candidate=""
+  for candidate in "${PYTHON:-}" "$(command -v python3 || true)" \
+                   "$(command -v python || true)" "${1:-}"; do
+    [ -n "$candidate" ] && [ -x "$candidate" ] || continue
+    if "$candidate" -c 'import mcp' >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+SAGE_PY="$(find_sage_python || true)"
+SPY="$(find_server_python "$SAGE_PY" || true)"
+
 if [ "$CHECK_ONLY" = 1 ]; then
-  # The registration, not the source tree, is what has to work.
-  PY="${PY:-$(command -v python3)}"
   CONFIG="${1:-$MCP_JSON}"
+  [ -n "$SPY" ] || SPY="$(command -v python3)"
   echo "config : $CONFIG"
-  "$PY" "$SRC/selftest.py" --config "$CONFIG" ${2:+--name "$2"}
-  exit $?
+  [ -n "$SAGE_PY" ] && export SAGE_PYTHON="$SAGE_PY"
+  exec "$SPY" "$SRC/selftest.py" --config "$CONFIG" ${2:+--name "$2"}
 fi
 
-PY="$(cd "$(dirname "$PY")" && pwd)/$(basename "$PY")"
-
-# sage needs its own bin directory on PATH, or `import sage.all` dies with
-# FeatureNotPresentError: singular is not available.
-export PATH="$(dirname "$PY"):$PATH"
+[ -n "$SAGE_PY" ] || die "no interpreter that can 'import sage.all' was found.
+       Install SageMath, or set SAGE_PYTHON to Sage's python:
+       SAGE_PYTHON=\$(sage -c 'print(__import__(\"sys\").executable)') ./install.sh"
+[ -n "$SPY" ] || die "no Python here can 'import mcp' (the MCP SDK).
+       Install it for one of them:  python3 -m pip install 'mcp>=2.3,<3'
+       ...or point PYTHON at an interpreter that already has it."
+SAGE_PY="$(readlink -f "$SAGE_PY")"
+SPY="$(readlink -f "$SPY")"
 
 echo "source : $SRC"
 echo "target : $DST"
-echo "python : $PY"
-echo
+echo "server : $SPY  (imports mcp)"
+echo "sage   : $SAGE_PY  (runs the kernel)"
 
-mkdir -p "$DST/tests"
 if [ "$SRC" != "$DST" ]; then
+  mkdir -p "$DST"
   install -m 0644 "$SRC/sage_mcp.py" "$SRC/sage_client.py" "$SRC/sage_kernel.py" \
-      "$SRC/runfile.py" "$SRC/nbrun.py" "$DST/"
-  install -m 0644 "$SRC/tests/acceptance.py" "$SRC/tests/interrupt_ownership.sage" "$DST/tests/"
-  install -m 0644 "$SRC/selftest.py" "$DST/"
-  for doc in README.md agents-section.md LICENSE pyproject.toml; do
-    [ -f "$SRC/$doc" ] && install -m 0644 "$SRC/$doc" "$DST/"
-  done
-  [ -f "$SRC/example.mcp.json" ] && install -m 0644 "$SRC/example.mcp.json" "$DST/"
+    "$SRC/runfile.py" "$SRC/nbrun.py" "$SRC/selftest.py" "$DST/"
+  chmod 0755 "$DST/sage_mcp.py" "$DST/sage_kernel.py"
 fi
-chmod 0755 "$DST/sage_mcp.py" "$DST/sage_kernel.py"
 
-# leftovers from older layouts: `pdf` is its own server now, and the first
-# `run_file` was an artifact store
-for stale in artifacts.py pdftext.py server.py probe.txt; do
-  if [ -e "$DST/$stale" ]; then
-    rm -f "$DST/$stale"
-    echo "removed stale $stale"
-  fi
-done
-rm -rf "$DST/__pycache__" "$DST/tests/__pycache__"
-
-# --------------------------------------------------------------------------
-# registration
-# --------------------------------------------------------------------------
-CFG="$(
-  "$PY" - "$DST/sage_mcp.py" "$PY" <<'EOF'
+mkdir -p "$(dirname "$MCP_JSON")"
+"$SPY" - "$MCP_JSON" "$DST/sage_mcp.py" "$SPY" "$SAGE_PY" <<'EOF'
 import json
-import sys
-
-script, python = sys.argv[1], sys.argv[2]
-print(json.dumps(
-    {
-        "command": python,
-        "args": [script],
-        "env": {"SAGE_CWD": "/tmp"},
-    },
-    indent=2,
-))
-EOF
-)"
-
-if [ -f "$MCP_JSON" ]; then
-  "$PY" - "$MCP_JSON" "$DST/sage_mcp.py" "$PY" <<'EOF'
-import json
+import os
 import shutil
 import sys
 
-path, script, python = sys.argv[1], sys.argv[2], sys.argv[3]
-with open(path) as fh:
-    data = json.load(fh)
-shutil.copy2(path, path + ".bak")
-data.setdefault("mcpServers", {})["sage"] = {
+path, script, python, sage = sys.argv[1:5]
+entry = {
     "command": python,
     "args": [script],
-    "env": {"SAGE_CWD": "/tmp"},
+    "env": {"SAGE_CWD": "/tmp", "SAGE_PYTHON": sage},
     "exposure": "direct",
 }
+if os.path.exists(path):
+    with open(path) as fh:
+        data = json.load(fh)
+    shutil.copy2(path, path + ".bak")
+else:
+    data = {}
+data.setdefault("mcpServers", {})["sage"] = entry
 with open(path, "w") as fh:
     json.dump(data, fh, indent=2)
     fh.write("\n")
-print("patched %s" % path)
+print("registered the %r entry in %s" % ("sage", path))
 EOF
-else
-  echo "No $MCP_JSON here.  Add this to your MCP client's config as \"sage\":"
-  echo "$CFG"
-fi
-
-if [ -x "$DST/sage_mcp.py" ] || [ -f "$DST/sage_mcp.py" ]; then
-  echo
-  echo "verifying the registration (a throwaway kernel, not the live one):"
-  if "$PY" "$DST/selftest.py" "$PY" "$DST/sage_mcp.py"; then
-    echo "the registration works."
-  else
-    echo "error: the server does not answer '2+2' -- fix that before using it" >&2
-    exit 1
-  fi
-fi
-
-if [ -f "$DST/agents-section.md" ] && [ -f "$PI_AGENT_DIR/AGENTS.md" ]; then
-  echo
-  echo "Replace the '## Sage (MCP: \`sage\`)' section of $PI_AGENT_DIR/AGENTS.md with:"
-  echo "------------------------------------------------------------"
-  cat "$DST/agents-section.md"
-  echo "------------------------------------------------------------"
-fi
 
 echo
-echo "done. Restart the client (in Pi: restart or reload MCP servers):"
-echo "  exec poll reset drop status interrupt run_file notebook"
+echo "verifying the registration (a throwaway kernel, never the live one):"
+SAGE_PYTHON="$SAGE_PY" "$SPY" "$SRC/selftest.py" --config "$MCP_JSON"
 echo
-echo "Verify with:"
-echo "  ./install.sh --check                     (re-test this registration)"
-echo "  cd /tmp && $PY $DST/tests/acceptance.py"
-echo "  cd /tmp && $(dirname "$PY")/sage $DST/tests/interrupt_ownership.sage"
+echo "done. Restart the client (in Pi: reload MCP servers) to pick it up."

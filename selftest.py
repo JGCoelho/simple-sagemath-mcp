@@ -151,7 +151,17 @@ def check(command, args, timeout=TIMEOUT):
             return results
         record("spawn %s" % " ".join([command] + list(args)), True)
 
-        reply = server.call("initialize", timeout=timeout)
+        # `protocolVersion` is required by the spec (and by the SDK's server);
+        # a server negotiates it, so any supported version is a valid probe.
+        reply = server.call(
+            "initialize",
+            {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "selftest", "version": "1"},
+            },
+            timeout=timeout,
+        )
         info = (reply.get("result") or {}).get("serverInfo") or {}
         record("initialize", "error" not in reply, json.dumps(info))
 

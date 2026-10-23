@@ -7,25 +7,59 @@ can outlive the run and would keep an inherited pipe open, making the call look
 hung long after the notebook was written.
 """
 
-import importlib.util
 import os
-import shutil
 import subprocess
-import sys
 import time
+
+import sage_client
 
 
 class NotebookError(Exception):
     pass
 
 
+_AVAILABLE = []  # cached: one probe per server process
+
+
+def sage_python():
+    """The interpreter that runs nbconvert: Sage's, not necessarily ours."""
+    try:
+        return sage_client.sage_python()
+    except sage_client.KernelError as exc:
+        raise NotebookError(str(exc))
+
+
 def available():
-    """True when both reading and executing notebooks is possible."""
-    return bool(
-        importlib.util.find_spec("nbformat")
-        and importlib.util.find_spec("nbconvert")
-        and importlib.util.find_spec("nbclient")
-    )
+    """True when *Sage's* interpreter can read and execute notebooks.
+
+    The server may run on a plain Python with only `mcp` (PLAN §1.2), so asking
+    our own sys.path would answer for the wrong interpreter.
+    """
+    if _AVAILABLE:
+        return _AVAILABLE[0]
+    ok = False
+    try:
+        python = sage_client.resolve_python()
+        if python:
+            ok = (
+                subprocess.run(
+                    [
+                        python,
+                        "-c",
+                        "import importlib.util as u; "
+                        "raise SystemExit(0 if all(u.find_spec(m) for m in "
+                        "('nbformat', 'nbconvert', 'nbclient')) else 1)",
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    timeout=120,
+                ).returncode
+                == 0
+            )
+    except (OSError, subprocess.SubprocessError):
+        ok = False
+    _AVAILABLE.append(ok)
+    return ok
 
 
 def _nbformat():
@@ -162,7 +196,7 @@ def run(path, out=None, in_place=False, cell_timeout_s=120, timeout_s=None, stat
     produced = os.path.join(destdir, tmp_base + ".ipynb")
 
     cmd = [
-        sys.executable,
+        sage_python(),
         "-m",
         "nbconvert",
         "--to",

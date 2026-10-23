@@ -3,21 +3,25 @@
 The parts of the README that were too long to keep there. `README.md` says *what*
 the server does; this file says *why* it is built that way.
 
-## Why the protocol is hand-rolled
+## On the SDK, and what stayed ours
 
-The server is stdio JSON-RPC 2.0, one object per line, stdlib only. The stdio
-layer is a few hundred lines of `json.dumps` over a pipe, which is what makes
-`pip install` enough: the server must run under Sage's *own* interpreter, where
-every dependency is another thing that can fail to build or clash with the Sage
-environment.
+The MCP layer is the official SDK (`mcp.server.mcpserver.MCPServer`, stdio
+transport): schemas and argument validation come from type hints, sync handlers
+run on worker threads (so `poll`/`status`/`interrupt` answer while `exec` waits),
+and while serving, fd 1 is pointed at stderr, so a handler that prints cannot
+corrupt the wire -- a test asserts that rather than trusting it.
 
-The price is that only what these tools need is implemented -- `initialize`,
-`tools/list`, `tools/call`, `ping` and empty `resources`/`prompts` lists. There
-is no capability negotiation, no progress notifications, no tool annotations, no
-`structuredContent`, and `notifications/cancelled` is deliberately ignored (a
-timeout is not a cancel). Descriptions and text results carry that semantic load
-instead. An `mcp`-SDK proxy can be put in front if the newer bits are needed; the
-wire is plain JSON-RPC 2.0 and the tools are ordinary functions.
+This is affordable only because of the split it forced: the *server* needs
+`mcp` and nothing else, the *kernel* is Sage's interpreter discovered at runtime.
+The hand-rolled predecessor existed because `mcp` would otherwise have had to go
+into the Sage environment, where every dependency is a thing that can fail to
+build or clash. Two interpreters also mean a Sage crash cannot take the transport
+down.
+
+What stayed ours is what no SDK provides: user code on the kernel's main thread,
+`timeout` that never cancels (job id + `poll` instead), busy-vs-dead, interrupt
+ownership, the crash-loop guard, and the resource limits. Those are the promises
+the tool descriptions carry.
 
 ## Three details that are easy to get wrong
 

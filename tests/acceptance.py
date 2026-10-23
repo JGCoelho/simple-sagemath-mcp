@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""acceptance.py -- drives sage_mcp.py over stdio and runs the spec's §9 suite.
+"""acceptance.py -- drives sage_mcp.py through the official MCP client.
 
     python tests/acceptance.py [--python /path/to/sageenv/python]
 
-Every line the server writes to stdout is parsed as JSON-RPC; a single
-non-JSON line fails the whole run (rule 15).
+Every request goes through `mcp.client.stdio` + `ClientSession`, i.e. the same
+code path a real client uses; the suite tests the wire contract, not a private
+harness.  Rule 15 (nothing but JSON-RPC on stdout) is measured directly by
+`stdout_hygiene()`: a stray handler print would break the session, and does not.
 """
 
+import asyncio
 import json
 import os
-import queue
 import shutil
 import socket
 import stat
@@ -19,27 +21,38 @@ import tempfile
 import threading
 import time
 
+from mcp import ClientSession, StdioServerParameters  # noqa: E402
+from mcp.client.stdio import stdio_client  # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 SERVER = os.path.join(ROOT, "sage_mcp.py")
+
+
 def _sage_python():
-    """An interpreter that can import sage.all: $SAGE_PYTHON, else the python
-    beside `sage` on PATH, else this one."""
+    """Sage's interpreter: $SAGE_PYTHON, else the python beside `sage`.
+
+    The *kernel* runs there; the server may run on a plain Python, which is why
+    PYTHON (below) is this process's interpreter and this one only widens PATH.
+    """
     explicit = os.environ.get("SAGE_PYTHON")
     if explicit and os.path.exists(explicit):
         return explicit
     sage_bin = shutil.which("sage")
     if sage_bin:
-        candidate = os.path.join(os.path.dirname(sage_bin), "python")
-        if os.path.exists(candidate):
-            return candidate
+        for name in ("python", "python3"):
+            candidate = os.path.join(os.path.dirname(os.path.realpath(sage_bin)), name)
+            if os.path.exists(candidate):
+                return candidate
     return sys.executable
 
 
-PYTHON = _sage_python()
+PYTHON = sys.executable  # the server's interpreter: this one (it imports `mcp`)
+SAGE_PYTHON = _sage_python()  # the kernel's: discovered by the server at runtime
 
 RESULTS = []
-BAD_OUTPUT = []
+ERROR_TEXT = []  # isError results whose own message did not survive the SDK
+NOISE_MARKER = "stray handler stdout"  # printed by exec under SAGE_MCP_STDOUT_NOISE
 
 
 def record(name, ok, detail=""):
@@ -51,110 +64,135 @@ def record(name, ok, detail=""):
             print("       " + line)
 
 
+def server_params(state_dir, extra_env=None):
+    env = os.environ.copy()
+    env["SAGE_MCP_STATE"] = state_dir
+    env.setdefault("SAGE_CWD", "/tmp")
+    # The server discovers Sage itself; PATH is what makes that possible when it
+    # runs on a plain Python (two interpreters: PLAN §1.2).
+    dirs = [os.path.dirname(PYTHON)]
+    if os.path.dirname(SAGE_PYTHON) not in dirs:
+        dirs.append(os.path.dirname(SAGE_PYTHON))
+    env["PATH"] = os.pathsep.join(dirs + [env.get("PATH", "")])
+    env.update(extra_env or {})
+    return StdioServerParameters(command=PYTHON, args=[SERVER], env=env, cwd=ROOT)
+
+
 class Server:
-    def __init__(self, state_dir):
-        env = os.environ.copy()
-        env["SAGE_MCP_STATE"] = state_dir
-        env["PATH"] = os.path.dirname(PYTHON) + os.pathsep + env.get("PATH", "")
-        self.proc = subprocess.Popen(
-            [PYTHON, SERVER],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            cwd=ROOT,
+    """One server process, driven synchronously through the official client.
+
+    The suite is synchronous and the MCP client is asyncio-only, so the session
+    lives on its own event loop in a daemon thread and every call is submitted
+    to it.  `close()` stops that loop with the client's context managers still
+    open, which closes the server's stdin -- exactly a client shutting down.
+    """
+
+    def __init__(self, state_dir, extra_env=None, errlog=None):
+        self.state_dir = state_dir
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
+        self._thread.start()
+        self._session = None
+        self._ready = threading.Event()
+        self._closed = False
+        self._errlog = errlog or sys.stderr
+        self._task = asyncio.run_coroutine_threadsafe(
+            self._serve(state_dir, extra_env), self._loop
         )
-        self.next_id = 0
-        self.lock = threading.Lock()
-        self.waiters = {}
-        self.stderr_lines = []
-        self.reader = threading.Thread(target=self._read_stdout, daemon=True)
-        self.reader.start()
-        self.err_reader = threading.Thread(target=self._read_stderr, daemon=True)
-        self.err_reader.start()
-        self.initialize()
+        if not self._ready.wait(180):
+            raise AssertionError("the server did not answer initialize")
+        if self._session is None:  # _serve failed before the session existed
+            self.close()
+            raise AssertionError("the server failed to start: %s" % (self._task.exception(),))
 
-    def _read_stdout(self):
-        for raw in self.proc.stdout:
-            text = raw.decode("utf-8", "replace").strip()
-            if not text:
-                continue
-            try:
-                msg = json.loads(text)
-            except ValueError:
-                BAD_OUTPUT.append(text)
-                continue
-            if not isinstance(msg, dict) or "jsonrpc" not in msg:
-                BAD_OUTPUT.append(text)
-                continue
-            msg_id = msg.get("id")
-            with self.lock:
-                waiter = self.waiters.pop(msg_id, None)
-            if waiter is not None:
-                waiter.put(msg)
-
-    def _read_stderr(self):
-        for raw in self.proc.stderr:
-            self.stderr_lines.append(raw.decode("utf-8", "replace").rstrip())
-
-    def call(self, method, params=None, timeout=120.0, notify=False):
-        with self.lock:
-            self.next_id += 1
-            msg_id = self.next_id
-            waiter = queue.Queue()
-            if not notify:
-                self.waiters[msg_id] = waiter
-        payload = {"jsonrpc": "2.0", "method": method}
-        if not notify:
-            payload["id"] = msg_id
-        if params is not None:
-            payload["params"] = params
-        self.proc.stdin.write((json.dumps(payload) + "\n").encode("utf-8"))
-        self.proc.stdin.flush()
-        if notify:
-            return None
+    async def _serve(self, state_dir, extra_env):
+        self._stop = asyncio.Event()
         try:
-            reply = waiter.get(timeout=timeout)
-        except queue.Empty:
-            raise AssertionError("timed out waiting for %s" % method)
-        if "error" in reply:
-            raise AssertionError("%s failed: %s" % (method, reply["error"]))
-        return reply["result"]
+            async with stdio_client(
+                server_params(state_dir, extra_env), errlog=self._errlog
+            ) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    self._session = session
+                    self._ready.set()
+                    await self._stop.wait()
+        finally:
+            self._ready.set()
 
-    def initialize(self):
-        result = self.call(
-            "initialize",
+    def _result(self, coro, what, timeout=300.0):
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        try:
+            return future.result(timeout)
+        except TimeoutError:
+            future.cancel()
+            raise AssertionError("timed out waiting for %s" % what)
+
+    def tools(self):
+        listing = self._result(self._session.list_tools(), "tools/list", timeout=60)
+        return [
             {
-                "protocolVersion": "2025-06-18",
-                "capabilities": {},
-                "clientInfo": {"name": "acceptance", "version": "1"},
-            },
-            timeout=30,
-        )
-        self.call("notifications/initialized", None, notify=True)
-        return result
+                "name": tool.name,
+                "description": tool.description or "",
+                "inputSchema": tool.input_schema or {},
+            }
+            for tool in listing.tools
+        ]
 
     def tool(self, tool_name, **arguments):  # `name` is a tool argument now
-        reply = self.call(
-            "tools/call", {"name": tool_name, "arguments": arguments}, timeout=300
+        result = self._result(
+            self._session.call_tool(tool_name, arguments), "tools/call %s" % tool_name
         )
         text = "".join(
-            block.get("text", "")
-            for block in reply.get("content") or []
-            if block.get("type") == "text"
+            getattr(block, "text", "")
+            for block in result.content or []
+            if getattr(block, "type", None) == "text"
         )
-        return text, bool(reply.get("isError")), reply
+        is_error = bool(result.is_error)
+        if is_error:
+            text = _strip_error_prefix(tool_name, text)
+        return text, is_error, result
+
+    def cancel_tool(self, tool_name, arguments, after=0.5):
+        """Send a tools/call and cancel it after `after` seconds (C13)."""
+        future = asyncio.run_coroutine_threadsafe(
+            self._session.call_tool(tool_name, arguments), self._loop
+        )
+        time.sleep(after)
+        was_running = not future.done()
+        future.cancel()
+        try:
+            future.result(10)
+        except BaseException:  # CancelledError, or the reply the cancel discarded
+            pass
+        return was_running
 
     def close(self):
+        if self._closed:
+            return
+        self._closed = True
         try:
-            self.proc.stdin.close()
-        except Exception:
+            self._loop.call_soon_threadsafe(self._stop.set)
+            self._task.result(90)
+        except BaseException:  # a shutdown hiccup must not mask the test result
             pass
-        try:
-            self.proc.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            self.proc.wait()
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(20)
+
+
+def _strip_error_prefix(tool_name, text):
+    """Undo the SDK's fixed prefix and keep the message the handler raised.
+
+    `mcp` renders a raised `ToolError` as "Error executing tool <name>: <msg>".
+    The prefix is fixed, so it is checked to be exactly that before it is
+    dropped; a bare "Error executing tool <name>" means a *crash* (the SDK
+    withholds the exception text) and is recorded rather than read as a
+    diagnosis.
+    """
+    fixed = "Error executing tool %s" % tool_name
+    if text.startswith(fixed + ": "):
+        return text[len(fixed) + 2:]
+    ERROR_TEXT.append("%s: %r" % (tool_name, text[:200]))
+    return text
 
 
 # --------------------------------------------------------------------------
@@ -588,13 +626,13 @@ def suite(server, workdir):
         second.close()
 
     run_file_suite(server, workdir)
-    if "notebook" in [t["name"] for t in server.call("tools/list")["tools"]]:
+    if "notebook" in [t["name"] for t in server.tools()]:
         notebook_suite(server, workdir)
     else:
         print("[SKIP] notebook (nbformat/nbconvert/nbclient not importable)")
 
     # tool list
-    tools = server.call("tools/list")["tools"]
+    tools = server.tools()
     names = [t["name"] for t in tools]
     record(
         "tools/list advertises the six kernel tools plus run_file",
@@ -890,6 +928,287 @@ def extra_invariants(workdir):
 
     client.kill()
 
+
+# --------------------------------------------------------------------------
+# rule 15, measured: handler stdout cannot reach the wire
+# --------------------------------------------------------------------------
+def stdout_hygiene(workdir):
+    """A stray print inside a tool handler goes to stderr, not to the wire.
+
+    `SAGE_MCP_STDOUT_NOISE=1` makes the exec handler print a marker; the SDK
+    claims fd 1 for the wire and points it at stderr while serving.  If that
+    were not so, the transport would read a non-JSON line and the session would
+    break -- so "the marker is on stderr" *and* "the session still answers"
+    are both asserted.
+    """
+    log_path = os.path.join(workdir, "noise-stderr.log")
+    with open(log_path, "w", encoding="utf-8") as errlog:
+        server = Server(os.path.join(workdir, "noise"), {"SAGE_MCP_STDOUT_NOISE": "1"}, errlog)
+        try:
+            first, first_err, _ = server.tool("exec", code="7*6")
+            second, second_err, _ = server.tool("exec", code="6*7")
+        finally:
+            server.close()
+    with open(log_path, encoding="utf-8", errors="replace") as fh:
+        noise = fh.read()
+    record(
+        "rule 15: a stray print in a handler reaches stderr",
+        NOISE_MARKER in noise,
+        "%d bytes on stderr" % len(noise),
+    )
+    record(
+        "rule 15: the wire survives a handler print",
+        first.strip() == "42" and second.strip() == "42" and not (first_err or second_err),
+        "%r / %r" % (first.strip(), second.strip()),
+    )
+
+
+# --------------------------------------------------------------------------
+# §1.5 / C13: a cancelled exec is still collectable
+# --------------------------------------------------------------------------
+def cancellation_recovery(workdir):
+    """Cancel an `exec` request mid-job; status/poll must still recover it.
+
+    The SDK cancels the async task, but a sync handler runs on a worker thread
+    that cannot be interrupted, so the job keeps running with its output in the
+    kernel while the agent never receives the job id.  `status` therefore names
+    the last job submitted per session, and `poll(job_id)` drains it.
+    """
+    server = Server(os.path.join(workdir, "cancel"))
+    try:
+        # Warm-up: the first exec pays the kernel spawn (Sage takes seconds), and
+        # a job cannot be lost before it was submitted.
+        server.tool("exec", code="cancelled_marker = 0")
+        cancelled = server.cancel_tool(
+            "exec",
+            {
+                "code": "print('cancel-marker')\nimport time; time.sleep(4)\ncancelled_marker = 11",
+                "timeout_s": 30,
+            },
+            after=0.6,
+        )
+        record("§1.5: the exec request was cancelled mid-job", cancelled)
+
+        text, _, _ = server.tool("status")
+        lines = [row for row in text.splitlines() if row.startswith("last job per session")]
+        job_id = None
+        if lines and "default=" in lines[0]:
+            job_id = lines[0].split("default=", 1)[1].split(",")[0].strip()
+        record(
+            "§1.5: status names the job whose reply was cancelled",
+            bool(job_id) and job_id.startswith("j"),
+            lines[0] if lines else text,
+        )
+
+        final = ""
+        deadline = time.time() + 40
+        while job_id and time.time() < deadline:
+            final, _, _ = server.tool("poll", job_id=job_id, since=0)
+            if "[job finished in" in final:
+                break
+            time.sleep(0.3)
+        record(
+            "§1.5: poll recovers the cancelled job's output",
+            "cancel-marker" in final and "[job finished in" in final,
+            final.splitlines()[-1] if final.strip() else "(nothing)",
+        )
+
+        after, _, _ = server.tool("exec", code="cancelled_marker")
+        record(
+            "§1.5: the cancelled exec left its session state intact",
+            after.strip() == "11",
+            after.strip(),
+        )
+    finally:
+        server.close()
+
+
+# --------------------------------------------------------------------------
+# phase 2: transport, authkey, adoption, discovery
+# --------------------------------------------------------------------------
+def transport_invariants(workdir):
+    """multiprocessing.connection transport: authkey, refusal, adoption."""
+    sys.path.insert(0, ROOT)
+    import sage_client as sc
+    from multiprocessing.connection import AuthenticationError, Client
+
+    state_dir = os.path.join(workdir, "transport")
+    client = sc.Client(state_dir)
+    client.ensure()
+
+    # two interpreters: the kernel must be the *discovered* Sage python, not
+    # whatever runs this server (it may be a plain Python with only `mcp`).
+    try:
+        with open(client.log_path, encoding="utf-8", errors="replace") as fh:
+            spawn_log = fh.read()
+    except OSError:
+        spawn_log = ""
+    record(
+        "transport: the kernel is spawned with Sage's interpreter",
+        ("python=%s" % SAGE_PYTHON) in spawn_log,
+        "server=%s kernel=%s" % (PYTHON, SAGE_PYTHON),
+    )
+
+    mode = stat.S_IMODE(os.stat(client.key_path).st_mode)
+    record(
+        "transport: the authkey is 32 bytes, 0600, inside the 0700 state dir",
+        mode == 0o600
+        and os.path.getsize(client.key_path) == sc.KEY_BYTES
+        and stat.S_IMODE(os.stat(state_dir).st_mode) == 0o700,
+        "%s mode=%03o size=%d" % (client.key_path, mode, os.path.getsize(client.key_path)),
+    )
+
+    # a raw client with a foreign authkey is refused by the kernel itself
+    refused = ""
+    try:
+        conn = Client(client.sock_path, authkey=os.urandom(sc.KEY_BYTES))
+        conn.send_bytes(b'{"op": "hello"}')
+        conn.recv_bytes(4096)
+        conn.close()
+    except AuthenticationError as exc:
+        refused = "AuthenticationError: %s" % exc
+    except (OSError, EOFError) as exc:
+        refused = "%s: %s" % (type(exc).__name__, exc)
+    record("transport: a foreign authkey is refused", bool(refused), refused or "accepted!")
+    record(
+        "transport: the kernel survives a refused connection",
+        client.status_snapshot()["state"] == "running",
+    )
+
+    # our own client with the wrong key file: a clear error, not a pickle traceback
+    with open(client.key_path, "rb") as fh:
+        good = fh.read()
+    with open(client.key_path, "wb") as fh:
+        fh.write(os.urandom(sc.KEY_BYTES))
+    try:
+        message = "(no exception)"
+        try:
+            sc.Client(state_dir).hello(timeout=5.0)
+        except sc.KernelError as exc:
+            message = str(exc)
+    finally:
+        with open(client.key_path, "wb") as fh:
+            fh.write(good)
+    record(
+        "transport: a wrong authkey is reported clearly",
+        "authkey" in message and "Traceback" not in message,
+        message.splitlines()[0] if message else "",
+    )
+    record(
+        "transport: the kernel survives a wrong-authkey client",
+        client.op("hello")["ok"] and client.status_snapshot()["state"] == "running",
+    )
+    client.kill()
+
+    # adoption: a *new MCP server* reaches the kernel the first one started
+    adopt_dir = os.path.join(workdir, "adopt")
+    first = Server(adopt_dir)
+    keeper = Server(adopt_dir)  # a second live client: the kernel must survive
+    try:
+        first.tool("exec", code="adopted_value = 314")
+        first_status, _, _ = first.tool("status")
+        pid = _status_pid(first_status)
+        keeper.tool("status")
+        first.close()  # kernel kept: `keeper` is a live client
+        third = Server(adopt_dir)
+        try:
+            text, _, _ = third.tool("exec", code="adopted_value")
+            status, _, _ = third.tool("status")
+        finally:
+            third.close()
+        record(
+            "adoption: a restarted server reaches the same kernel",
+            text.strip() == "314" and _status_pid(status) == pid and pid is not None,
+            "%r | kernel pid %s -> %s" % (text.strip(), pid, _status_pid(status)),
+        )
+    finally:
+        keeper.close()
+
+
+def _status_pid(status):
+    """The pid from a `status` line: "kernel: running, up 1s (pid 720)"."""
+    for row in status.splitlines():
+        if row.startswith("kernel: running") and "(pid " in row:
+            return row.rsplit("(pid ", 1)[1].rstrip(")").strip()
+    return None
+
+
+def _resolve_in(env):
+    """Run resolve_python() in a fresh process with `env` (the cache is per process)."""
+    code = (
+        "import sys; sys.path.insert(0, %r); import sage_client\n"
+        "print(sage_client.resolve_python())\n" % ROOT
+    )
+    done = subprocess.run(
+        [PYTHON, "-c", code], env=env, capture_output=True, text=True, timeout=180
+    )
+    return done.stdout.strip(), (done.stderr or "").strip()
+
+
+def discovery_invariants(workdir):
+    """PLAN §1.2/§9.3: $SAGE_PYTHON -> `sage -c` -> the python beside `sage`.
+
+    Each route is measured in its own process with a controlled PATH, because
+    resolve_python() caches its answer (one `sage -c` spawn per server).
+    """
+    base = os.environ.copy()
+    base.pop("SAGE_PYTHON", None)
+    expected = os.path.abspath(SAGE_PYTHON)
+    real_sage = shutil.which("sage") or os.path.join(os.path.dirname(expected), "sage")
+
+    env = dict(base, SAGE_PYTHON=SAGE_PYTHON)
+    found, _ = _resolve_in(env)
+    record("discovery: $SAGE_PYTHON is used first", found == expected, found)
+
+    fakebin = os.path.join(workdir, "sage-on-path")
+    os.makedirs(fakebin, exist_ok=True)
+    os.symlink(real_sage, os.path.join(fakebin, "sage"))
+    env = dict(base, PATH=fakebin + os.pathsep + base.get("PATH", ""))
+    found, err = _resolve_in(env)
+    record(
+        "discovery: a `sage` on PATH is asked for its interpreter",
+        found == expected,
+        found or err,
+    )
+
+    broken = os.path.join(workdir, "broken-sage")
+    os.makedirs(broken, exist_ok=True)
+    shim = os.path.join(broken, "sage")
+    with open(shim, "w", encoding="utf-8") as fh:
+        fh.write("#!/bin/sh\nexit 1\n")
+    os.chmod(shim, 0o755)
+    os.symlink(SAGE_PYTHON, os.path.join(broken, "python3"))
+    env = dict(base, PATH=broken + os.pathsep + base.get("PATH", ""))
+    found, err = _resolve_in(env)
+    record(
+        "discovery: the python beside a broken `sage` is the last route",
+        os.path.realpath(found) == os.path.realpath(expected),
+        found or err,
+    )
+
+    empty = os.path.join(workdir, "no-sage")
+    os.makedirs(empty, exist_ok=True)
+    env = dict(base, PATH=empty)
+    found, _ = _resolve_in(env)
+    code = (
+        "import sys; sys.path.insert(0, %r); import sage_client\n"
+        "try:\n    sage_client.sage_python()\n"
+        "except sage_client.KernelError as exc:\n    print(exc)\n" % ROOT
+    )
+    done = subprocess.run(
+        [PYTHON, "-c", code], env=env, capture_output=True, text=True, timeout=180
+    )
+    text = done.stdout
+    record(
+        "discovery: no Sage -> None, and an error naming the three routes",
+        found == "None"
+        and "SAGE_PYTHON" in text
+        and "sage -c" in text
+        and "beside" in text,
+        text.strip().splitlines()[0] if text.strip() else "(no error text)",
+    )
+
+
 # --------------------------------------------------------------------------
 def main():
     global PYTHON
@@ -915,11 +1234,15 @@ def main():
 
     client_invariants(workdir)
     extra_invariants(workdir)
+    transport_invariants(workdir)
+    discovery_invariants(workdir)
+    cancellation_recovery(workdir)
+    stdout_hygiene(workdir)
 
     record(
-        "rule 15: stdout carried only JSON-RPC",
-        not BAD_OUTPUT,
-        "\n".join(BAD_OUTPUT[:5]),
+        "errors reach the model with the tool's own message",
+        not ERROR_TEXT,
+        "\n".join(ERROR_TEXT[:5]),
     )
 
     failed = [name for name, ok, _ in RESULTS if not ok]

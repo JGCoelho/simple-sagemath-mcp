@@ -4,12 +4,17 @@
 Non-obvious rules encoded here (each one was a bug):
 
 * A **busy** kernel is not a dead kernel.  If the Unix socket accepts a
-  connection but ``hello``/the op times out, the kernel is alive and merely
+  connection but the handshake/reply times out, the kernel is alive and merely
   holding the GIL inside a computation: raise :class:`KernelBusy` and NEVER
   respawn (that would orphan a live kernel and start a second one).
 * The socket lives in a directory that must be owned by us and mode 0700.
   ``/tmp`` is sticky, not protective: another user can create
   ``/tmp/sage-mcp-<uid>`` first and would then own the socket path.
+* Framing is ``multiprocessing.connection`` (``Client`` + ``send_bytes`` /
+  ``recv_bytes``): the 64 MB reply cap is a parameter, and the *authkey* -- 32
+  random bytes in a 0600 file inside that 0700 directory, never on a command
+  line -- means a same-user process that finds the socket path still cannot
+  drive the kernel without the key.
 * Spawning is serialised with ``O_CREAT|O_EXCL`` on ``spawn.lock``; a second
   client waits for the first one's kernel.  The lock is reclaimed only when its
   mtime is older than the wait budget.
@@ -20,18 +25,15 @@ Non-obvious rules encoded here (each one was a bug):
 * Every response read is capped at 64 MB.
 """
 
-import errno
 import json
 import os
 import shutil
-import socket
 import stat
 import subprocess
-import sys
 import threading
 import time
-import traceback
 import uuid
+from multiprocessing.connection import AuthenticationError, Client as ConnectClient
 
 MAX_RESPONSE = 64 * 1024 * 1024  # rule 19
 SPAWN_TIMEOUT = 180.0  # rule 14: how long we wait for a launcher
@@ -40,11 +42,12 @@ STATE_NAME = "kernel.json"
 SOCK_NAME = "kernel.sock"  # AF_UNIX: no TCP port, nothing another user can dial
 RUNNING_NAME = "running.json"  # written by the kernel: the job executing now
 LOG_NAME = "kernel.log"
+KEY_NAME = "kernel.key"  # the kernel's authkey: 32 random bytes, mode 0600
+KEY_BYTES = 32
 DIR_MODE = 0o700
 SUN_PATH_MAX = 100  # Linux sun_path is 108 bytes including the trailing NUL
 HELLO_TIMEOUT = 5.0
 OP_TIMEOUT = 30.0
-CONNECT_TIMEOUT = 3.0
 KERNEL_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sage_kernel.py")
 
 
@@ -124,29 +127,97 @@ def _sage_ish(path):
     return os.access(os.path.join(os.path.dirname(path), "sage"), os.X_OK)
 
 
-def resolve_python():
-    """Interpreter that can `import sage.all`, or the one we are running on.
+DISCOVERY_HELP = (
+    "no interpreter that can 'import sage.all' was found.  Tried, in order:\n"
+    "  1. $SAGE_PYTHON -- not set, or not an existing file\n"
+    "  2. `sage -c 'import sys;print(sys.executable)'` -- no `sage` on PATH, or it failed\n"
+    "  3. the python beside `sage` on PATH -- no `sage` on PATH, or no python beside it\n"
+    "Point SAGE_PYTHON at Sage's own interpreter, e.g.\n"
+    "  SAGE_PYTHON=$(sage -c 'print(__import__(\"sys\").executable)')"
+)
 
-    Order: $SAGE_PYTHON, then our own interpreter, then the python beside the
-    `sage` found on PATH.  Nothing machine-specific is baked in: an install that
-    is not the sage environment fails loudly at spawn time (the launcher's log
-    names the missing import), and $SAGE_PYTHON fixes it.
+_PYTHON = []  # cache of the *discovered* answer: `sage -c` is a process spawn
+
+
+def resolve_python():
+    """Sage's interpreter for the kernel (and for run_file/notebook children).
+
+    The only place that knows where Sage is (PLAN §1.2): $SAGE_PYTHON, then
+    `sage -c 'import sys;print(sys.executable)'`, then the python beside the
+    `sage` found on PATH.  Returns None when none of them works -- a client must
+    still be constructible then, or even `status` could not explain the
+    problem; DISCOVERY_HELP names all three routes when something needs one.
+
+    $SAGE_PYTHON is re-read on every call (it is an override a user or a test
+    can set at any time); only the `sage -c` discovery is cached, because it
+    spawns a process and the answer cannot change under a running server.
     """
     explicit = os.environ.get("SAGE_PYTHON")
     if explicit and os.path.exists(explicit):
         return os.path.abspath(explicit)
-    candidates = [sys.executable]
+    if _PYTHON:
+        return _PYTHON[0]
     sage_bin = shutil.which("sage")
     if sage_bin:
+        try:
+            done = subprocess.run(
+                [sage_bin, "-c", "import sys;print(sys.executable)"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            candidate = done.stdout.strip().splitlines()[-1] if done.returncode == 0 else ""
+            if candidate and os.path.exists(candidate) and _sage_ish(candidate):
+                _PYTHON.append(os.path.abspath(candidate))
+                return _PYTHON[0]
+        except (OSError, subprocess.SubprocessError, IndexError):
+            pass
         # prefix layouts (conda, source builds) call it `python`; distro
         # packages ship `python3` only, next to the same `sage`
         beside = os.path.dirname(os.path.realpath(sage_bin))
-        candidates.append(os.path.join(beside, "python"))
-        candidates.append(os.path.join(beside, "python3"))
-    for candidate in candidates:
-        if candidate and os.path.exists(candidate) and _sage_ish(candidate):
-            return os.path.abspath(candidate)
-    return sys.executable
+        for name in ("python", "python3"):
+            candidate = os.path.join(beside, name)
+            if os.path.exists(candidate) and _sage_ish(candidate):
+                _PYTHON.append(os.path.abspath(candidate))
+                return _PYTHON[0]
+    _PYTHON.append(None)
+    return None
+
+
+def sage_python():
+    """Sage's interpreter, or a KernelError naming the three discovery routes."""
+    python = resolve_python()
+    if not python:
+        raise KernelError(DISCOVERY_HELP)
+    return python
+
+
+def load_or_create_key(state_dir):
+    """The kernel's authkey: 32 random bytes, mode 0600, in the 0700 state dir.
+
+    Shared through a file rather than argv/env (both are readable from `ps` and
+    /proc), and *reused* across kernel generations: a server that adopted a
+    kernel, and one that started a fresh one, both read the same key.  Written
+    atomically so a concurrent reader never sees a half-written key.
+    """
+    path = os.path.join(state_dir, KEY_NAME)
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+        if len(data) >= KEY_BYTES:
+            return data
+    except OSError:
+        pass
+    data = os.urandom(KEY_BYTES)
+    tmp = path + ".tmp.%d" % os.getpid()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    return data
 
 
 def _alive(pid):
@@ -212,7 +283,8 @@ class Client:
         check_sock_path(self.sock_path)
         self.lock_path = os.path.join(self.state_dir, SPAWN_LOCK)
         self.log_path = os.path.join(self.state_dir, LOG_NAME)
-        self.python = resolve_python()
+        self.key_path = os.path.join(self.state_dir, KEY_NAME)
+        self.python = resolve_python()  # None: Sage was not found (see DISCOVERY_HELP)
         self.cwd = os.environ.get("SAGE_CWD") or "/tmp"
         self.proc = None  # our own launcher, if we ever spawned one
         self._spawn_lock = threading.Lock()
@@ -259,74 +331,105 @@ class Client:
             raise KernelDown("no kernel state file at %s" % self.state_path)
         return self._roundtrip_state(payload, timeout)
 
-    def _roundtrip_state(self, payload, timeout):
-        if isinstance(payload, dict):
-            payload.setdefault("client", self.client_id)
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    def _authkey(self):
+        """The authkey the running kernel expects, or None when it is missing."""
         try:
-            sock.settimeout(CONNECT_TIMEOUT)
-            sock.connect(self.sock_path)
-        except OSError as exc:
-            sock.close()
+            with open(self.key_path, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            return None
+        return data if len(data) >= KEY_BYTES else None
+
+    def _connect(self, budget):
+        """Connect + authenticate; KernelBusy when the kernel is alive but wedged.
+
+        `multiprocessing.connection.Client` runs the challenge/response handshake
+        with blocking reads, and a busy kernel holds the GIL -- its accept thread
+        cannot answer -- so the handshake runs in a helper thread bounded by
+        `budget`.  Busy is then a clean KernelBusy, never a hang (rule 11).
+        """
+        key = self._authkey()
+        if key is None:
+            raise KernelDown(
+                "the kernel authkey %s is missing or too short; it is created next "
+                "to kernel.json when a kernel is spawned -- stop the running kernel "
+                "with interrupt(force=true) and retry" % (self.key_path,)
+            )
+        box = {}
+        abandoned = threading.Event()
+
+        def attempt():
+            try:
+                conn = ConnectClient(self.sock_path, authkey=key)
+            except BaseException as exc:  # noqa: BLE001 - reported to the caller
+                box["error"] = exc
+                return
+            if abandoned.is_set():
+                conn.close()
+                return
+            box["conn"] = conn
+
+        helper = threading.Thread(target=attempt, daemon=True, name="kernel-connect")
+        helper.start()
+        helper.join(budget)
+        if helper.is_alive():
+            abandoned.set()
+            raise KernelBusy(
+                "the kernel accepted the connection but did not answer within "
+                "%.1fs (a computation is probably holding the GIL; it is alive, "
+                "not dead)" % budget
+            )
+        exc = box.get("error")
+        if exc is not None:
+            if isinstance(exc, AuthenticationError):
+                raise KernelDown(
+                    "the kernel at %s refused the authkey from %s (%s): the running "
+                    "kernel was started with a different key, or the file was "
+                    "replaced.  Stop it with interrupt(force=true) and retry."
+                    % (self.sock_path, self.key_path, exc)
+                )
             raise KernelDown(
                 "cannot connect to the kernel socket %s: %s" % (self.sock_path, exc)
             )
+        return box["conn"]
+
+    def _roundtrip_state(self, payload, timeout):
+        if isinstance(payload, dict):
+            payload.setdefault("client", self.client_id)
+        conn = self._connect(timeout)
         try:
-            sock.settimeout(timeout)
-            data = json.dumps(payload, ensure_ascii=False).encode("utf-8") + b"\n"
             try:
-                sock.sendall(data)
+                conn.send_bytes(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
             except OSError as exc:
                 raise KernelDown("lost the connection to the kernel: %s" % (exc,))
-            line = self._recv_line(sock, timeout)
-            if line is None:
+            if not conn.poll(timeout):
+                raise KernelBusy(
+                    "the kernel accepted the connection but did not answer within "
+                    "%.1fs (a computation is probably holding the GIL; it is alive, "
+                    "not dead)" % timeout
+                )
+            try:
+                raw = conn.recv_bytes(MAX_RESPONSE)
+            except EOFError:
                 raise KernelBusy(
                     "kernel accepted the connection but closed it without answering"
                 )
-        finally:
-            try:
-                sock.close()
-            except OSError:
-                pass
-        try:
-            reply = json.loads(line.decode("utf-8", "replace"))
-        except ValueError:
-            raise KernelDown("kernel sent a non-JSON reply: %r" % (line[:200],))
-        return reply
-
-    def _recv_line(self, sock, timeout):
-        buf = bytearray()
-        deadline = time.monotonic() + timeout
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise KernelBusy(
-                    "the kernel accepted the connection but did not answer within "
-                    "%.1fs (a computation is probably holding the GIL; it is alive, "
-                    "not dead)" % timeout
-                )
-            try:
-                sock.settimeout(remaining)
-                chunk = sock.recv(65536)
-            except socket.timeout:
-                raise KernelBusy(
-                    "the kernel accepted the connection but did not answer within "
-                    "%.1fs (a computation is probably holding the GIL; it is alive, "
-                    "not dead)" % timeout
-                )
             except OSError as exc:
                 raise KernelDown("error while reading from the kernel: %s" % (exc,))
-            if not chunk:
-                return None
-            buf += chunk
-            if len(buf) > MAX_RESPONSE:
-                raise KernelError(
-                    "kernel reply exceeded the 64 MB client cap (got %d bytes); "
-                    "reduce the output (e.g. truncate reprs) and retry" % len(buf)
-                )
-            idx = buf.find(b"\n")
-            if idx >= 0:
-                return bytes(buf[:idx])
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+        if raw is None:
+            raise KernelError(
+                "kernel reply exceeded the 64 MB client cap; reduce the output "
+                "(e.g. truncate reprs) and retry"
+            )
+        try:
+            return json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            raise KernelDown("kernel sent a non-JSON reply: %r" % (raw[:200],))
 
     # -- lifecycle --------------------------------------------------------
     def hello(self, state=None, timeout=HELLO_TIMEOUT):
@@ -488,6 +591,8 @@ class Client:
         return state
 
     def _spawn_locked(self, reason):
+        if not self.python:
+            raise KernelError(DISCOVERY_HELP)
         mark = time.time()
         deadline = mark + SPAWN_TIMEOUT
         fd = self._acquire_spawn_lock(deadline)
@@ -499,6 +604,7 @@ class Client:
             if adopted is not None:
                 return adopted
             self._unlink_state()  # rule 13: never adopt a stale state file
+            load_or_create_key(self.state_dir)  # before the kernel boots and reads it
             env = os.environ.copy()
             env["PATH"] = os.path.dirname(self.python) + os.pathsep + env.get("PATH", "")
             env.setdefault("SAGE_MCP_STATE", self.state_dir)
