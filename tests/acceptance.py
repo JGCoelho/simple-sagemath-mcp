@@ -12,6 +12,7 @@ harness.  Rule 15 (nothing but JSON-RPC on stdout) is measured directly by
 import asyncio
 import json
 import os
+import re
 import shutil
 import socket
 import stat
@@ -137,6 +138,18 @@ class Server:
             }
             for tool in listing.tools
         ]
+
+    def resources(self):
+        listing = self._result(self._session.list_resources(), "resources/list", 60)
+        return [{"uri": str(res.uri), "mime_type": res.mime_type} for res in listing.resources]
+
+    def resource(self, uri):
+        """(mime_type, text) of one resource, read through the official client."""
+        result = self._result(
+            self._session.read_resource(uri), "resources/read %s" % uri
+        )
+        block = result.contents[0]
+        return block.mime_type, block.text
 
     def tool(self, tool_name, **arguments):  # `name` is a tool argument now
         result = self._result(
@@ -964,6 +977,361 @@ def stdout_hygiene(workdir):
 
 
 # --------------------------------------------------------------------------
+# §4: the GAP crash-loop guard
+# --------------------------------------------------------------------------
+def gap_guard_suite(workdir):
+    """GAP crash-restart markers on *stderr* interrupt the job, once per job.
+
+    No real GAP crash is needed: the marker text on stderr is what the kernel's
+    router matches, and that is what GAP writes when it crash-restarts.  The
+    guard's second condition is `"sage.interfaces.gap" in sys.modules`, so the
+    job imports it first; that is also what makes the stdout case meaningful.
+    """
+    sys.path.insert(0, ROOT)
+    import sage_client as sc
+
+    markers = (
+        "import sys\n"
+        "for _ in range(%d):\n"
+        "    print('Gap crashed', file=sys.stderr)\n"
+    )
+    state_dir = os.path.join(workdir, "gap")
+    server = Server(state_dir)
+    client = sc.Client(state_dir)
+    try:
+        out, err, _ = server.tool("exec", code="import sage.interfaces.gap")
+        record(
+            "§4: GAP is loaded in the kernel (the guard's precondition)",
+            not err and "Error" not in out,
+            (out.strip() or "(no output)")[:80],
+        )
+
+        trips = client.op("status")["gap_trips"]
+        out, err, _ = server.tool("exec", code=markers % 2)
+        record(
+            "§4: two crash markers do not trip the guard",
+            not err and "[gap-guard]" not in out and "KeyboardInterrupt" not in out,
+            (out.strip() or "(no output)").splitlines()[-1],
+        )
+
+        out, err, _ = server.tool(
+            "exec", code="import sys\nfor _ in range(4): print('hi', file=sys.stderr)\n"
+        )
+        record(
+            "§4: ordinary stderr warnings do not trip the guard",
+            not err and "[gap-guard]" not in out and "KeyboardInterrupt" not in out,
+            (out.strip() or "(no output)").splitlines()[-1],
+        )
+
+        server.tool("exec", code="gap_kept = 41")
+        out, err, _ = server.tool("exec", code=markers % 4)
+        record(
+            "§4: the third marker interrupts the job and prepends the notice",
+            not err
+            and out.startswith("[gap-guard] interrupted after 3 'Gap crashed' markers")
+            and "KeyboardInterrupt" in out,
+            "\n".join(out.strip().splitlines()[:2]),
+        )
+        after = client.op("status")["gap_trips"]
+        record(
+            "§4: gap_trips counts the trip",
+            after == trips + 1,
+            "before=%d after=%d" % (trips, after),
+        )
+        where = client.op("status")["last_error"]
+        record(
+            "§4: status indexes the interrupted job's error",
+            bool(where) and "KeyboardInterrupt" in (where.get("error") or ""),
+            str(where),
+        )
+        kept, err, _ = server.tool("exec", code="gap_kept")
+        record(
+            "§4: the session keeps its variables after a guard trip",
+            not err and kept.strip() == "41",
+            kept.strip(),
+        )
+
+        out, _, _ = server.tool("exec", code=markers % 3, timeout_s=0)
+        jid = _first_job_id(out)
+        final = ""
+        deadline = time.time() + 25
+        while jid and time.time() < deadline:
+            final, _, _ = server.tool("poll", job_id=jid, since=0)
+            if "[job finished in" in final:
+                break
+            time.sleep(0.2)
+        record(
+            "§4: poll collects the guard-interrupted job and its notice",
+            "[job finished in" in final
+            and "[gap-guard]" in final
+            and "KeyboardInterrupt" in final,
+            (final.strip() or "(nothing)").splitlines()[0],
+        )
+
+        burst = (
+            "import sys\n"
+            "try:\n"
+            "    for _ in range(3): print('Gap crashed', file=sys.stderr)\n"
+            "except KeyboardInterrupt:\n"
+            "    for _ in range(5): print('Restarting Gap', file=sys.stderr)\n"
+            "    print('survived one burst')\n"
+        )
+        out, err, _ = server.tool("exec", code=burst)
+        record(
+            "§4: markers after the trip send no second signal",
+            not err and "survived one burst" in out,
+            (out.strip() or "(no output)").splitlines()[-1],
+        )
+
+        out, err, _ = server.tool(
+            "exec", code="import sys\nfor _ in range(5): print('Gap crashed')\n"
+        )
+        record(
+            "§4: crash markers on stdout are ignored",
+            not err and "[gap-guard]" not in out and "KeyboardInterrupt" not in out,
+            (out.strip() or "(no output)").splitlines()[-1],
+        )
+
+        # Sage prints the *real* markers with print(), i.e. on stdout, from
+        # sage/interfaces/gap.py ("crashed or quit executing" / "Restarting Gap
+        # and trying again").  A module that prints from that path stands in for
+        # the real interface, so this proves the guard is not dead on stdout.
+        fake = os.path.join(workdir, "gapfake", "sage", "interfaces")
+        os.makedirs(fake, exist_ok=True)
+        with open(os.path.join(fake, "gap.py"), "w", encoding="utf-8") as fh:
+            fh.write(
+                "def eval(line='x'):\n"
+                "    print(\"** Gap crashed or quit executing '%s' **\" % line)\n"
+                "    print('Restarting Gap and trying again')\n"
+                "    return line\n"
+            )
+        loader = (
+            "import importlib.util as u\n"
+            "spec = u.spec_from_file_location('fakegap', %r)\n"
+            "mod = u.module_from_spec(spec)\n"
+            "spec.loader.exec_module(mod)\n"
+            "gap_fake_n = 0\n"
+            "for _ in range(2):\n"
+            "    mod.eval('x')\n"
+            "gap_fake_n += 1\n"
+        ) % os.path.join(fake, "gap.py")
+        out, err, _ = server.tool("exec", code=loader)
+        record(
+            "§4: GAP's own stdout markers (sage/interfaces/gap.py) do trip it",
+            "[gap-guard]" in out and "KeyboardInterrupt" in out,
+            (out.strip() or "(no output)").splitlines()[0][:90],
+        )
+
+        try:
+            log = open(client.log_path, encoding="utf-8", errors="replace").read()
+        except OSError:
+            log = ""
+        record(
+            "§4: the trip is logged to kernel.log",
+            "gap guard:" in log and "-> SIGINT" in log,
+            [row for row in log.splitlines() if "gap guard:" in row][-1:][:1] or "(absent)",
+        )
+    finally:
+        server.close()
+        # This test's own Client counts as a live kernel client for CLIENT_TTL, so
+        # the server's stop_if_last() leaves the kernel for it: stop it here, or
+        # the suite leaves an orphan kernel behind.
+        client.kill()
+
+    disabled = Server(os.path.join(workdir, "gap-off"), {"SAGE_MCP_GAP_LIMIT": "0"})
+    try:
+        disabled.tool("exec", code="import sage.interfaces.gap")
+        out, err, _ = disabled.tool("exec", code=markers % 5)
+        record(
+            "§4: SAGE_MCP_GAP_LIMIT=0 disables the guard",
+            not err and "[gap-guard]" not in out and "KeyboardInterrupt" not in out,
+            (out.strip() or "(no output)").splitlines()[-1],
+        )
+    finally:
+        disabled.close()
+
+
+# --------------------------------------------------------------------------
+# §5: observability -- kernel counters and the sage://kernel/status resource
+# --------------------------------------------------------------------------
+def observability_suite(workdir):
+    """The kernel is the single source of truth for counters; the server adds its own.
+
+    Everything here is read the way a client reads it: `resources/list`,
+    `resources/read` and the `status` tool, through the official MCP client.
+    """
+    server = Server(os.path.join(workdir, "observability"))
+    resource = "sage://kernel/status"
+    section = ("server", "kernel", "sessions", "jobs", "last_error", "limits", "log")
+
+    def doc():
+        mime, text = server.resource(resource)
+        return mime, json.loads(text)
+
+    def jobs():
+        return doc()[1]["jobs"]
+
+    def wait_done(job_id, deadline=25):
+        end = time.time() + deadline
+        while job_id and time.time() < end:
+            text, _, _ = server.tool("poll", job_id=job_id, since=0)
+            if "[job finished in" in text:
+                return text
+            time.sleep(0.2)
+        return ""
+
+    try:
+        listed = server.resources()
+        record(
+            "§5: sage://kernel/status is listed as application/json",
+            any(
+                entry["uri"] == resource and entry["mime_type"] == "application/json"
+                for entry in listed
+            ),
+            str(listed),
+        )
+        mime, text = server.resource(resource)
+        try:
+            first = json.loads(text)
+            parsed, why = True, ""
+        except ValueError as exc:
+            first, parsed, why = {}, False, str(exc)
+        record(
+            "§5: the resource parses as JSON with the §5 top-level keys",
+            parsed and mime == "application/json" and sorted(first) == sorted(section),
+            why or ", ".join(sorted(first)),
+        )
+        record(
+            "§5: server/kernel/jobs/log carry their fields (limits null for now)",
+            {"version", "pid", "clients", "spawns", "restarts"} <= set(first["server"])
+            and {"pid", "state", "uptime_s", "restarts", "started",
+                 "counters_since"} <= set(first["kernel"])
+            and {"run", "failed", "interrupted", "queued", "last_job",
+                 "gap_trips"} <= set(first["jobs"])
+            and first["limits"] is None
+            and isinstance(first["sessions"], list)
+            and isinstance(first["log"], dict)
+            and isinstance(first["log"]["tail"], list)
+            and first["log"]["path"].endswith("kernel.log"),
+            json.dumps({"kernel": first["kernel"], "jobs": first["jobs"]})[:400],
+        )
+
+        server.tool("exec", code="observability_warmup = 0")  # spawn the kernel
+        before = jobs()
+        server.tool("exec", code="observable_ok = 1")
+        after_ok = jobs()
+        record(
+            "§5: a successful job moves jobs.run only",
+            after_ok["run"] == before["run"] + 1
+            and after_ok["failed"] == before["failed"]
+            and after_ok["interrupted"] == before["interrupted"],
+            "before=%s after=%s" % (before, after_ok),
+        )
+
+        fail_id = _first_job_id(server.tool("exec", code="1/0", timeout_s=0)[0])
+        wait_done(fail_id)
+        after_fail = jobs()
+        last = doc()[1]["last_error"]
+        record(
+            "§5: a failing job moves jobs.failed and names the job",
+            after_fail["failed"] == after_ok["failed"] + 1
+            and last
+            and last.get("job") == fail_id
+            and "ZeroDivisionError" in (last.get("error") or "")
+            and last.get("session") == "default"
+            and last.get("when"),
+            "failed=%s last_error=%s" % (after_fail["failed"], last),
+        )
+
+        out, _, _ = server.tool(
+            "exec", code="import time; time.sleep(5)", session="obs", timeout_s=0
+        )
+        slow_id = _first_job_id(out)
+        time.sleep(0.4)
+        server.tool("interrupt")
+        wait_done(slow_id)
+        after_int = jobs()
+        record(
+            "§5: an interrupt moves jobs.interrupted, not jobs.failed",
+            after_int["interrupted"] == after_fail["interrupted"] + 1
+            and after_int["failed"] == after_fail["failed"],
+            "before=%s after=%s" % (after_fail, after_int),
+        )
+
+        server.tool("exec", code="import sage.interfaces.gap")
+        server.tool(
+            "exec",
+            code="import sys\nfor _ in range(3): print('Gap crashed', file=sys.stderr)\n",
+        )
+        after_gap = jobs()
+        record(
+            "§5: a gap-guard trip moves jobs.gap_trips",
+            after_gap["gap_trips"] == 1,
+            "gap_trips=%s" % (after_gap["gap_trips"],),
+        )
+
+        out, _, _ = server.tool(
+            "exec", code="import time; time.sleep(4)", session="obs-running", timeout_s=0
+        )
+        running_id = _first_job_id(out)
+        time.sleep(0.4)
+        live = doc()[1]
+        tail = live["log"]["tail"]
+        record(
+            "§5: the resource answers while a job runs, with a bounded log tail",
+            0 < len(tail) <= 20
+            and live["kernel"]["state"] == "busy"
+            and any("submit" in row for row in tail),
+            "state=%s tail=%d lines, last=%r"
+            % (live["kernel"]["state"], len(tail), tail[-1:]),
+        )
+        wait_done(running_id, deadline=15)
+
+        status, _, _ = server.tool("status")
+        lines = [row for row in status.splitlines() if row.startswith("jobs: ")]
+        record(
+            "§5: status gains one jobs/gap-guard/restarts line",
+            len(lines) == 1
+            and re.match(
+                r"^jobs: \d+ run, \d+ failed, \d+ interrupted; gap-guard: \d+; "
+                r"restarts: \d+$",
+                lines[0],
+            )
+            is not None,
+            lines[0] if lines else "(no jobs: line)",
+        )
+
+        before_kill = doc()[1]
+        server.tool("interrupt", force=True)
+        server.tool("exec", code="1+1")
+        after_kill = doc()[1]
+        record(
+            "§5: counters_since changes after interrupt(force=true)",
+            before_kill["kernel"]["counters_since"]
+            and after_kill["kernel"]["counters_since"]
+            and before_kill["kernel"]["counters_since"]
+            != after_kill["kernel"]["counters_since"],
+            "%s -> %s"
+            % (before_kill["kernel"]["counters_since"],
+               after_kill["kernel"]["counters_since"]),
+        )
+        record(
+            "§5: restarts/spawns grow across a force-stop and a respawn",
+            after_kill["kernel"]["restarts"] > before_kill["kernel"]["restarts"]
+            and after_kill["server"]["spawns"] > before_kill["server"]["spawns"],
+            "restarts %s -> %s, spawns %s -> %s"
+            % (
+                before_kill["kernel"]["restarts"],
+                after_kill["kernel"]["restarts"],
+                before_kill["server"]["spawns"],
+                after_kill["server"]["spawns"],
+            ),
+        )
+    finally:
+        server.close()
+
+
+# --------------------------------------------------------------------------
 # §1.5 / C13: a cancelled exec is still collectable
 # --------------------------------------------------------------------------
 def cancellation_recovery(workdir):
@@ -1237,6 +1605,8 @@ def main():
     transport_invariants(workdir)
     discovery_invariants(workdir)
     cancellation_recovery(workdir)
+    gap_guard_suite(workdir)
+    observability_suite(workdir)
     stdout_hygiene(workdir)
 
     record(

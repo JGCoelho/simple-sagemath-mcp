@@ -77,10 +77,28 @@ SPY="$(find_server_python "$SAGE_PY" || true)"
 
 if [ "$CHECK_ONLY" = 1 ]; then
   CONFIG="${1:-$MCP_JSON}"
-  [ -n "$SPY" ] || SPY="$(command -v python3)"
+  NAME="${2:-sage}"
+  [ -f "$CONFIG" ] || die "nothing to check: $CONFIG does not exist.
+       Run ./install.sh first, or pass the config: ./install.sh --check <mcp.json>"
+  # Re-testing a registration means starting what the client would start: the
+  # entry's own `command`, not whatever python this shell happens to have. A
+  # bare shell usually has no Sage on PATH, and a python3 without `mcp` turns
+  # the check into a ModuleNotFoundError traceback instead of a verdict.
+  json_py="$(command -v python3 || true)"
+  registered=""
+  if [ -n "$json_py" ]; then
+    registered="$("$json_py" -c 'import json,sys;d=json.load(open(sys.argv[1]));e=(d.get("mcpServers") or {}).get(sys.argv[2]) or {};sys.stdout.write(e.get("command",""))' "$CONFIG" "$NAME" 2>/dev/null || true)"
+  fi
+  if [ -n "$registered" ] && [ -x "$registered" ] && "$registered" -c 'import mcp' 2>/dev/null; then
+    SPY="$registered"
+  fi
+  [ -n "$SPY" ] || die "no Python here can 'import mcp' (the MCP SDK), and the
+       command in $CONFIG could not be used to run the check.
+       Install it:  python3 -m pip install 'mcp>=2.3,<3'   or set SAGE_PYTHON."
   echo "config : $CONFIG"
+  echo "checker: $SPY"
   [ -n "$SAGE_PY" ] && export SAGE_PYTHON="$SAGE_PY"
-  exec "$SPY" "$SRC/selftest.py" --config "$CONFIG" ${2:+--name "$2"}
+  exec "$SPY" "$SRC/sage_mcp.py" --check --config "$CONFIG" ${2:+--name "$2"}
 fi
 
 [ -n "$SAGE_PY" ] || die "no interpreter that can 'import sage.all' was found.
@@ -100,7 +118,7 @@ echo "sage   : $SAGE_PY  (runs the kernel)"
 if [ "$SRC" != "$DST" ]; then
   mkdir -p "$DST"
   install -m 0644 "$SRC/sage_mcp.py" "$SRC/sage_client.py" "$SRC/sage_kernel.py" \
-    "$SRC/runfile.py" "$SRC/nbrun.py" "$SRC/selftest.py" "$DST/"
+    "$SRC/subproc.py" "$DST/"
   chmod 0755 "$DST/sage_mcp.py" "$DST/sage_kernel.py"
 fi
 
@@ -133,6 +151,6 @@ EOF
 
 echo
 echo "verifying the registration (a throwaway kernel, never the live one):"
-SAGE_PYTHON="$SAGE_PY" "$SPY" "$SRC/selftest.py" --config "$MCP_JSON"
+SAGE_PYTHON="$SAGE_PY" "$SPY" "$SRC/sage_mcp.py" --check --config "$MCP_JSON"
 echo
 echo "done. Restart the client (in Pi: reload MCP servers) to pick it up."

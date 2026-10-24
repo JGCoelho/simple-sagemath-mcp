@@ -2,33 +2,37 @@
 """sage_mcp.py -- MCP server (official SDK, stdio) in front of a Sage kernel.
 
 Eight tools: the kernel itself (exec, poll, reset, drop, status, interrupt --
-with force=true to stop the kernel, not just the job) plus the two tools that
-need Sage's own interpreter (run_file: execute a file the agent already wrote,
-inline results; notebook: drive the Jupyter kernel SageMath ships).  PDFs are a
-separate server, pdf-mcp.
+force=true stops the kernel, not just the job) plus the two that need Sage's
+own interpreter (run_file, notebook).  This process needs only `mcp`; user code
+runs in a separate kernel started with Sage's interpreter, which
+`sage_client.resolve_python()` discovers (DESIGN.md: two interpreters).
 
-Two interpreters, one contract: this process needs only `mcp` (no Sage), user
-code runs in a separate kernel process started with Sage's interpreter, which
-`sage_client.resolve_python()` discovers.  The SDK owns the wire while serving
--- it moves fd 1 onto stderr, so a stray `print` in a handler cannot corrupt
-the transport.
+`--check` (also `simple-sage-mcp-check`) drives a *registered* server through
+the official client against a throwaway state dir, so an install can be proven
+without touching the live kernel.
 """
 
+import asyncio
 import functools
+import json
 import os
+import shutil
 import sys
+import tempfile
+import time
 from typing import Annotated, Literal
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+from mcp import ClientSession, StdioServerParameters  # noqa: E402
+from mcp.client.stdio import stdio_client  # noqa: E402
 from mcp.server.mcpserver import MCPServer  # noqa: E402
 from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 from pydantic import Field  # noqa: E402
 
-import nbrun  # noqa: E402
-import runfile  # noqa: E402
+import subproc  # noqa: E402
 from sage_client import (  # noqa: E402
     KernelBusy,
     KernelDown,
@@ -38,7 +42,6 @@ from sage_client import (  # noqa: E402
 )
 
 __version__ = "1.0.0"
-
 SESSION_DOC = "Namespace to run in. State persists per session between exec calls."
 
 mcp = MCPServer(
@@ -56,38 +59,31 @@ mcp = MCPServer(
 )
 
 # The job each session submitted last, so an exec whose *reply* was cancelled
-# (§1.5) can still be collected: status names it, poll(job_id) drains it.
+# can still be collected: status names it, poll(job_id) drains it.
 LAST_JOB = {}
 
-
-# --------------------------------------------------------------------------
 # helpers
-# --------------------------------------------------------------------------
+
+
 def _fmt_secs(value):
     try:
         value = float(value or 0)
     except (TypeError, ValueError):
         value = 0.0
-    if value < 100:
-        return "%.1f" % value
-    return "%.0f" % value
+    return "%.1f" % value if value < 100 else "%.0f" % value
 
 
 def _join(*parts):
     out = ""
     for part in parts:
-        if part is None:
-            continue
-        text = str(part)
-        if not text:
-            continue
-        text = text.rstrip("\n")
-        out = text if not out else out + "\n" + text
+        text = "" if part is None else str(part).rstrip("\n")
+        if text:
+            out = text if not out else out + "\n" + text
     return out
 
 
 def _body(job):
-    parts = [job.get("stdout") or ""]
+    parts = [job.get("note"), job.get("stdout") or ""]
     if job.get("error"):
         parts.append(job["error"])
     elif job.get("repr"):
@@ -100,7 +96,7 @@ def _job_text(job, job_id):
     """Text for an exec/poll result that may still be running."""
     if job.get("state") == "done":
         return _body(job)
-    parts = [job.get("stdout") or ""]
+    parts = [job.get("note"), job.get("stdout") or ""]
     if job.get("state") == "queued":
         if job.get("blocked"):
             parts.append("[queued: another job is running]")
@@ -123,6 +119,90 @@ def _as_float(value, default):
         raise ToolError("expected a number, got %r" % (value,))
 
 
+def _iso(when):
+    """A timestamp as the resource reports it (UTC, seconds)."""
+    try:
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(when)))
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def _log_tail_lines(path, lines=20, budget=8192):
+    """The last `lines` of kernel.log, read from its tail only (never readlines)."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - budget))
+            data = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    rows = data.splitlines()
+    if size > budget:
+        rows = rows[1:]  # the first line of the window may be cut in half
+    return [row for row in rows if row.strip()][-lines:]
+
+
+def status_json():
+    """PLAN §5: the kernel's counters plus the few facts only the server knows."""
+    client = get_client()
+    snap = client.status_snapshot(timeout=2.0)
+    state = snap.get("state")
+    known = state == "running"
+    jobs = snap.get("jobs") or {}
+    if known:
+        kernel_state = "busy" if jobs.get("running") else "idle"
+    else:
+        kernel_state = "busy" if state == "busy" else (
+            "unreachable" if state == "unreachable" else "not running"
+        )
+    last = snap.get("last_error")
+    log_path = snap.get("log") or client.log_path
+    return {
+        "server": {
+            "version": __version__,
+            "pid": os.getpid(),
+            "clients": (snap.get("clients") or {}).get("live"),
+            "spawns": client.spawns,
+            "restarts": client.restarts,
+        },
+        "kernel": {
+            "pid": snap.get("pid"),
+            "state": kernel_state,
+            "uptime_s": snap.get("uptime_s"),
+            "restarts": client.restarts,
+            "started": _iso(snap.get("started")),
+            "counters_since": _iso(snap.get("counters_since")),
+        },
+        "sessions": sorted(snap.get("sessions") or {}),
+        "jobs": {
+            "run": jobs.get("run"),
+            "failed": jobs.get("failed"),
+            "interrupted": jobs.get("interrupted"),
+            "queued": len(jobs.get("queued") or []) if known else None,
+            "last_job": jobs.get("last_job"),
+            "gap_trips": snap.get("gap_trips"),
+        },
+        "last_error": (
+            {
+                "error": last.get("error"),
+                "job": last.get("job"),
+                "session": last.get("session"),
+                "when": _iso(last.get("when")),
+            }
+            if last
+            else None
+        ),
+        "limits": None,  # filled in by the limits work (PLAN §7)
+        "log": {"path": log_path, "tail": _log_tail_lines(log_path)},
+    }
+
+
+@mcp.resource("sage://kernel/status", mime_type="application/json")
+def kernel_status() -> str:
+    """Machine-readable status: kernel counters, last error and the log tail."""
+    return json.dumps(status_json(), indent=2)
+
+
 def _tool_errors(fn):
     """Kernel trouble is anticipated: tell the model, keep the message."""
 
@@ -135,12 +215,15 @@ def _tool_errors(fn):
 
     return wrapper
 
-
-# --------------------------------------------------------------------------
 # tools
-# --------------------------------------------------------------------------
+
+
 @mcp.tool(name="exec", structured_output=False)
+
+
 @_tool_errors
+
+
 def tool_exec(
     code: Annotated[str, Field(description="Code to execute.")],
     session: Annotated[str, Field(description=SESSION_DOC)] = "default",
@@ -211,12 +294,15 @@ def tool_exec(
         pass
     return _join(prefix, _job_text(job, job_id))
 
-
 MAX_POLL_WAIT = 3600.0
 
 
 @mcp.tool(name="poll", structured_output=False)
+
+
 @_tool_errors
+
+
 def tool_poll(
     job_id: Annotated[str, Field(description="Job id such as j7.")],
     since: Annotated[
@@ -233,31 +319,22 @@ def tool_poll(
     """Collect a job started by exec. since = the offset the previous call printed (0 to start), so you get only new output. wait_s blocks until the job finishes or that many seconds pass (0 = return immediately, the default)."""
     if not job_id:
         raise ToolError("job_id is required")
-    offset = int(_as_float(since, 0))
-    if offset < 0:
-        offset = 0
-    wait = _as_float(wait_s, 0.0)
-    if wait < 0:
-        wait = 0.0
-    wait = min(wait, MAX_POLL_WAIT)
+    offset = max(0, int(_as_float(since, 0)))
+    wait = min(max(_as_float(wait_s, 0.0), 0.0), MAX_POLL_WAIT)
     client = get_client()
     try:
         if wait > 0:
             # Optional blocking collection: the kernel waits on the job's done
             # event and returns the same snapshot `poll` would.
             reply = client.op(
-                "wait",
-                _timeout=wait + 15.0,
-                job_id=str(job_id),
-                timeout=wait,
-                since=offset,
+                "wait", _timeout=wait + 15.0, job_id=str(job_id), timeout=wait, since=offset
             )
         else:
             reply = client.op("poll", _timeout=10.0, job_id=str(job_id), since=offset)
     except KernelBusy as exc:
         raise ToolError("kernel busy: %s" % exc)
     job = reply["job"]
-    parts = [job.get("stdout") or ""]
+    parts = [job.get("note"), job.get("stdout") or ""]
     if job.get("state") == "done":
         if job.get("error"):
             parts.append(job["error"])
@@ -279,7 +356,11 @@ def tool_poll(
 
 
 @mcp.tool(name="reset", structured_output=False)
+
+
 @_tool_errors
+
+
 def tool_reset(
     session: Annotated[str, Field(description=SESSION_DOC)] = "default",
 ) -> str:
@@ -290,7 +371,11 @@ def tool_reset(
 
 
 @mcp.tool(name="drop", structured_output=False)
+
+
 @_tool_errors
+
+
 def tool_drop(
     sessions: Annotated[
         list[str] | None, Field(description="Session names to drop.")
@@ -301,9 +386,7 @@ def tool_drop(
     ] = False,
 ) -> str:
     """Free idle sessions; refuses one with a queued/running job (kept, and the job id is reported). all=true drops every idle session."""
-    names = []
-    for item in sessions or []:
-        names.append(str(item))
+    names = [str(item) for item in sessions or []]
     if not names and not all:
         raise ToolError("nothing to drop: pass sessions=[...] or all=true")
     reply = get_client().op("drop", _timeout=10.0, sessions=names, all=bool(all))
@@ -326,6 +409,8 @@ def tool_drop(
 
 
 @mcp.tool(name="status", structured_output=False)
+
+
 def tool_status() -> str:
     """Kernel state (running / busy / not running) with pid and uptime, one line per session with its name count, active jobs, the last error, the log path."""
     client = get_client()
@@ -388,6 +473,22 @@ def tool_status() -> str:
         )
     else:
         lines.append("active jobs: " + (", ".join(active) if active else "none"))
+    if state == "running":
+        lines.append(
+            "jobs: %d run, %d failed, %d interrupted; gap-guard: %d; restarts: %d"
+            % (
+                jobs.get("run", 0),
+                jobs.get("failed", 0),
+                jobs.get("interrupted", 0),
+                snapshot.get("gap_trips") or 0,
+                client.restarts,
+            )
+        )
+    else:
+        lines.append(
+            "jobs: unknown (the kernel is not answering); gap-guard: %d; restarts: %d"
+            % (snapshot.get("gap_trips") or 0, client.restarts)
+        )
     if LAST_JOB:
         lines.append(
             "last job per session: "
@@ -396,10 +497,8 @@ def tool_status() -> str:
     live = (snapshot.get("clients") or {}).get("live")
     if live:
         others = int(live) - 1
-        lines.append(
-            "clients: %d (this server%s)"
-            % (live, " + %d other%s" % (others, "" if others == 1 else "s") if others > 0 else "")
-        )
+        note = " + %d other%s" % (others, "" if others == 1 else "s") if others > 0 else ""
+        lines.append("clients: %d (this server%s)" % (live, note))
     last = snapshot.get("last_error")
     if last:
         lines.append(
@@ -413,6 +512,8 @@ def tool_status() -> str:
 
 
 @mcp.tool(name="interrupt", structured_output=False)
+
+
 def tool_interrupt(
     force: Annotated[
         bool,
@@ -440,6 +541,8 @@ def tool_interrupt(
 
 
 @mcp.tool(name="run_file", structured_output=False)
+
+
 def tool_run_file(
     path: Annotated[
         str,
@@ -463,19 +566,16 @@ def tool_run_file(
 ) -> str:
     """Run a file that already exists and return its output inline: exit code, duration, stdout and stderr. Nothing is copied or stored -- the file you name is the file that runs, with cwd = its own directory. lang=auto guesses from the extension and honours a #! for executables; lang=python uses Sage's own interpreter (so `from sage.all import *` works) and lang=sage shells out to `sage`. A non-zero exit or a timeout is an error, with the output attached; the timeout kills the whole process group."""
     try:
-        return runfile.run(
-            path=path,
-            lang=lang,
-            args=args,
-            timeout_s=timeout_s,
-            stdin=stdin,
-            cwd=cwd,
+        return subproc.run_file(
+            path=path, lang=lang, args=args, timeout_s=timeout_s, stdin=stdin, cwd=cwd
         )
-    except runfile.RunError as exc:
+    except subproc.SubprocessError as exc:
         raise ToolError(str(exc))
 
 
 @_tool_errors
+
+
 def tool_notebook(
     action: Annotated[Literal["check", "run", "clear", "extract"], Field()],
     path: Annotated[str, Field(description=".ipynb file.")],
@@ -504,12 +604,12 @@ def tool_notebook(
         raise ToolError("notebook needs a path to an .ipynb file")
     try:
         if action == "check":
-            return nbrun.check(path)
+            return subproc.check(path)
         if action == "extract":
-            return nbrun.extract(path)
+            return subproc.extract(path)
         if action == "clear":
-            return nbrun.clear(path, out=out, in_place=bool(in_place))
-        return nbrun.run(
+            return subproc.clear(path, out=out, in_place=bool(in_place))
+        return subproc.run_notebook(
             path,
             out=out,
             in_place=bool(in_place),
@@ -517,18 +617,199 @@ def tool_notebook(
             timeout_s=None if timeout_s is None else _as_float(timeout_s, 0),
             state_dir=get_client().state_dir,
         )
-    except nbrun.NotebookError as exc:
+    except subproc.SubprocessError as exc:
         raise ToolError(str(exc))
     except OSError as exc:
         raise ToolError("%s: %s" % (type(exc).__name__, exc))
 
-
 # `notebook` needs nbformat+nbconvert+nbclient; the rest are unconditional.
-if nbrun.available():
+if subproc.available():
     mcp.tool(name="notebook", structured_output=False)(tool_notebook)
 
+# --check: prove that a registration really works (post-install smoke test)
+CHECK_TIMEOUT = 90.0
+KERNEL_TOOLS = ("exec", "poll", "reset", "drop", "status", "interrupt", "run_file")
 
-def main():
+CHECK_DOC = """\
+Usage: sage_mcp.py --check [--config mcp.json] [--name sage] [--timeout S]
+       sage_mcp.py --check <command> [server-script]
+
+Spawns the given (or registered) server against a throwaway SAGE_MCP_STATE and
+checks, through the official MCP client: spawn, initialize, tools/list, the
+kernel tools, exec `2+2`, status, and interrupt(force=true).  Exit 0 only when
+every check passed; the caller's live kernel is never touched."""
+
+
+def _mcp_entry(path, name="sage"):
+    """(command, args, env) for `name` in an mcp.json-style file."""
+    with open(path) as fh:
+        data = json.load(fh)
+    servers = data.get("mcpServers") or data.get("servers") or {}
+    entry = servers.get(name)
+    if not isinstance(entry, dict) or not entry.get("command"):
+        raise SystemExit("error: no %r entry in %s" % (name, path))
+    return entry["command"], [str(arg) for arg in entry.get("args") or []], (
+        entry.get("env") or {}
+    )
+
+
+def _log_tail(state_dir, lines=6):
+    """The end of kernel.log: the launcher's own words about a failed spawn."""
+    try:
+        with open(os.path.join(state_dir, "kernel.log"), "r", errors="replace") as fh:
+            tail = fh.read()[-4000:].rstrip().splitlines()
+    except OSError:
+        return ""
+    return "\n".join(tail[-lines:]) if tail else ""
+
+async def _tool_text(session, name, arguments, timeout):
+    result = await asyncio.wait_for(session.call_tool(name, arguments), timeout)
+    text = "".join(
+        getattr(block, "text", "")
+        for block in result.content or []
+        if getattr(block, "type", None) == "text"
+    )
+    return text, bool(result.is_error)
+
+async def _probe(session, state_dir, timeout):
+    """The seven checks, each bounded and each recording its own failure."""
+    out = []
+
+    async def step(name, call, judge):
+        try:
+            value = await asyncio.wait_for(call(), timeout)
+        except Exception as exc:
+            out.append((name, False, "%s: %s" % (type(exc).__name__, exc)))
+            return None
+        ok, detail = judge(value)
+        out.append((name, bool(ok), detail))
+        return value
+
+    def _first(text):
+        return (text.splitlines() or [""])[0]
+
+    async def tool(name, arguments):
+        return await _tool_text(session, name, arguments, timeout)
+
+    await step(
+        "initialize",
+        session.initialize,
+        lambda info: (
+            bool(info.server_info.name),
+            "%s %s" % (info.server_info.name, info.server_info.version),
+        ),
+    )
+    names = await step(
+        "tools/list",
+        session.list_tools,
+        lambda listing: (
+            bool(listing.tools),
+            ", ".join(tool.name for tool in listing.tools),
+        ),
+    )
+    advertised = [tool.name for tool in names.tools] if names else []
+    missing = [name for name in KERNEL_TOOLS if name not in advertised]
+    out.append(("the kernel tools are advertised", not missing, ", ".join(missing) or "all present"))
+
+    def judge_exec(result):
+        text, is_error = result
+        detail = _first(text) if text else "(no text)"
+        if is_error or "4" not in text:
+            tail = _log_tail(state_dir)
+            detail += "\nkernel.log:\n" + tail if tail else ""
+        return not is_error and "4" in text, detail
+
+    await step("exec runs Sage code", lambda: tool("exec", {"code": "print(2+2)"}), judge_exec)
+    await step(
+        "status",
+        lambda: tool("status", {}),
+        lambda result: (not result[1] and "kernel: running" in result[0], _first(result[0])),
+    )
+    await step(
+        "interrupt(force=true)",
+        lambda: tool("interrupt", {"force": True}),
+        lambda result: (not result[1], _first(result[0])),
+    )
+    return out
+
+
+def check(command, args, extra_env=None, timeout=CHECK_TIMEOUT):
+    """Run the smoke test; return a list of (name, ok, detail)."""
+    state_dir = tempfile.mkdtemp(prefix="sage-check-")
+    label = "spawn " + " ".join([command] + list(args))
+    results = []
+    env = os.environ.copy()
+    env.update({str(k): str(v) for k, v in (extra_env or {}).items()})
+    env["SAGE_MCP_STATE"] = state_dir  # never the caller's live kernel
+    env.setdefault("SAGE_CWD", "/tmp")
+    env["PATH"] = os.path.dirname(command) + os.pathsep + env.get("PATH", "")
+    params = StdioServerParameters(command=command, args=list(args), env=env, cwd="/tmp")
+
+    async def probe():
+        try:
+            async with stdio_client(params, errlog=sys.stderr) as (read, write):
+                async with ClientSession(read, write) as session:
+                    results.append((label, True, ""))
+                    results.extend(await _probe(session, state_dir, timeout))
+        except BaseException as exc:  # a broken server must be a failed check
+            results.append(
+                (label if not results else "the server answered the handshake",
+                 False, "%s: %s" % (type(exc).__name__, exc))
+            )
+
+    try:
+        asyncio.run(probe())
+    finally:
+        if not results:
+            results.append((label, False, "the server did not start"))
+        for name, ok, detail in results:
+            print("[%s] %s" % ("PASS" if ok else "FAIL", name))
+            for line in str(detail).rstrip().splitlines() if detail else []:
+                print("       " + line)
+        shutil.rmtree(state_dir, ignore_errors=True)
+    return results
+
+
+def check_main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "--check":
+        argv.pop(0)
+    command, args, extra_env, timeout = None, [], {}, CHECK_TIMEOUT
+    config, wanted = None, "sage"
+    while argv:
+        flag = argv.pop(0)
+        if flag in ("-h", "--help"):
+            print(CHECK_DOC.strip())
+            return 0
+        if flag == "--config":
+            config = argv.pop(0)
+        elif flag == "--name":
+            wanted = argv.pop(0)
+        elif flag == "--timeout":
+            timeout = float(argv.pop(0))
+        elif flag.startswith("-"):
+            raise SystemExit("error: unknown option %s" % flag)
+        elif command is None:
+            command = flag
+            args = [argv.pop(0)] if argv and not argv[0].startswith("-") else []
+        else:
+            args.append(flag)
+    if command is None and config is not None:  # --config/--name in any order
+        command, args, extra_env = _mcp_entry(config, wanted)
+    if command is None:
+        print(CHECK_DOC.strip())
+        return 2
+    results = check(command, args, extra_env, timeout=timeout)
+    failed = [name for name, ok, _ in results if not ok]
+    print()
+    print("%d checks, %d failed" % (len(results), len(failed)))
+    return 0 if not failed else 1
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if "--check" in argv:
+        return check_main(argv)
     client = get_client()
     try:
         mcp.run(transport="stdio")
@@ -543,4 +824,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

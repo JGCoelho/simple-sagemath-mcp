@@ -32,7 +32,7 @@ Source = "https://github.com/JGCoelho/simple-sagemath-mcp"
 
 [project.scripts]
 simple-sage-mcp = "sage_mcp:main"
-simple-sage-mcp-check = "selftest:main"
+simple-sage-mcp-check = "sage_mcp:check_main"
 
 [tool.setuptools]
-py-modules = ["sage_mcp", "sage_client", "sage_kernel", "runfile", "nbrun", "selftest"]
+py-modules = ["sage_mcp", "sage_client", "sage_kernel", "subproc"]

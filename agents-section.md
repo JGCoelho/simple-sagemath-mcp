@@ -21,8 +21,21 @@ A persistent Sage kernel, not a proof checker. Tools: `exec`, `poll`, `reset`,
 - `interrupt(force=true)` stops the kernel instead of the job: all variables are
   lost, the next `exec` starts a fresh one and prefixes its output with
   `[kernel restarted: ...]`.
-- `status` shows pid/uptime, live MCP clients, sessions, active jobs, last error
-  and the log path (`${SAGE_MCP_STATE:-/tmp/sage-mcp-$UID}/kernel.log`).
+- A GAP crash-restart loop (e.g. `structure_description()` on hostile input) is
+  caught by the guard: the job's result starts with `[gap-guard] interrupted
+  after N 'Gap crashed' markers ...`, the job ended as `KeyboardInterrupt`, the
+  session keeps its variables, and `poll` collects it. Do not retry the same
+  input -- try a different invariant or representation. `SAGE_MCP_GAP_LIMIT`
+  (default 3, `0` disables) changes the threshold; your own prints of that text
+  do not trip it.
+- `status` shows pid/uptime, live MCP clients, sessions, active jobs, the last
+  error, the log path (`${SAGE_MCP_STATE:-/tmp/sage-mcp-$UID}/kernel.log`) and one
+  line of counters: `jobs: N run, N failed, N interrupted; gap-guard: N;
+  restarts: N`.
+- `sage://kernel/status` (`application/json`) is the same thing for a client that
+  wants data instead of prose: kernel state/pid/uptime/restarts, `jobs` counters,
+  `last_error`, `sessions`, and the last 20 lines of `kernel.log`. The counters
+  reset when the kernel restarts; `counters_since` says since when.
 - Sessions are never evicted; use `drop` to free one (it refuses sessions with a
   running job). Use `reset` to empty a namespace but keep the session.
 - Several Pi sessions/subagents share one kernel: their jobs queue on it, and it is

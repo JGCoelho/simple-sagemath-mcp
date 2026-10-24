@@ -1,28 +1,19 @@
 #!/usr/bin/env python3
 """sage_client.py -- client side of sage-mcp: find, spawn, talk to the kernel.
 
-Non-obvious rules encoded here (each one was a bug):
+Rules encoded here (each one was a bug):
 
-* A **busy** kernel is not a dead kernel.  If the Unix socket accepts a
-  connection but the handshake/reply times out, the kernel is alive and merely
-  holding the GIL inside a computation: raise :class:`KernelBusy` and NEVER
-  respawn (that would orphan a live kernel and start a second one).
-* The socket lives in a directory that must be owned by us and mode 0700.
-  ``/tmp`` is sticky, not protective: another user can create
-  ``/tmp/sage-mcp-<uid>`` first and would then own the socket path.
+* A **busy** kernel is not a dead kernel: if the socket accepts a connection but
+  the handshake/reply times out, the kernel is alive and merely holding the GIL
+  inside a computation.  Raise :class:`KernelBusy` and NEVER respawn.
+* The socket lives in a directory we own, mode 0700: ``/tmp`` is sticky, not
+  protective -- another user could create ``/tmp/sage-mcp-<uid>`` first.
 * Framing is ``multiprocessing.connection`` (``Client`` + ``send_bytes`` /
-  ``recv_bytes``): the 64 MB reply cap is a parameter, and the *authkey* -- 32
-  random bytes in a 0600 file inside that 0700 directory, never on a command
-  line -- means a same-user process that finds the socket path still cannot
-  drive the kernel without the key.
-* Spawning is serialised with ``O_CREAT|O_EXCL`` on ``spawn.lock``; a second
-  client waits for the first one's kernel.  The lock is reclaimed only when its
-  mtime is older than the wait budget.
-* Only a state file written *after* this spawn began is trusted
-  (``started >= spawn_mark - 5`` plus a pid match).
-* A dead launcher is reported immediately (``proc.poll()``) together with the
-  last ~12 lines of ``kernel.log``, not as a generic timeout.
-* Every response read is capped at 64 MB.
+  ``recv_bytes``), authenticated with a 32-byte authkey kept in a 0600 file in
+  that directory -- never on a command line.
+* Spawning is serialised with ``O_CREAT|O_EXCL`` on ``spawn.lock``, and only a
+  state file written after this spawn began is trusted.  A dead launcher is
+  reported at once, with the log tail; a stale state file is never adopted.
 """
 
 import json
@@ -35,8 +26,8 @@ import time
 import uuid
 from multiprocessing.connection import AuthenticationError, Client as ConnectClient
 
-MAX_RESPONSE = 64 * 1024 * 1024  # rule 19
-SPAWN_TIMEOUT = 180.0  # rule 14: how long we wait for a launcher
+MAX_RESPONSE = 64 * 1024 * 1024  # every reply read is capped
+SPAWN_TIMEOUT = 180.0  # how long we wait for a launcher
 SPAWN_LOCK = "spawn.lock"
 STATE_NAME = "kernel.json"
 SOCK_NAME = "kernel.sock"  # AF_UNIX: no TCP port, nothing another user can dial
@@ -73,23 +64,19 @@ def default_state_dir():
 def private_dir(path):
     """Create the state dir as 0700 and refuse to use one that is not ours.
 
-    A kernel in a directory another user owns means they can read the socket
-    path (and the state file) and talk to the kernel: local code execution as
-    us.  The sticky bit on /tmp does not prevent them from creating the
-    directory name first, so ownership is verified, not assumed.
+    A kernel in a directory another user controls is local code execution as
+    us: they read the socket path and the authkey.  The sticky bit on /tmp does
+    not stop them creating the name first, so ownership is verified.
     """
     try:
         os.makedirs(path, mode=DIR_MODE, exist_ok=True)
-    except OSError as exc:
-        raise KernelError("cannot create the state directory %s: %s" % (path, exc))
-    try:
         st = os.lstat(path)
     except OSError as exc:
-        raise KernelError("cannot inspect the state directory %s: %s" % (path, exc))
+        raise KernelError("cannot use the state directory %s: %s" % (path, exc))
     if not stat.S_ISDIR(st.st_mode):
         raise KernelError(
-            "the state path %s exists but is not a directory (a symlink or a file); "
-            "refusing to put a kernel there" % (path,)
+            "the state path %s is not a directory (a symlink or a file); refusing "
+            "to put a kernel there" % (path,)
         )
     if st.st_uid != os.getuid():
         raise KernelError(
@@ -126,7 +113,6 @@ def _sage_ish(path):
     """
     return os.access(os.path.join(os.path.dirname(path), "sage"), os.X_OK)
 
-
 DISCOVERY_HELP = (
     "no interpreter that can 'import sage.all' was found.  Tried, in order:\n"
     "  1. $SAGE_PYTHON -- not set, or not an existing file\n"
@@ -140,17 +126,14 @@ _PYTHON = []  # cache of the *discovered* answer: `sage -c` is a process spawn
 
 
 def resolve_python():
-    """Sage's interpreter for the kernel (and for run_file/notebook children).
+    """Sage's interpreter for the kernel (and run_file/notebook children).
 
-    The only place that knows where Sage is (PLAN §1.2): $SAGE_PYTHON, then
-    `sage -c 'import sys;print(sys.executable)'`, then the python beside the
-    `sage` found on PATH.  Returns None when none of them works -- a client must
-    still be constructible then, or even `status` could not explain the
-    problem; DISCOVERY_HELP names all three routes when something needs one.
-
-    $SAGE_PYTHON is re-read on every call (it is an override a user or a test
-    can set at any time); only the `sage -c` discovery is cached, because it
-    spawns a process and the answer cannot change under a running server.
+    The only place that knows where Sage is: $SAGE_PYTHON, then
+    `sage -c 'import sys;print(sys.executable)'`, then the python beside `sage`
+    on PATH.  Returns None when none works -- a client must still be
+    constructible then, or even `status` could not explain the problem.
+    $SAGE_PYTHON is re-read every call (a test may set it); only `sage -c`,
+    which spawns a process, is cached.
     """
     explicit = os.environ.get("SAGE_PYTHON")
     if explicit and os.path.exists(explicit):
@@ -196,9 +179,8 @@ def sage_python():
 def load_or_create_key(state_dir):
     """The kernel's authkey: 32 random bytes, mode 0600, in the 0700 state dir.
 
-    Shared through a file rather than argv/env (both are readable from `ps` and
-    /proc), and *reused* across kernel generations: a server that adopted a
-    kernel, and one that started a fresh one, both read the same key.  Written
+    A file rather than argv/env (both are readable from `ps` and /proc), and
+    *reused* across kernel generations so adoption keeps working.  Written
     atomically so a concurrent reader never sees a half-written key.
     """
     path = os.path.join(state_dir, KEY_NAME)
@@ -222,21 +204,18 @@ def load_or_create_key(state_dir):
 
 def _alive(pid):
     """True only for a *live* process: a zombie is a dead process to us."""
-    if not pid:
-        return False
     try:
         pid = int(pid)
     except (ValueError, TypeError, OverflowError):
         return False
+    if not pid:
+        return False
     try:
         with open("/proc/%d/stat" % pid, "r") as fh:
-            data = fh.read()
-        fields = data.rsplit(")", 1)[-1].split()
-        if fields and fields[0] in ("Z", "X", "x"):
+            state = fh.read().rsplit(")", 1)[-1].split()
+        if state and state[0] in ("Z", "X", "x"):
             return False
         return True
-    except FileNotFoundError:
-        return False
     except OSError:
         pass
     try:
@@ -272,6 +251,16 @@ def _is_our_kernel(pid, state_path):
     return "sage_kernel.py" in cmd and state_path in cmd
 
 
+def _stuck_text(pid, why):
+    """Rule 17: a kernel we could not stop keeps its state files -- say so."""
+    return (
+        "could not stop the kernel: %s.\n"
+        "The state files were left in place on purpose: pid %s may still be alive, and "
+        "deleting them would orphan it and let the next call spawn a second kernel.\n"
+        "Stop it yourself with: kill -9 %s" % (why, pid, pid)
+    )
+
+
 class Client:
     """One process-wide handle on the kernel; safe to share across threads."""
 
@@ -293,6 +282,8 @@ class Client:
         self.client_id = uuid.uuid4().hex
         self._ever_ready = False  # did this server hand out a kernel already?
         self._killed_pid = None  # pid stopped by kill(), for the restart notice
+        self.spawns = 0  # kernels this server launched (observability)
+        self.restarts = 0  # kernels replaced after this server had handed one out
 
     # -- state file -------------------------------------------------------
     def read_state(self):
@@ -325,12 +316,6 @@ class Client:
                 pass
 
     # -- transport --------------------------------------------------------
-    def _roundtrip(self, payload, timeout):
-        state = self.read_state()
-        if state is None:
-            raise KernelDown("no kernel state file at %s" % self.state_path)
-        return self._roundtrip_state(payload, timeout)
-
     def _authkey(self):
         """The authkey the running kernel expects, or None when it is missing."""
         try:
@@ -346,7 +331,7 @@ class Client:
         `multiprocessing.connection.Client` runs the challenge/response handshake
         with blocking reads, and a busy kernel holds the GIL -- its accept thread
         cannot answer -- so the handshake runs in a helper thread bounded by
-        `budget`.  Busy is then a clean KernelBusy, never a hang (rule 11).
+        `budget`.  Busy is then a clean KernelBusy, never a hang.
         """
         key = self._authkey()
         if key is None:
@@ -443,9 +428,11 @@ class Client:
 
     def op(self, name, _timeout=OP_TIMEOUT, **params):
         """Send an op; ``_timeout`` is the socket budget, params go to the kernel."""
+        if self.read_state() is None:
+            raise KernelDown("no kernel state file at %s" % self.state_path)
         payload = {"op": name}
         payload.update(params)
-        reply = self._roundtrip(payload, _timeout)
+        reply = self._roundtrip_state(payload, _timeout)
         if not reply.get("ok"):
             raise KernelError(str(reply.get("error") or ("%s failed" % name)))
         return reply
@@ -477,21 +464,12 @@ class Client:
                     return state, False, "busy"
                 except KernelDown as exc:
                     if _alive(pid):
-                        if "sock" not in state:
-                            raise KernelDown(
-                                "kernel pid %s is alive but was started by a pre-Unix-socket "
-                                "version of this server (%s); stop it once with "
-                                "interrupt(force=true) — its variables cannot be handed "
-                                "over to the new transport" % (pid, exc)
-                            )
                         raise KernelDown(
                             "kernel pid %s is alive but not accepting connections "
                             "(%s); refusing to start a second kernel — use `kill`"
                             % (pid, exc)
                         )
                     reason = "the previous kernel (pid %s) stopped answering" % (pid,)
-            if self.proc is not None and self.proc.poll() is None and self.proc.pid == pid:
-                raise KernelDown("our own kernel (pid %s) is alive but unresponsive" % pid)
         else:
             killed = self._killed_pid
             self._killed_pid = None
@@ -505,29 +483,36 @@ class Client:
                 "the state file was missing; the live kernel (pid %s) was adopted"
                 % (state.get("pid"),)
             )
+        if was_ready:
+            self.restarts += 1
         self._ever_ready = True
         return state, was_ready, reason
 
     def _spawn(self, reason):
         with self._spawn_lock:
             # Re-check: another thread may have spawned while we waited.  Only a
-            # state we can *verify* as our kernel may be adopted (rule 13).
-            state = self.read_state()
-            if (
-                state is not None
-                and self._still_there(state.get("pid"))
-                and _is_our_kernel(state.get("pid"), self.state_path)
-            ):
-                try:
-                    self.hello(state, timeout=2.0)
-                    return state
-                except KernelBusy:
-                    return state
-                except KernelDown:
-                    pass
-            return self._spawn_locked(reason)
+            # state we can *verify* as our kernel may be adopted.
+            state = self._verified_state()
+            return state if state is not None else self._spawn_locked(reason)
 
-    def _acquire_spawn_lock(self, deadline):
+    def _verified_state(self, timeout=2.0):
+        """Our verified live kernel's state (even if wedged), or None."""
+        state = self.read_state()
+        if (
+            state is None
+            or not self._still_there(state.get("pid"))
+            or not _is_our_kernel(state.get("pid"), self.state_path)
+        ):
+            return None
+        try:
+            self.hello(state, timeout=timeout)
+            return state
+        except KernelBusy:
+            return state  # alive, merely holding the GIL: adopt, never respawn
+        except KernelDown:
+            return None
+
+    def _acquire_spawn_lock(self):
         while True:
             try:
                 fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
@@ -536,7 +521,7 @@ class Client:
                     age = time.time() - os.path.getmtime(self.lock_path)
                 except OSError:
                     continue
-                if age > SPAWN_TIMEOUT:  # rule 12: reclaim only when stale
+                if age > SPAWN_TIMEOUT:  # reclaim only when stale
                     try:
                         os.unlink(self.lock_path)
                     except OSError:
@@ -546,10 +531,6 @@ class Client:
             else:
                 os.write(fd, ("%d %f\n" % (os.getpid(), time.time())).encode())
                 return fd
-            if time.time() > deadline:
-                raise KernelDown(
-                    "timed out waiting for the spawn lock at %s" % self.lock_path
-                )
 
     def _adopt_lost_state(self):
         """Adopt a live kernel whose state file vanished instead of spawning a twin.
@@ -595,7 +576,7 @@ class Client:
             raise KernelError(DISCOVERY_HELP)
         mark = time.time()
         deadline = mark + SPAWN_TIMEOUT
-        fd = self._acquire_spawn_lock(deadline)
+        fd = self._acquire_spawn_lock()
         if fd is None:
             state = self._wait_for_foreign_kernel(deadline)
             return state
@@ -603,7 +584,7 @@ class Client:
             adopted = self._adopt_lost_state()
             if adopted is not None:
                 return adopted
-            self._unlink_state()  # rule 13: never adopt a stale state file
+            self._unlink_state()  # never adopt a stale state file
             load_or_create_key(self.state_dir)  # before the kernel boots and reads it
             env = os.environ.copy()
             env["PATH"] = os.path.dirname(self.python) + os.pathsep + env.get("PATH", "")
@@ -631,10 +612,12 @@ class Client:
                     env=env,
                     start_new_session=True,
                 )
+                self.spawns += 1
             finally:
                 log.close()
-            state = self._wait_for_our_kernel(mark, self.proc)
-            self._recent_restart = reason
+            state = self._wait_for_kernel(
+                "the Sage kernel did not come up", mark + SPAWN_TIMEOUT, mark, self.proc
+            )
             return state
         finally:
             os.close(fd)
@@ -643,21 +626,29 @@ class Client:
             except OSError:
                 pass
 
-    def _wait_for_our_kernel(self, mark, proc):
-        deadline = time.time() + SPAWN_TIMEOUT
+    def _wait_for_kernel(self, what, deadline, mark=None, proc=None):
+        """Wait for a kernel we can verify (and hello); else KernelDown `what`."""
         while time.time() < deadline:
-            rc = proc.poll()
-            if rc is not None:  # rule 14: report a dead launcher immediately
-                raise KernelDown(
-                    "the Sage kernel launcher exited with code %s after %.1fs\n"
-                    "--- %s (last 12 lines) ---\n%s"
-                    % (rc, time.time() - mark, self.log_path, tail_log(self.log_path))
-                )
+            if proc is not None:
+                code = proc.poll()
+                if code is not None:  # a dead launcher is reported at once
+                    raise KernelDown(
+                        "the Sage kernel launcher exited with code %s after %.1fs\n"
+                        "--- %s (last 12 lines) ---\n%s"
+                        % (code, time.time() - mark, self.log_path, tail_log(self.log_path))
+                    )
             state = self.read_state()
             if (
                 state is not None
-                and float(state.get("started") or 0) >= mark - 5  # rule 13
-                and int(state.get("pid") or -1) == proc.pid
+                and self._still_there(state.get("pid"))
+                and _is_our_kernel(state.get("pid"), self.state_path)
+                and (
+                    proc is None  # another client's kernel: any verified one will do
+                    or (
+                        float(state.get("started") or 0) >= mark - 5  # a fresh state file
+                        and int(state.get("pid") or -1) == proc.pid
+                    )
+                )
             ):
                 try:
                     self.hello(state, timeout=HELLO_TIMEOUT)
@@ -668,32 +659,16 @@ class Client:
                     pass
             time.sleep(0.05)
         raise KernelDown(
-            "the Sage kernel did not come up within %.0fs\n"
-            "--- %s (last 12 lines) ---\n%s"
-            % (SPAWN_TIMEOUT, self.log_path, tail_log(self.log_path))
+            "%s within %.0fs\n--- %s (last 12 lines) ---\n%s"
+            % (what, SPAWN_TIMEOUT, self.log_path, tail_log(self.log_path))
         )
 
     def _wait_for_foreign_kernel(self, deadline):
         """Another client holds the spawn lock: adopt the kernel it is starting."""
-        while time.time() < deadline:
-            state = self.read_state()
-            if (
-                state is not None
-                and self._still_there(state.get("pid"))
-                and _is_our_kernel(state.get("pid"), self.state_path)
-            ):
-                try:
-                    self.hello(state, timeout=2.0)
-                    return state
-                except KernelBusy:
-                    return state
-                except KernelDown:
-                    pass
-            time.sleep(0.1)
-        raise KernelDown(
-            "another client is starting the kernel and it did not appear within "
-            "%.0fs (lock: %s)\n--- %s (last 12 lines) ---\n%s"
-            % (SPAWN_TIMEOUT, self.lock_path, self.log_path, tail_log(self.log_path))
+        return self._wait_for_kernel(
+            "another client is starting the kernel (lock: %s) and it did not appear"
+            % (self.lock_path,),
+            deadline,
         )
 
     # -- control ----------------------------------------------------------
@@ -794,31 +769,17 @@ class Client:
             except ProcessLookupError:
                 return self._stopped(pid)
             except OSError as exc:
-                # Rule 17: keep the state files; they point at a live process.
                 return status_result(
-                    ok=False,
-                    text="could not stop the kernel: signal %d to pid %s failed (%s).\n"
-                    "The state files were left in place on purpose: pid %s may still be "
-                    "alive, and deleting them would orphan it and let the next call "
-                    "spawn a second kernel.\nStop it yourself with: kill -9 %s"
-                    % (sig, pid, exc, pid, pid),
+                    ok=False, text=_stuck_text(pid, "signal %d failed: %s" % (sig, exc))
                 )
             if self._wait_gone(pid, budget):
                 return self._stopped(pid)
         return status_result(
-            ok=False,
-            text="could not stop the kernel: pid %s is still alive after SIGTERM and "
-            "SIGKILL.\nThe state files were left in place on purpose (deleting them "
-            "would orphan a live kernel and let the next call spawn a second one).\n"
-            "Stop it yourself with: kill -9 %s" % (pid, pid),
+            ok=False, text=_stuck_text(pid, "SIGTERM and SIGKILL did not stop it")
         )
 
     def stop_if_last(self, timeout=3.0):
-        """Stop the kernel only if no other MCP server is still using it.
-
-        Called when this server exits. Returns True when the kernel was stopped,
-        False when it was left running for somebody else (or was unreachable).
-        """
+        """Stop the kernel only if no other MCP server still uses it (on exit)."""
         try:
             info = self.op("clients", _timeout=timeout)
         except (KernelDown, KernelBusy, KernelError, OSError):
@@ -858,47 +819,32 @@ class Client:
     def status_snapshot(self, timeout=5.0):
         """Best-effort status: never raises for a missing/wedged kernel."""
         state = self.read_state()
+        log = self.log_path
         if state is None:
-            snapshot = {"state": "absent", "log": self.log_path, "path": self.state_path}
+            snapshot = {"state": "absent", "log": log, "path": self.state_path}
             if self._killed_pid:
-                snapshot["note"] = (
-                    "the previous kernel (pid %s) was force-stopped"
-                    % (self._killed_pid,)
+                snapshot["note"] = "the previous kernel (pid %s) was force-stopped" % (
+                    self._killed_pid,
                 )
             return snapshot
         pid = int(state["pid"])
         if not self._still_there(pid):
-            return {"state": "dead", "pid": pid, "log": self.log_path, "state_file": state}
+            return {"state": "dead", "pid": pid, "log": log, "state_file": state}
         if not _is_our_kernel(pid, self.state_path):
-            return {
-                "state": "dead",
-                "pid": pid,
-                "log": self.log_path,
-                "error": "stale state file (pid reuse)",
-            }
+            return {"state": "dead", "pid": pid, "log": log,
+                    "error": "stale state file (pid reuse)"}
         try:
             reply = self._roundtrip_state({"op": "status"}, timeout)
         except KernelBusy:
-            return {
-                "state": "busy",
-                "pid": pid,
-                "started": state.get("started"),
-                "log": self.log_path,
-            }
+            return {"state": "busy", "pid": pid, "started": state.get("started"), "log": log}
         except KernelError as exc:
-            return {
-                "state": "unreachable",
-                "pid": pid,
-                "error": str(exc),
-                "log": self.log_path,
-            }
+            return {"state": "unreachable", "pid": pid, "error": str(exc), "log": log}
         reply["state"] = "running"
         return reply
 
 
 def status_result(ok, text):
     return {"ok": ok, "text": text}
-
 
 _SINGLETON = None
 _SINGLETON_LOCK = threading.Lock()

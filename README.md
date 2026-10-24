@@ -46,6 +46,21 @@ any registration at any time with `./install.sh --check` or
 | `run_file` | `path`*, `lang`="auto", `args`=[], `timeout_s`=120, `stdin`, `cwd` | exit code and duration, then stdout/stderr inline; a non-zero exit is an error carrying both |
 | `notebook` | `action`*, `path`*, `out`, `in_place`, `cell_timeout_s`=120, `timeout_s` | `check` / `extract` / `clear` / `run`; advertised only when `nbformat`+`nbconvert`+`nbclient` import |
 
+## Status resource
+
+`sage://kernel/status` (`application/json`) is the machine-readable form of
+`status`, for a client that does not want to parse prose: the kernel's `pid`,
+`state` (`idle` / `busy` / `unreachable` / `not running`), uptime, `restarts`,
+the `jobs` counters (`run`, `failed`, `interrupted`, `queued`, `last_job`,
+`gap_trips`), `last_error` with the job and session that produced it,
+`sessions`, `limits` (`null` until the resource-limit work lands), and the log
+`path` plus its last 20 lines (read from the file's tail, so it answers while a
+job runs). The counters live **in the kernel** and reset when it restarts;
+`counters_since` says since when, so they are never read as lifetime totals. The
+server adds what only it knows: its own pid, version, live `clients`, `spawns`
+and `restarts`. The `status` tool carries the same numbers in one line:
+`jobs: N run, N failed, N interrupted; gap-guard: N; restarts: N`.
+
 ## Why `poll` exists
 
 `exec`'s timeout **does not cancel anything**: a Gröbner basis or a graph
@@ -96,10 +111,24 @@ which stops when the last server exits. See [DESIGN.md](DESIGN.md) for the rest.
 `running.json`, `kernel.log`, created `0700`) and `SAGE_CWD` (working directory
 for `exec` and `run_file`, default the server's cwd).
 
+`SAGE_MCP_GAP_LIMIT` (default `3`; `0` disables it) is the **GAP crash-loop
+guard**. `structure_description()` on hostile input makes GAP crash-restart in a
+loop, forking a process per crash; no timeout catches that, because the cell
+never finishes. The kernel counts the `Gap crashed` / `Restarting Gap` markers as
+they are written and, at the limit, interrupts that job **once** -- the same
+`SIGINT` as `interrupt`, so it ends as a `KeyboardInterrupt`, the session keeps
+its variables, and `poll` collects it. The result text is prefixed with
+`[gap-guard] interrupted after N 'Gap crashed' markers ...`, the trip is logged to
+`kernel.log`, and the count is in `status`/the status resource. Markers written
+by your own code on stdout are ignored; Sage's own markers (printed from
+`sage/interfaces/gap.py`, i.e. on stdout) are what the guard is for, and stderr
+is watched as well. Per-process limits are the backstop for a fork storm that
+outruns the markers.
+
 ## Tests
 
 ```bash
-# 84 checks over MCP stdio (official client), ~85 s
+# 108 checks over MCP stdio (official client), ~100 s
 /path/to/sage-env/bin/python tests/acceptance.py
 
 # 10 checks as a Sage script, ~10 s (`singular` must be on PATH)
@@ -111,8 +140,9 @@ spawn serialisation, stale state files, dead launchers, an honest stop, output
 caps, `since` offsets, log isolation, shared-kernel ownership, socket privacy and
 the authkey, adoption across a server restart, the three discovery routes, a
 cancelled `exec` still being recoverable, the `run_file` contract, the notebook
-cycle, and that a handler's stray `print` cannot reach the wire. `selftest.py` is
-the 7-check version behind `install.sh --check`.
+cycle, the GAP crash-loop guard, the status resource and its counters, and that a
+handler's stray `print` cannot reach the wire. `sage_mcp.py --check` (behind
+`install.sh --check` and `simple-sage-mcp-check`) is the 7-check smoke test.
 
 ## License
 
