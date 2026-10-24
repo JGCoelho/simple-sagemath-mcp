@@ -1,0 +1,65 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.JGCoelho/simple-sagemath-mcp",
+  "title": "Simple Sage MCP",
+  "description": "One persistent SageMath kernel: jobs outlive timeouts, the kernel outlives the server.",
+  "version": "1.0.0",
+  "websiteUrl": "https://github.com/JGCoelho/simple-sagemath-mcp",
+  "repository": {
+    "url": "https://github.com/JGCoelho/simple-sagemath-mcp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registryType": "pypi",
+      "registryBaseUrl": "https://pypi.org",
+      "identifier": "simple-sage-mcp",
+      "version": "1.0.0",
+      "runtimeHint": "uvx",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "SAGE_PYTHON",
+          "description": "Interpreter that can `import sage.all` (the kernel). Discovered from `SAGE_PYTHON`, then `sage -c`, then the python beside `sage` on PATH.",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "SAGE_MCP_STATE",
+          "description": "State directory identifying the kernel (default: /tmp/sage-mcp-$UID). Clients that share it share one kernel.",
+          "format": "string",
+          "default": "/tmp/sage-mcp-$UID",
+          "isRequired": false
+        },
+        {
+          "name": "SAGE_CWD",
+          "description": "Working directory for `exec` and `run_file` (default: the server's cwd).",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "SAGE_MCP_LIMITS",
+          "description": "Per-process limits for the kernel and its children, e.g. cpu=3600,as=8G,fsize=1G,nproc=off (the defaults).",
+          "format": "string",
+          "isRequired": false
+        },
+        {
+          "name": "SAGE_MCP_GAP_LIMIT",
+          "description": "GAP crash-loop markers before one SIGINT (default 3; 0 disables the guard).",
+          "format": "string",
+          "default": "3",
+          "isRequired": false
+        },
+        {
+          "name": "SAGE_MCP_LOG_MAX",
+          "description": "Size at which kernel.log is rotated to kernel.log.1 (default 8 MiB; 0 disables).",
+          "format": "string",
+          "default": "8388608",
+          "isRequired": false
+        }
+      ]
+    }
+  ]
+}

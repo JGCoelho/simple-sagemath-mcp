@@ -2398,6 +2398,7 @@ def main():
     check_suite(workdir)
     ownership_pin(workdir)
     stdout_hygiene(workdir)
+    cli_suite()
 
     record(
         "errors reach the model with the tool's own message",
@@ -2418,6 +2419,55 @@ def main():
     else:
         print("kept %s" % workdir)
     return 0
+
+
+# --------------------------------------------------------------------------
+# the CLI surface: --help / --version / an unknown flag
+# --------------------------------------------------------------------------
+def cli_suite():
+    """`--help` and `--version` answer without starting a server or a kernel."""
+
+    def run(*args):
+        return subprocess.run(
+            [sys.executable, SERVER] + list(args),
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd="/tmp",
+        )
+
+    helped = run("--help")
+    text = helped.stdout + helped.stderr
+    record(
+        "`--help` exits 0 and names --check and the environment variables",
+        helped.returncode == 0
+        and "--check" in text
+        and "SAGE_PYTHON" in text
+        and "SAGE_MCP_STATE" in text,
+        (helped.stdout.strip().splitlines() or [""])[0],
+    )
+    version = run("--version")
+    record(
+        "`--version` names the package and a version",
+        version.returncode == 0
+        and "simple-sage-mcp" in version.stdout
+        and any(ch.isdigit() for ch in version.stdout),
+        version.stdout.strip(),
+    )
+    bogus = run("--bogus")
+    record(
+        "an unknown argument exits 2 instead of silently serving",
+        bogus.returncode == 2 and "unknown argument" in (bogus.stdout + bogus.stderr),
+        (bogus.stderr.strip().splitlines() or ["(nothing)"])[0],
+    )
+    check_help = run("--check", "--help")
+    record(
+        "`--check --help` documents the checker, not the server",
+        check_help.returncode == 0
+        and "Usage: sage_mcp.py --check" in check_help.stdout,
+        (check_help.stdout.strip().splitlines() or [""])[0],
+    )
+
 
 
 if __name__ == "__main__":

@@ -652,6 +652,37 @@ if subproc.available():
 CHECK_TIMEOUT = 90.0
 KERNEL_TOOLS = ("exec", "poll", "reset", "drop", "status", "interrupt", "run_file")
 
+USE_DOC = """\
+Usage: sage_mcp.py [-h|--help] [--version] [--check ...]
+
+An MCP server over one persistent SageMath kernel.  With no options it serves
+MCP on stdin/stdout: that is how a client starts it, and it takes no arguments
+to do so.  The kernel is a separate process started with Sage's own
+interpreter; this process needs only `mcp`.
+
+  -h, --help      this text
+  --version       print the package version and exit
+  --check [...]    prove a registration works (`--check --help` for its options)
+
+Environment:
+  SAGE_PYTHON         interpreter that can `import sage.all` (the kernel)
+  SAGE_MCP_STATE      state directory; its identity is the kernel's identity
+  SAGE_CWD            working directory for exec and run_file
+  SAGE_MCP_LIMITS     cpu/as/fsize/nproc limits for the kernel and its children
+  SAGE_MCP_GAP_LIMIT  GAP crash-loop markers before one SIGINT (0 disables)
+  SAGE_MCP_LOG_MAX    kernel.log rotation size (0 disables)
+
+See README.md for the tools, and DESIGN.md for why they behave this way."""
+
+
+def _version():
+    try:
+        from importlib.metadata import version
+
+        return version("simple-sage-mcp")
+    except Exception:
+        return "1.0.0-dev (not installed)"
+
 CHECK_DOC = """\
 Usage: sage_mcp.py --check [--config mcp.json] [--name sage] [--timeout S]
        sage_mcp.py --check <command> [server-script]
@@ -931,6 +962,15 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
     if "--check" in argv:
         return check_main(argv)
+    if "-h" in argv or "--help" in argv:
+        print(USE_DOC)
+        return 0
+    if "--version" in argv:
+        print("simple-sage-mcp %s" % _version())
+        return 0
+    if argv:
+        print("error: unknown argument %s\n\n%s" % (argv[0], USE_DOC), file=sys.stderr)
+        return 2
     # The server applies the same limits as the kernel so run_file/notebook
     # children inherit them.  `cpu` and `nproc` stay kernel-scoped (PLAN §7):
     # CPU here would bound the *server's* lifetime CPU, and an nproc small enough

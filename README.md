@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/JGCoelho/simple-sagemath-mcp/main/images/simple-sagemath-logo.png"
+       alt="simple-sagemath-mcp" width="820">
+</p>
+
 # simple-sage-mcp
 
 An MCP server that gives an agent a **persistent SageMath kernel** over stdio: one
@@ -32,7 +37,8 @@ and running `2+2` through it. Another client needs the block it prints:
 
 `pip install git+https://github.com/JGCoelho/simple-sagemath-mcp` works too. Check a
 registration at any time with `./install.sh --check` or
-`simple-sage-mcp-check /path/to/python /path/to/sage_mcp.py`.
+`simple-sage-mcp-check /path/to/python /path/to/sage_mcp.py`. `sage_mcp.py --help`
+lists the options and the environment variables.
 
 ## Persistent state and sessions
 
@@ -101,6 +107,9 @@ does -- `counters_since` says since when.
 | `reset` / `drop` | `session`; `sessions`=[], `all`=false | empty a namespace; free idle sessions |
 | `run_file` | `path`*, `lang`="auto", `args`=[], `timeout_s`=120, `stdin`, `cwd` | exit code and duration, then stdout/stderr inline; a non-zero exit is an error carrying both |
 | `notebook` | `action`*, `path`*, `out`, `in_place`, `cell_timeout_s`=120, `timeout_s` | `check` / `extract` / `clear` / `run`; all four run in Sage's interpreter, and the tool is advertised only when *that* interpreter has `nbformat`+`nbconvert`+`nbclient` |
+
+Five short transcripts with the real output -- a job outliving its `exec`, an
+interrupt, `run_file`, sessions, notebooks -- are in [`examples/`](examples/).
 
 ## Jobs, and why `poll` exists
 
@@ -208,7 +217,7 @@ interruption that did not happen.
 # 24 conformance cases, one row each, ~70 s
 /path/to/sage-env/bin/python tests/conformance.py        # or --only C13,C15
 
-# 140 checks over MCP stdio through the official client, ~195 s
+# 144 checks over MCP stdio through the official client, ~200 s
 /path/to/sage-env/bin/python tests/acceptance.py
 
 # 10 checks as a Sage script, ~10 s (`singular` must be on PATH)

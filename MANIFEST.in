@@ -1,0 +1,3 @@
+include LICENSE README.md DESIGN.md agents-section.md server.json
+recursive-include examples *.md *.py *.ipynb
+recursive-include images *.png
