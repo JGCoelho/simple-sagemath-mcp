@@ -14,6 +14,11 @@ A persistent Sage kernel, not a proof checker. Tools: `exec`, `poll`, `reset`,
   start); `wait_s` blocks up to T seconds for the job to finish. Use
   `wait_s` rather than polling in a loop, and print progress sparsely (job output
   is capped at 4 MB; a truncated repr at 4000 chars).
+- Sessions are namespaces inside one shared kernel: `a = 1` in session `work` is
+  invisible in `default`, and both persist between calls, across turns, and across
+  an MCP server restart (a new server adopts the surviving kernel, so `poll` still
+  collects a job the old one started). Use distinct session names when parallel
+  subagents must not collide, and print progress sparsely -- output is capped.
 - `interrupt` sends SIGINT: the job fails with `KeyboardInterrupt` and the session
   KEEPS its variables — the first thing to try for a runaway computation. It
   refuses when the running job belongs to another MCP client (another Pi session

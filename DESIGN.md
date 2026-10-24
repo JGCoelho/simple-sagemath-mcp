@@ -58,7 +58,11 @@ work while the socket is blocked, and refuses to let a job's failure take the
 kernel with it.
 
 Kernels are shared, not per-call: several Pi sessions or subagents drive one
-kernel, jobs queue on it, and it stops when the last server exits. State lives in
+kernel, jobs queue on it, and it stops when the last server exits. Sessions are
+namespaces inside that kernel -- a name to a dict of globals seeded from
+`from sage.all import *` -- so `reset` is a `clear()` and `drop` frees a name,
+neither of which restarts anything; the server itself holds no user state, which
+is why a restarted server can adopt the kernel and still serve `poll`. State lives in
 `${SAGE_MCP_STATE:-/tmp/sage-mcp-$UID}` (`kernel.sock`, `kernel.json`,
 `running.json`, `kernel.log`), never in the package directory.
 
