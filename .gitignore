@@ -17,3 +17,5 @@ PLAN.md
 
 # local implementation workflow (see .workflow/)
 .workflow/
+# notebooks executed while testing the examples
+*.out.ipynb
