@@ -1,6 +1,6 @@
 <p align="center">
   <img src="https://raw.githubusercontent.com/JGCoelho/simple-sagemath-mcp/main/images/simple-sagemath-banner.png"
-       alt="simple-sagemath-mcp" width="820">
+       alt="simple-sagemath-mcp" width="850">
 </p>
 
 # simple-sage-mcp
@@ -221,8 +221,12 @@ interruption that did not happen.
 # 24 conformance cases, one row each, ~70 s
 /path/to/sage-env/bin/python tests/conformance.py        # or --only C13,C15
 
-# 150 checks over MCP stdio through the official client, ~200 s
+# 151 checks over MCP stdio through the official client, ~190 s
 /path/to/sage-env/bin/python tests/acceptance.py
+
+# one suite instead of all of them (~7 s): the names come from --list-suites
+/path/to/sage-env/bin/python tests/acceptance.py --list-suites
+/path/to/sage-env/bin/python tests/acceptance.py --suite discovery_visibility_suite
 
 # 10 checks as a Sage script, ~10 s (`singular` must be on PATH)
 PATH=/path/to/sage-env/bin:$PATH sage tests/interrupt_ownership.sage

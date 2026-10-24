@@ -997,6 +997,16 @@ def main(argv=None):
     except limits_mod.LimitError as exc:
         print("sage-mcp: SAGE_MCP_LIMITS: %s" % exc, file=sys.stderr)
         return 2
+    # stdio is the wire, so stderr is the only place a startup problem can be
+    # said out loud -- and a client shows it in its logs.  One line, only when
+    # discovery is already known to fail: `status` and `exec` carry the details.
+    sage = discovery_report()
+    if not sage["interpreter"]:
+        print(
+            "sage-mcp: no Sage interpreter (%s) -- status and exec will explain; "
+            "pip/uvx install this server, not SageMath." % sage["detail"],
+            file=sys.stderr,
+        )
     client = get_client()
     try:
         mcp.run(transport="stdio")

@@ -2366,11 +2366,64 @@ def ownership_pin(workdir):
 
 
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# suite registry: `--suite name[,name]` runs a subset (the whole thing is ~3 min)
+# --------------------------------------------------------------------------
+def iter_suites(workdir, selected=None):
+    """(name, callable) for every suite, or only those named (prefix matches)."""
+    suites = [
+        ("client_invariants", lambda: client_invariants(workdir)),
+        ("extra_invariants", lambda: extra_invariants(workdir)),
+        ("transport_invariants", lambda: transport_invariants(workdir)),
+        ("discovery_invariants", lambda: discovery_invariants(workdir)),
+        ("cancellation_recovery", lambda: cancellation_recovery(workdir)),
+        ("gap_guard_suite", lambda: gap_guard_suite(workdir)),
+        ("log_reentrancy_check", log_reentrancy_check),
+        ("limits_suite", lambda: limits_suite(workdir)),
+        ("observability_suite", lambda: observability_suite(workdir)),
+        ("notebook_interpreter_suite", lambda: notebook_interpreter_suite(workdir)),
+        ("check_suite", lambda: check_suite(workdir)),
+        ("ownership_pin", lambda: ownership_pin(workdir)),
+        ("stdout_hygiene", lambda: stdout_hygiene(workdir)),
+        ("cli_suite", cli_suite),
+        ("discovery_visibility_suite", lambda: discovery_visibility_suite(workdir)),
+    ]
+    if not selected:
+        return suites
+    chosen = []
+    for wanted in selected:
+        hits = [(n, f) for n, f in suites if n.startswith(wanted)]
+        if not hits:
+            raise SystemExit(
+                "error: no suite matches %r; --list-suites shows the names" % wanted
+            )
+        chosen.extend(hits)
+    return chosen
+
+
+
 def main():
     global PYTHON
     args = sys.argv[1:]
-    if args and args[0] == "--python":
-        PYTHON = args[1]
+    selected, quiet = [], False
+    while args:
+        flag = args.pop(0)
+        if flag == "--python":
+            PYTHON = args.pop(0)
+        elif flag == "--list-suites":
+            for name, _ in iter_suites("."):
+                print(name)
+            return 0
+        elif flag == "--suite":
+            selected.extend(
+                part.strip() for part in args.pop(0).split(",") if part.strip()
+            )
+            if selected and selected[-1].startswith("-"):
+                raise SystemExit("error: --suite needs a comma-separated list")
+        elif flag in ("-q", "--quiet"):
+            quiet = True
+        else:
+            raise SystemExit("error: unknown argument %r (see --list-suites)" % flag)
 
     workdir = tempfile.mkdtemp(prefix="sage-mcp-accept-")
     state_dir = os.path.join(workdir, "state")
@@ -2378,31 +2431,22 @@ def main():
     server = Server(state_dir)
     started = time.time()
     try:
-        suite(server, workdir)
+        if not selected:
+            suite(server, workdir)
     finally:
         server.close()
-        kernel_gone = not os.path.exists(os.path.join(state_dir, "kernel.json"))
-        record(
-            "server exit stops the kernel (no orphan)",
-            kernel_gone,
-            "" if kernel_gone else "kernel.json still present",
-        )
+        if not selected:
+            kernel_gone = not os.path.exists(os.path.join(state_dir, "kernel.json"))
+            record(
+                "server exit stops the kernel (no orphan)",
+                kernel_gone,
+                "" if kernel_gone else "kernel.json still present",
+            )
 
-    client_invariants(workdir)
-    extra_invariants(workdir)
-    transport_invariants(workdir)
-    discovery_invariants(workdir)
-    cancellation_recovery(workdir)
-    gap_guard_suite(workdir)
-    log_reentrancy_check()
-    limits_suite(workdir)
-    observability_suite(workdir)
-    notebook_interpreter_suite(workdir)
-    check_suite(workdir)
-    ownership_pin(workdir)
-    stdout_hygiene(workdir)
-    cli_suite()
-    discovery_visibility_suite(workdir)
+    for name, run in iter_suites(workdir, selected):
+        if not quiet:
+            print("\n--- %s ---" % name)
+        run()
 
     record(
         "errors reach the model with the tool's own message",
@@ -2486,7 +2530,12 @@ def discovery_visibility_suite(workdir):
     """
     bare = {"PATH": "/usr/bin:/bin", "SAGE_PYTHON": ""}
     state = os.path.join(workdir, "novisibility")
-    server = Server(state, extra_env=bare)
+    errlog = open(os.path.join(workdir, "novisibility.err"), "w+")  # needs a fileno()
+    server = Server(state, extra_env=bare, errlog=errlog)
+    time.sleep(1.0)  # let the child write its startup line
+    errlog.flush()
+    errlog.seek(0)
+    errlog_text = errlog.read()
     try:
         text, err, _ = server.tool("status")
         record(
@@ -2504,6 +2553,12 @@ def discovery_visibility_suite(workdir):
                 json.loads(server.resource("sage://kernel/status")[1])
             ),
             "sage=%s" % json.loads(server.resource("sage://kernel/status")[1]).get("sage"),
+        )
+        record(
+            "no Sage anywhere: the server says it on stderr at startup, where a "
+            "client's log can show it",
+            "no Sage interpreter" in (errlog_text or ""),
+            (errlog_text or "(nothing on stderr)").strip().splitlines()[:1],
         )
         out, failed, _ = server.tool("exec", code="2+2")
         record(
