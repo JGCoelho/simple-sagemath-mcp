@@ -464,8 +464,14 @@ def progress_suite(workdir):
     notification resets it. The server therefore slices its waits and reports
     while it waits: without this, a 90 s job under `timeout_s=120` looked like a
     failed call and its job id was lost.
+
+    The reporting interval defaults to 60 s, so the checks below lower it through
+    SAGE_MCP_PROGRESS_SLICE: they exercise the mechanism, not the constant, and
+    stay fast enough to run in the full suite.
     """
-    server = Server(os.path.join(workdir, "progress"))
+    server = Server(
+        os.path.join(workdir, "progress"), extra_env={"SAGE_MCP_PROGRESS_SLICE": "3"}
+    )
     # Longer than one progress slice, so a wait that reports has to report.
     slow = "import time\ntime.sleep(12)\nprint('slow done')"
     try:
@@ -474,7 +480,7 @@ def progress_suite(workdir):
             "exec reports progress while it waits",
             not is_err
             and "slow done" in text
-            and notes
+            and len(notes) >= 3  # a 12 s job on a 3 s slice: three reports
             and all(message and "still running" in message for _, _, message in notes)
             and all(total == 40 for _, total, _ in notes),
             "%d notification(s): %r" % (len(notes), notes[0][2] if notes else None),

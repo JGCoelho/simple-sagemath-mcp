@@ -7,14 +7,16 @@ of them are breaking and get a major version.
 ## Unreleased
 
 - **Long waits cannot be mistaken for failures.** `exec`, `poll`, `run_file` and
-  `notebook` now send an MCP progress notification every 10 s while they wait.
+  `notebook` now send an MCP progress notification every 30 s while they wait.
   Clients reset their per-request timeout on a progress notification, so a wait
   longer than that timeout ends normally instead of being aborted while the job
   keeps running (and losing its job id). The tool surface is unchanged: a client
   that asks for no progress token sees byte-identical results, and the frozen
   `tools/list` snapshot still matches.
 - **`"timeout": 600`** for `sage` in `example.mcp.json`, with the same entry in
-  this machine's `mcp.json`.
+  this machine's `mcp.json`. The reporting interval is 30 s by default and
+  `SAGE_MCP_PROGRESS_SLICE` lowers it for a client whose request timeout is
+  shorter than that.
 - New `progress_suite` in `tests/acceptance.py` (154 checks): it asserts the
   notifications, their cadence, their `total`, and that a call without a progress
   token is unaffected.

@@ -59,9 +59,10 @@ A persistent Sage kernel, not a proof checker. Tools: `exec`, `poll`, `reset`,
   run).
 - Long jobs: set `timeout_s` generously in the first `exec`. Long waits are
   safe: `exec`, `poll`, `run_file` and `notebook` emit
-  `notifications/progress` every 10 s while they wait, and a progress
+  `notifications/progress` every 30 s while they wait, and a progress
   notification resets the client's per-request timeout (pi's `mcp.json` sets
-  `"timeout": 600` for `sage`). A client that asked for no progress token gets
+  `"timeout": 600` for `sage`; `SAGE_MCP_PROGRESS_SLICE` changes the interval if a
+  client's own timeout is shorter than that). A client that asked for no progress token gets
   the same calls as before, so a wait beyond that timeout still wants
   `timeout_s=0` plus `poll`.
 - To verify that state was really lost (after `interrupt(force=true)`), test `'name' in globals()`:

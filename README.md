@@ -134,9 +134,10 @@ offset `N` -- incremental, never a re-run. To cancel, do it explicitly: `interru
 then `poll` to collect the `KeyboardInterrupt`. Silence is never read as "cancel".
 
 A wait can be longer than your client's request timeout, so `exec`, `poll`,
-`run_file` and `notebook` send an MCP progress notification every 10 s while they
+`run_file` and `notebook` send an MCP progress notification every 30 s while they
 wait; a progress notification resets that timeout (pi's default is 60 s, and its
-`mcp.json` entry for `sage` sets `"timeout": 600`). A client that asks for no
+`mcp.json` entry for `sage` sets `"timeout": 600`). A client with a tighter
+timeout lowers the interval with `SAGE_MCP_PROGRESS_SLICE`. A client that asks for no
 progress keeps the old behaviour exactly, which is why `timeout_s=0` plus `poll`
 is still the shape for a job that may run for hours.
 
@@ -199,6 +200,7 @@ from the file, so it answers while a job runs.
 | `SAGE_MCP_LIMITS` | `cpu=off,as=8G,fsize=1G,nproc=off` | per-process limits, below |
 | `SAGE_MCP_GAP_LIMIT` | `3` (`0` disables) | GAP crash-loop guard, below |
 | `SAGE_MCP_LOG_MAX` | `8` MiB (`0` disables) | rotate `kernel.log` to `kernel.log.1`, one generation |
+| `SAGE_MCP_PROGRESS_SLICE` | `30` | seconds between progress reports while `exec`/`poll`/`run_file`/`notebook` wait; lower it for a client whose request timeout is tighter than that |
 
 `SAGE_MCP_LIMITS` bounds what the kernel and the children `run_file`/`notebook` spawn
 may consume, so a runaway job fails instead of taking the machine down:

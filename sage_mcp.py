@@ -258,13 +258,28 @@ def _tool_errors(fn):
 # like a failure: the client aborts the request while the job keeps running, and
 # the job id is lost.  Progress notifications reset that timeout, so the wait is
 # sliced into `PROGRESS_SLICE_S` steps and each step that finds the job still
-# running reports elapsed time.  The slice must stay well under the smallest
-# timeout a client is likely to use (pi's default is 60 s).
+# running reports elapsed time.
+#
+# The slice is the reporting interval, and it must be shorter than the client's
+# timeout or the notification arrives too late to help.  pi's default is 60 s
+# (its `sage` entry sets 600), so half a minute leaves a margin under the
+# smallest timeout a client is likely to use; SAGE_MCP_PROGRESS_SLICE changes it.
 #
 # Notifications are advisory: a client that did not ask for progress (no
 # progressToken) makes report_progress a no-op, and any failure here must not
 # turn a working tool call into an error.
-PROGRESS_SLICE_S = 10.0
+
+
+def _progress_slice():
+    raw = os.environ.get("SAGE_MCP_PROGRESS_SLICE")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 30.0
+    return min(max(value, 0.5), 3600.0)
+
+
+PROGRESS_SLICE_S = _progress_slice()
 
 
 async def _report(ctx, label, elapsed, total):
@@ -795,6 +810,7 @@ Environment:
   SAGE_MCP_LIMITS     cpu/as/fsize/nproc limits for the kernel and its children
   SAGE_MCP_GAP_LIMIT  GAP crash-loop markers before one SIGINT (0 disables)
   SAGE_MCP_LOG_MAX    kernel.log rotation size (0 disables)
+  SAGE_MCP_PROGRESS_SLICE  seconds between progress reports on a long wait (30)
 
 See README.md for the tools, and DESIGN.md for why they behave this way."""
 

@@ -40,7 +40,7 @@ Two things worth noticing:
 - `wait_s=20` blocked until the job ended, instead of polling in a loop. With no
   `wait_s` the same call would have answered `[still running 9s; …]` immediately.
 - That wait is safe even though it outlives a client's own request timeout: the
-  server reports progress every 10 s while it waits, and a progress notification
+  server reports progress every 30 s while it waits, and a progress notification
   resets the client's timeout. Nothing needs to be fire-and-forget unless the job
   is longer than the timeout you configured.
 - The agent's turn can end here and the job keeps going; a later `poll`, from this
