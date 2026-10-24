@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/JGCoelho/simple-sagemath-mcp/main/images/simple-sagemath-logo.png"
+  <img src="https://raw.githubusercontent.com/JGCoelho/simple-sagemath-mcp/main/images/simple-sagemath-banner.png"
        alt="simple-sagemath-mcp" width="820">
 </p>
 
@@ -109,7 +109,7 @@ does -- `counters_since` says since when.
 | `notebook` | `action`*, `path`*, `out`, `in_place`, `cell_timeout_s`=120, `timeout_s` | `check` / `extract` / `clear` / `run`; all four run in Sage's interpreter, and the tool is advertised only when *that* interpreter has `nbformat`+`nbconvert`+`nbclient` |
 
 Five short transcripts with the real output -- a job outliving its `exec`, an
-interrupt, `run_file`, sessions, notebooks -- are in [`examples/`](examples/).
+interrupt, `run_file`, sessions, notebooks -- are in [`examples/`](https://github.com/JGCoelho/simple-sagemath-mcp/tree/main/examples).
 
 ## Jobs, and why `poll` exists
 
@@ -145,7 +145,7 @@ of work disappears. `sage_kernel.py` is the long-lived process: it runs jobs on 
 the in-flight job to `running.json`, and refuses to let a job's failure or an idle
 `SIGINT` take the kernel with it. `subproc.py` is the child-process core behind
 `run_file` and `notebook`, `limits.py` the `SAGE_MCP_LIMITS` knob. See
-[DESIGN.md](DESIGN.md) for the reasoning and `tests/conformance.py` for the
+[DESIGN.md](https://github.com/JGCoelho/simple-sagemath-mcp/blob/main/DESIGN.md) for the reasoning and `tests/conformance.py` for the
 protocol contract.
 
 `sage://kernel/status` (`application/json`) is the machine-readable form of
@@ -246,4 +246,4 @@ skipped check is never a pass.
 
 ## License
 
-MIT -- see `LICENSE`.
+MIT -- see `LICENSE`. What changed in each release: `CHANGELOG.md`.

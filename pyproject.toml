@@ -16,19 +16,30 @@ license-files = ["LICENSE"]
 authors = [{ name = "JGCoelho", email = "josegustavocoelho@gmail.com" }]
 keywords = ["mcp", "sagemath", "sage", "model-context-protocol", "computer-algebra"]
 classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Science/Research",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Scientific/Engineering :: Mathematics",
 ]
 dependencies = ["mcp>=2.3,<3"]
 
 [project.optional-dependencies]
-# only the `notebook` tool needs these; it runs under Sage's interpreter
-notebook = ["nbformat>=5"]
+# Only the `notebook` tool needs these, and it runs them in *Sage's*
+# interpreter -- so install this extra there (or rely on SageMath, which ships
+# all three), not into a plain server env where nothing would import them.
+notebook = ["nbformat>=5", "nbconvert>=7", "nbclient>=0.7"]
 
 [project.urls]
 Homepage = "https://github.com/JGCoelho/simple-sagemath-mcp"
 Source = "https://github.com/JGCoelho/simple-sagemath-mcp"
+Issues = "https://github.com/JGCoelho/simple-sagemath-mcp/issues"
+Changelog = "https://github.com/JGCoelho/simple-sagemath-mcp/blob/main/CHANGELOG.md"
 
 [project.scripts]
 simple-sage-mcp = "sage_mcp:main"
