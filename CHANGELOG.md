@@ -37,6 +37,10 @@ First release.
 - **Observability**: the `status` tool and the `sage://kernel/status` resource
   (jobs, gap trips, last error with its job and session, sessions, limits and
   their source, log tail), readable while a job holds the kernel.
+- **Failures are visible**: `status` carries a `sage interpreter: …` line (and the
+  status resource a `sage` block), so a server installed with `pip`/`uvx` on a
+  machine without SageMath says so immediately instead of only failing at the
+  first `exec` -- and that error now states that pip installs the server, not Sage.
 - **Install**: `install.sh` (discovers the interpreter, writes the registration,
   proves it works), `simple-sage-mcp --help`, and `--check`/`simple-sage-mcp-check`
   which drives the registration in the client's own environment.

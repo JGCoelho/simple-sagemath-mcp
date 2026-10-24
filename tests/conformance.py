@@ -530,9 +530,10 @@ def c20(ctx):
         any(entry["uri"] == URI and entry["mime_type"] == "application/json" for entry in listed)
         and mime == "application/json"
         and sorted(body) == sorted(
-            ("server", "kernel", "sessions", "jobs", "last_error", "limits", "log")
+            ("server", "kernel", "sessions", "sage", "jobs", "last_error", "limits", "log")
         )
         and {"pid", "state", "restarts", "counters_since"} <= set(body["kernel"])
+        and set(body["sage"]) == {"interpreter", "source", "sage_on_path", "detail"}
         and {"run", "failed", "interrupted", "queued", "last_job"} <= set(body["jobs"])
         and set(body["limits"]) == {"cpu", "as", "fsize", "nproc", "source"}
     )

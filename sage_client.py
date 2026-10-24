@@ -125,6 +125,61 @@ DISCOVERY_HELP = (
 _PYTHON = []  # cache of the *discovered* answer: `sage -c` is a process spawn
 
 
+def discovery_report():
+    """What is known about Sage's interpreter *without* starting anything.
+
+    `status` is meant to be cheap and must never block on a `sage -c` spawn, so
+    this reads $SAGE_PYTHON and PATH only, plus whatever a previous real
+    resolution cached.  The `detail` field is the sentence a user needs when
+    `exec` cannot start a kernel -- above all the case of a pip/uvx install on a
+    machine with no SageMath at all, where nothing else would say so.
+    """
+    explicit = os.environ.get("SAGE_PYTHON") or ""
+    sage_bin = shutil.which("sage")
+    report = {
+        "interpreter": None,
+        "source": None,
+        "sage_on_path": bool(sage_bin),
+        "detail": None,
+    }
+    if explicit:
+        if os.path.exists(explicit):
+            report.update(interpreter=os.path.abspath(explicit), source="SAGE_PYTHON")
+            return report
+        report["detail"] = "$SAGE_PYTHON is set to %r, which does not exist" % explicit
+        return report
+    if _PYTHON and _PYTHON[0]:
+        report.update(interpreter=_PYTHON[0], source="discovered (sage -c)")
+        return report
+    if not sage_bin:
+        report["detail"] = "$SAGE_PYTHON is not set and there is no `sage` on PATH"
+        return report
+    report["detail"] = (
+        "`sage` is at %s but its interpreter has not been probed yet (the first "
+        "exec or run_file does that)" % sage_bin
+    )
+    return report
+
+
+def discovery_error():
+    """The failure a user sees when no Sage interpreter can be found."""
+    report = discovery_report()
+    if not report["sage_on_path"] and not os.environ.get("SAGE_PYTHON"):
+        # The first line is what a one-line renderer shows (the checker logs only
+        # that), so the install hint lives there -- after the diagnosis, which
+        # stays the same phrase every client and doc already knows.
+        return DISCOVERY_HELP.replace(
+            "no interpreter that can 'import sage.all' was found.",
+            "SageMath does not look installed on this machine: no interpreter that can "
+            "'import sage.all' was found.  pip and uvx install this MCP server, not "
+            "Sage -- the kernel is Sage's own interpreter, a separate installation.",
+            1,
+        )
+    if report["detail"]:
+        return report["detail"] + "\n" + DISCOVERY_HELP
+    return DISCOVERY_HELP
+
+
 def resolve_python():
     """Sage's interpreter for the kernel (and run_file/notebook children).
 
@@ -172,7 +227,7 @@ def sage_python():
     """Sage's interpreter, or a KernelError naming the three discovery routes."""
     python = resolve_python()
     if not python:
-        raise KernelError(DISCOVERY_HELP)
+        raise KernelError(discovery_error())
     return python
 
 
@@ -573,7 +628,7 @@ class Client:
 
     def _spawn_locked(self, reason):
         if not self.python:
-            raise KernelError(DISCOVERY_HELP)
+            raise KernelError(discovery_error())
         mark = time.time()
         deadline = mark + SPAWN_TIMEOUT
         fd = self._acquire_spawn_lock()

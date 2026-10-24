@@ -157,6 +157,10 @@ from the file, so it answers while a job runs.
 ## Requirements
 
 - Linux.
+- **SageMath installed, separately from this server.** `pip`/`uvx` install the
+  server only: the kernel is Sage's own interpreter. If it cannot be found, both
+  `status` (`sage interpreter: NOT FOUND -- …`) and `exec` say so, and
+  `exec`'s error names the three discovery routes and the one-line fix.
 - **Two interpreters, on purpose.** The *server* is any Python 3.10+ with the `mcp`
   package, and nothing else; the *kernel* is Sage's own interpreter, found at
   runtime by `SAGE_PYTHON`, then `sage -c 'import sys;print(sys.executable)'`, then
@@ -217,7 +221,7 @@ interruption that did not happen.
 # 24 conformance cases, one row each, ~70 s
 /path/to/sage-env/bin/python tests/conformance.py        # or --only C13,C15
 
-# 144 checks over MCP stdio through the official client, ~200 s
+# 150 checks over MCP stdio through the official client, ~200 s
 /path/to/sage-env/bin/python tests/acceptance.py
 
 # 10 checks as a Sage script, ~10 s (`singular` must be on PATH)

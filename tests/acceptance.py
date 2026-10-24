@@ -1599,7 +1599,9 @@ def observability_suite(workdir):
     """
     server = Server(os.path.join(workdir, "observability"))
     resource = "sage://kernel/status"
-    section = ("server", "kernel", "sessions", "jobs", "last_error", "limits", "log")
+    section = (
+        "server", "kernel", "sessions", "sage", "jobs", "last_error", "limits", "log"
+    )
 
     def doc():
         mime, text = server.resource(resource)
@@ -1645,6 +1647,7 @@ def observability_suite(workdir):
                  "counters_since"} <= set(first["kernel"])
             and {"run", "failed", "interrupted", "queued", "last_job",
                  "gap_trips"} <= set(first["jobs"])
+            and set(first["sage"]) == {"interpreter", "source", "sage_on_path", "detail"}
             and isinstance(first["limits"], dict)
             and set(first["limits"]) == {"cpu", "as", "fsize", "nproc", "source"}
             and first["limits"]["as"] == 8 * 1024**3
@@ -2399,6 +2402,7 @@ def main():
     ownership_pin(workdir)
     stdout_hygiene(workdir)
     cli_suite()
+    discovery_visibility_suite(workdir)
 
     record(
         "errors reach the model with the tool's own message",
@@ -2467,6 +2471,83 @@ def cli_suite():
         and "Usage: sage_mcp.py --check" in check_help.stdout,
         (check_help.stdout.strip().splitlines() or [""])[0],
     )
+
+
+
+# --------------------------------------------------------------------------
+# a pip/uvx install on a machine with no Sage: is the failure *visible*?
+# --------------------------------------------------------------------------
+def discovery_visibility_suite(workdir):
+    """`status` must say what is wrong, not wait for the first `exec` to fail.
+
+    `pip install` / `uvx` install the *server*; SageMath is a separate
+    installation, and a user who skips it otherwise sees a healthy-looking
+    server whose `status` claims "the next exec starts it".
+    """
+    bare = {"PATH": "/usr/bin:/bin", "SAGE_PYTHON": ""}
+    state = os.path.join(workdir, "novisibility")
+    server = Server(state, extra_env=bare)
+    try:
+        text, err, _ = server.tool("status")
+        record(
+            "no Sage anywhere: `status` names that instead of blaming the kernel",
+            not err
+            and "no Sage interpreter" in text
+            and "no `sage` on PATH" in text
+            and "the next exec starts it" not in text.splitlines()[0],
+            (text.splitlines() or ["(nothing)"])[0],
+        )
+        record(
+            "no Sage anywhere: the status resource carries the same fact",
+            (lambda doc: doc.get("sage", {}).get("interpreter") is None
+             and doc.get("sage", {}).get("sage_on_path") is False)(
+                json.loads(server.resource("sage://kernel/status")[1])
+            ),
+            "sage=%s" % json.loads(server.resource("sage://kernel/status")[1]).get("sage"),
+        )
+        out, failed, _ = server.tool("exec", code="2+2")
+        record(
+            "no Sage anywhere: `exec` says pip/uvx install the server, not Sage",
+            failed
+            and "pip and uvx install this MCP server, not Sage" in out
+            and "SAGE_PYTHON" in out,
+            (out.strip().splitlines() or ["(nothing)"])[0],
+        )
+    finally:
+        server.close()
+
+    broken = os.path.join(workdir, "broken-sage-python")
+    server = Server(
+        broken, extra_env={"SAGE_PYTHON": "/nonexistent/python-that-is-not-here"}
+    )
+    try:
+        text, _, _ = server.tool("status")
+        record(
+            "a bogus $SAGE_PYTHON is reported as such, not as `not installed`",
+            "does not exist" in text and "/nonexistent/python-that-is-not-here" in text,
+            (text.splitlines() or ["(nothing)"])[0],
+        )
+    finally:
+        server.close()
+
+    healthy = os.path.join(workdir, "visible-sage")
+    server = Server(healthy, extra_env={"SAGE_PYTHON": SAGE_PYTHON})
+    try:
+        text, _, _ = server.tool("status")
+        record(
+            "a working setup shows which interpreter will run the kernel",
+            "sage interpreter: %s" % SAGE_PYTHON in text and "(from SAGE_PYTHON)" in text,
+            [row for row in text.splitlines() if row.startswith("sage interpreter")][:1],
+        )
+        doc = json.loads(server.resource("sage://kernel/status")[1])
+        record(
+            "the status resource names the interpreter and its source",
+            doc.get("sage", {}).get("interpreter") == SAGE_PYTHON
+            and doc.get("sage", {}).get("source") == "SAGE_PYTHON",
+            "sage=%s" % doc.get("sage"),
+        )
+    finally:
+        server.close()
 
 
 

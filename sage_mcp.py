@@ -39,6 +39,7 @@ from sage_client import (  # noqa: E402
     KernelBusy,
     KernelDown,
     KernelError,
+    discovery_report,
     format_uptime,
     get_client,
 )
@@ -196,6 +197,7 @@ def status_json():
             "counters_since": _iso(snap.get("counters_since")),
         },
         "sessions": sorted(snap.get("sessions") or {}),
+        "sage": snap.get("sage") or discovery_report(),
         "jobs": {
             "run": jobs.get("run"),
             "failed": jobs.get("failed"),
@@ -458,7 +460,11 @@ def tool_status() -> str:
         )
     elif state == "absent":
         note = snapshot.get("note")
-        if note:
+        sage = discovery_report()
+        if not sage["interpreter"]:
+            # Never say "the next exec starts it" when there is no Sage to start.
+            head = "kernel: not running (no Sage interpreter: %s)" % sage["detail"]
+        elif note:
             head = "kernel: not running (%s; the next exec starts a fresh one)" % note
         else:
             head = "kernel: not running (it has not been started yet; the next exec starts it)"
@@ -511,6 +517,15 @@ def tool_status() -> str:
             "jobs: unknown (the kernel is not answering); gap-guard: %d; restarts: %d"
             % (snapshot.get("gap_trips") or 0, client.restarts)
         )
+    sage = snapshot.get("sage") or discovery_report()
+    lines.append(
+        "sage interpreter: "
+        + (
+            "%s (from %s)" % (sage["interpreter"], sage["source"])
+            if sage["interpreter"]
+            else "NOT FOUND -- %s" % sage["detail"]
+        )
+    )
     if LAST_JOB:
         lines.append(
             "last job per session: "
