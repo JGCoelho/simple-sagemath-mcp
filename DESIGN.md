@@ -65,6 +65,72 @@ is Sage's python, so `from sage.all import *` just works.
 through a pipe (a Jupyter kernel can outlive the run and would keep the call
 looking hung).
 
+## Limits: chosen so the kernel survives
+
+`limits.py` is the only place that knows `SAGE_MCP_LIMITS`; the server, the kernel
+and `subproc` all import it, so the parsing, the messages and the reporting cannot
+drift apart.
+
+Three decisions are not obvious and were forced by measurement:
+
+- **Only the soft limit is lowered.** A job that trips a limit therefore fails
+  without taking the kernel with it, and a hard limit below the configured soft
+  one is honoured by clamping instead of breaking the boot. Raising a limit is
+  the operator's job: stop the kernel and start it with a larger
+  `SAGE_MCP_LIMITS`.
+- **`as`/`fsize` are applied before `import sage.all`, `cpu` after it.** The
+  import peaks near 4 GiB of address space (so `as` must already hold) and costs
+  seconds of CPU (so `RLIMIT_CPU`, which counts from `exec`, would be spent before
+  the first job if applied earlier). `cpu` therefore means "from now on", and the
+  handler exists before the first job can trip it.
+- **`nproc` is a margin over the UID's task count, re-armed per job.** Linux
+  counts processes *and threads*, per UID, machine-wide, so an absolute number
+  from `/proc` is stale the moment another session starts. The kernel arms
+  "current tasks + margin" before each job (and `subproc` before each child
+  spawn), which is also why `nproc` is applied after the import: Sage's import
+  starts threads.
+
+A tripped limit raises `ResourceLimitError(BaseException)` into the running job --
+`BaseException` so an `except Exception` in user code cannot turn "this job is too
+big" into a `SIGKILL` for the kernel; the hard limit is the backstop if it is
+caught anyway. One raise per job is enough: `SIGXFSZ`/`SIGXCPU` arrive again while
+the job unwinds, and a second raise would replace the error already recorded
+(`Job.limit_guarded`). Outside a job the handler only notes the trip once, because
+`SIGXCPU` repeats every second above the soft limit.
+
+The server applies the same `as`/`fsize`/core so `run_file` and `notebook`
+children inherit them, but not `cpu` (it would bound the server's lifetime) or
+`nproc` (a margin that small breaks anything the server starts). `kernel.log` is
+rotated at 8 MiB (`SAGE_MCP_LOG_MAX`) into one `.1` generation, because the log is
+fd 1/2 and would otherwise be the first casualty of `fsize`.
+
+## The conformance matrix
+
+`tests/conformance.py` exists because "the acceptance suite is green" says
+nothing about *which* wire-level promise broke when a client misbehaves. It runs
+C01-C24 from PLAN §6, one row per case, through `mcp.client.stdio` +
+`ClientSession` -- the code path a real client uses.
+
+Two cases had to be written against what the SDK actually does, not what the
+matrix first assumed, and both differences are asserted rather than glossed over:
+
+- **C06 (unknown argument).** `mcp` 2.3.0 silently ignores an unknown field
+  instead of rejecting the call (pydantic's default `extra="ignore"`), so the
+  case asserts what matters: no protocol damage, exactly one job ran, and the
+  kernel is intact. Making it a protocol error would mean owning argument
+  validation the SDK does.
+- **C24 (malformed input).** A line that is not JSON is dropped by the SDK's
+  stdio reader (debug log, no `-32700` reply) and the connection keeps serving;
+  an unknown *method* does get `-32601`. The case asserts both observations and
+  that the next valid request is still answered, which is the property the
+  matrix is really about.
+
+C13 and C15 are the two cases that depend on harness setup: C13 needs a
+`tools/call` still in flight when the cancel lands, and C15 needs two servers
+sharing one kernel (pids compared). Both fail with an explicit message when the
+setup cannot be established, because a conformance run that silently skips them
+would report success for a property it never tested.
+
 ## The alternative semantics we rejected
 
 `exec`'s timeout could have killed the job instead of returning a job id. We did

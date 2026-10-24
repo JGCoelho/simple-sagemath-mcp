@@ -22,7 +22,7 @@ import tempfile
 import threading
 import time
 
-from mcp import ClientSession, StdioServerParameters  # noqa: E402
+from mcp import ClientSession, StdioServerParameters, types  # noqa: E402
 from mcp.client.stdio import stdio_client  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -164,6 +164,22 @@ class Server:
         if is_error:
             text = _strip_error_prefix(tool_name, text)
         return text, is_error, result
+
+    def ping(self):
+        return self._result(self._session.send_ping(), "ping", 30)
+
+    def initialize_result(self):
+        """What the handshake negotiated (protocol version, serverInfo)."""
+        return self._session.initialize_result
+
+    def notify_cancelled(self, request_id, reason):
+        """Send a CancelledNotification for an arbitrary request id (C14)."""
+        note = types.CancelledNotification(
+            params=types.CancelledNotificationParams(
+                request_id=request_id, reason=reason
+            )
+        )
+        self._result(self._session.send_notification(note), "cancelled notification", 30)
 
     def cancel_tool(self, tool_name, arguments, after=0.5):
         """Send a tools/call and cancel it after `after` seconds (C13)."""
@@ -1154,6 +1170,305 @@ def gap_guard_suite(workdir):
 # --------------------------------------------------------------------------
 # §5: observability -- kernel counters and the sage://kernel/status resource
 # --------------------------------------------------------------------------
+def limits_suite(workdir):
+    """PLAN §7: SAGE_MCP_LIMITS -- a limit fails the job, never the kernel.
+
+    Five limits, one case each, each with its own server (the limits are part of
+    the server's and the kernel's environment) and its own SAGE_MCP_STATE.
+    """
+    sys.path.insert(0, ROOT)
+    import limits as limits_mod
+
+    root = os.path.join(workdir, "limits")
+    os.makedirs(root, exist_ok=True)
+
+    def serve(tag, **env):
+        return Server(
+            os.path.join(root, tag),
+            extra_env={str(k): str(v) for k, v in env.items()},
+        )
+
+    def cleanup(server):
+        try:
+            server.tool("interrupt", force=True)
+        except Exception:
+            pass
+        server.close()
+
+    def reported(server):
+        return json.loads(server.resource("sage://kernel/status")[1])["limits"]
+
+    def wait_job(server, job_id, deadline=40.0):
+        end = time.time() + deadline
+        text = ""
+        while job_id and time.time() < end:
+            text = server.tool("poll", job_id=job_id, since=0, wait_s=5)[0]
+            if "[job finished in" in text:
+                return text
+            time.sleep(0.2)
+        return text
+
+    # the parser: suffixes, defaults and the garbage a typo produces
+    parsed = limits_mod.parse("cpu=2,as=1G,fsize=512M,nproc=off")
+    rejected = []
+    for spec in ("as=8X", "bogus=1", "as", "as=8.5G"):
+        try:
+            limits_mod.parse(spec)
+        except limits_mod.LimitError:
+            continue
+        rejected.append(spec)
+    record(
+        "§7: SAGE_MCP_LIMITS parses K/M/G, keeps defaults, rejects garbage",
+        parsed
+        == {"cpu": 2, "as": 1024**3, "fsize": 512 * 1024**2, "nproc": 0}
+        and limits_mod.parse("cpu=2")["as"] == 8 * 1024**3
+        and not rejected,
+        "parsed=%s rejected=%s" % (parsed, rejected or "all four bad specs"),
+    )
+
+    # RLIMIT_AS: a 10 GB allocation is a job error, the kernel keeps going
+    server = serve("as", SAGE_MCP_LIMITS="as=8G")
+    try:
+        server.tool("exec", code="as_probe = 1")
+        out, _, _ = server.tool("exec", code="bytearray(10 * 1024**3)")
+        after, after_err, _ = server.tool("exec", code="as_probe + 1")
+        record(
+            "§7: RLIMIT_AS=8G fails a 10 GB allocation as a job error; kernel survives",
+            "MemoryError" in out and not after_err and after.strip() == "2",
+            (out.splitlines() or [""])[-1] + " / next exec=" + after.strip(),
+        )
+        seen = reported(server)
+        record(
+            "§7: the resource reports the limits the kernel applied",
+            seen == {"cpu": None, "as": 8 * 1024**3, "fsize": 1024**3,
+                     "nproc": None, "source": "kernel"},
+            json.dumps(seen),
+        )
+        line = [row for row in server.tool("status")[0].splitlines() if row.startswith("limits:")]
+        record(
+            "§7: status names the limits",
+            line == ["limits: cpu=off, as=8G, fsize=1G, nproc=off"],
+            " / ".join(line) or "(no limits line)",
+        )
+    finally:
+        cleanup(server)
+
+    # RLIMIT_FSIZE: a write loop fails the job, the log stays writable
+    server = serve("fsize", SAGE_MCP_LIMITS="fsize=1M")
+    try:
+        server.tool("exec", code="fs_probe = 0")
+        log = os.path.join(root, "fsize", "kernel.log")
+        before = os.path.getsize(log)
+        target = os.path.join(root, "fsize", "big.bin")
+        code = "f = open(%r, 'wb')\nfor i in range(40):\n    f.write(b'x' * 65536)\n" % target
+        out, _, _ = server.tool("exec", code=code)
+        wrote = os.path.getsize(target) if os.path.exists(target) else 0
+        after, after_err, _ = server.tool("exec", code="fs_probe + 7")
+        record(
+            "§7: RLIMIT_FSIZE=1M fails a write loop as a job error (not a dead kernel)",
+            "RLIMIT_FSIZE" in out
+            and "File too large" in out
+            and 0 < wrote <= 1024**2 + 65536,
+            "wrote=%d / %s" % (wrote, (out.splitlines() or [""])[-1]),
+        )
+        record(
+            "§7: after a SIGXFSZ job error the kernel.log is still writable",
+            not after_err and after.strip() == "7" and os.path.getsize(log) > before,
+            "log %d -> %d bytes / next exec=%s" % (before, os.path.getsize(log), after.strip()),
+        )
+    finally:
+        cleanup(server)
+
+    # RLIMIT_CPU: a busy loop trips it in ~2 s, the kernel answers afterwards
+    server = serve("cpu", SAGE_MCP_LIMITS="cpu=2")
+    try:
+        server.tool("exec", code="cpu_probe = 1")
+        started = time.time()
+        out = server.tool("exec", code="while True:\n    cpu_probe += 1", timeout_s=0)[0]
+        text = wait_job(server, _first_job_id(out))
+        elapsed = time.time() - started
+        status = server.tool("status")[0]
+        record(
+            "§7: RLIMIT_CPU=2 stops a busy loop as a job error, not a dead kernel",
+            "RLIMIT_CPU" in text
+            and "[job finished in" in text
+            and 1.0 < elapsed < 25.0
+            and status.splitlines()[0].startswith("kernel: running"),
+            "finished after %.1fs / %s" % (elapsed, status.splitlines()[0]),
+        )
+        record(
+            "§7: status explains the CPU trip (last error names the limit)",
+            "last error: ResourceLimitError: RLIMIT_CPU" in status
+            and "limits: cpu=2s" in status,
+            " / ".join(
+                row for row in status.splitlines()
+                if row.startswith("last error") or row.startswith("limits:")
+            ),
+        )
+    finally:
+        cleanup(server)
+
+    # RLIMIT_NPROC: a margin over the per-UID task count; a fork loop gets EAGAIN
+    server = serve("nproc", SAGE_MCP_LIMITS="nproc=8")
+    try:
+        server.tool("exec", code="np_probe = 0")
+        code = """
+import os, resource, time
+import limits as kernel_limits
+
+
+def settle():
+    # Sage's import leaves a thread pool alive for a moment (17 tasks at the
+    # first job).  One fork makes it exit; then the per-UID count is stable and
+    # a margin means what it says.
+    for _ in range(3):
+        before = kernel_limits.uid_tasks()
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        os.waitpid(pid, 0)
+        if kernel_limits.uid_tasks() == before:
+            return
+
+
+settle()
+kernel_limits.arm_nproc({"nproc": 8})  # the helper the kernel itself uses
+soft, _hard = resource.getrlimit(resource.RLIMIT_NPROC)
+used = kernel_limits.uid_tasks()
+print("armed soft=%d tasks=%d margin=%d" % (soft, used, soft - used))
+kids, note = [], ""
+for i in range(20):
+    try:
+        child = os.fork()
+    except OSError as exc:
+        note = "EAGAIN at attempt %d: %s" % (i + 1, exc.strerror or exc)
+        break
+    if child == 0:
+        time.sleep(0.5)
+        os._exit(0)
+    kids.append(child)
+else:
+    note = "no EAGAIN after 20 attempts"
+for child in kids:
+    try:
+        os.waitpid(child, 0)
+    except OSError:
+        pass
+print("kids=%d %s" % (len(kids), note))
+"""
+        out = server.tool("exec", code=code, timeout_s=0)[0]
+        job_id = _first_job_id(out)
+        time.sleep(2.5)  # let the children exit before the next connection
+        text = wait_job(server, job_id, deadline=30)
+        after, after_err, _ = server.tool("exec", code="np_probe + 5")
+        record(
+            "§7: RLIMIT_NPROC margin: a capped fork loop gets EAGAIN, kernel survives",
+            "margin=8" in text
+            and "EAGAIN at attempt" in text
+            and "no EAGAIN" not in text
+            and not after_err
+            and after.strip() == "5",
+            text.replace("\n", " | ")[:400],
+        )
+        shown = reported(server)
+        record(
+            "§7: nproc is reported as the configured margin",
+            shown.get("nproc") == 8 and shown.get("source") == "kernel",
+            json.dumps(shown),
+        )
+    finally:
+        cleanup(server)
+
+    # RLIMIT_CORE=0 + children inherit the limits
+    server = serve("children", SAGE_MCP_LIMITS="as=8G,fsize=256M")
+    try:
+        work = os.path.join(root, "children", "work")
+        os.makedirs(work, exist_ok=True)
+        script = os.path.join(work, "limits_child.py")
+        with open(script, "w") as fh:
+            fh.write(
+                "import resource\n"
+                "for name in ('RLIMIT_AS', 'RLIMIT_FSIZE', 'RLIMIT_CORE'):\n"
+                "    print(name, resource.getrlimit(getattr(resource, name)))\n"
+            )
+        out, err, _ = server.tool("run_file", path=script)
+        record(
+            "§7: run_file children inherit the limits, RLIMIT_CORE is 0",
+            not err
+            and "RLIMIT_AS (8589934592" in out
+            and "RLIMIT_FSIZE (268435456" in out
+            and "RLIMIT_CORE (0, 0)" in out,
+            out.replace("\n", " | ")[:300],
+        )
+        abort = os.path.join(work, "abort_child.py")
+        with open(abort, "w") as fh:
+            fh.write("import os\nos.abort()\n")
+        out, err, _ = server.tool("run_file", path=abort)
+        cores = [name for name in os.listdir(work) if name.startswith("core")]
+        record(
+            "§7: os.abort() in a child leaves no core file (RLIMIT_CORE=0)",
+            err and "exit=-6" in out and not cores,
+            (out.splitlines() or [""])[0] + " / cores=%s" % (cores or "none"),
+        )
+        marker = os.path.join(work, "notebook_limits.txt")
+        nb = os.path.join(work, "limits.ipynb")
+        import nbformat
+        from nbformat.v4 import new_code_cell, new_notebook
+
+        book = new_notebook()
+        book.metadata["kernelspec"] = {
+            "name": "sagemath", "display_name": "SageMath", "language": "sage"
+        }
+        book.metadata["language_info"] = {"name": "sage"}
+        book.cells = [
+            new_code_cell(
+                "import resource\n"
+                "with open(%r, 'w') as fh:\n"
+                "    fh.write('AS %%s CORE %%s\\n' %% (resource.getrlimit("
+                "resource.RLIMIT_AS), resource.getrlimit(resource.RLIMIT_CORE)))\n"
+                % marker
+            )
+        ]
+        with open(nb, "w", encoding="utf-8") as fh:
+            nbformat.write(book, fh)
+        out, err, _ = server.tool("notebook", action="run", path=nb, cell_timeout_s=120)
+        wrote = ""
+        try:
+            with open(marker) as fh:
+                wrote = fh.read().strip()
+        except OSError:
+            pass
+        record(
+            "§7: the notebook's Jupyter kernel inherits the limits too",
+            not err and "AS (8589934592" in wrote and "CORE (0, 0)" in wrote,
+            (out.splitlines() or [""])[0] + " / " + (wrote or "(no marker file)"),
+        )
+    finally:
+        cleanup(server)
+
+    # log rotation: the default is 8 MB, so the threshold is lowered here
+    server = serve("rotation", SAGE_MCP_LOG_MAX="1500")
+    try:
+        for index in range(60):
+            server.tool("exec", code="rot = %d" % index)
+        state = os.path.join(root, "rotation")
+        sizes = {
+            name: os.path.getsize(os.path.join(state, name))
+            for name in ("kernel.log", "kernel.log.1")
+            if os.path.exists(os.path.join(state, name))
+        }
+        record(
+            "§7: kernel.log rotates (8 MB by default) keeping one .1",
+            set(sizes) == {"kernel.log", "kernel.log.1"}
+            and sizes["kernel.log.1"] >= 1500
+            and sizes["kernel.log"] < 1500
+            and server.tool("status")[0].splitlines()[0].startswith("kernel: running"),
+            "SAGE_MCP_LOG_MAX=1500: %s" % json.dumps(sizes),
+        )
+    finally:
+        cleanup(server)
+
+
 def observability_suite(workdir):
     """The kernel is the single source of truth for counters; the server adds its own.
 
@@ -1202,18 +1517,24 @@ def observability_suite(workdir):
             why or ", ".join(sorted(first)),
         )
         record(
-            "§5: server/kernel/jobs/log carry their fields (limits null for now)",
+            "§5: server/kernel/jobs/log carry their fields (limits reported)",
             {"version", "pid", "clients", "spawns", "restarts"} <= set(first["server"])
             and {"pid", "state", "uptime_s", "restarts", "started",
                  "counters_since"} <= set(first["kernel"])
             and {"run", "failed", "interrupted", "queued", "last_job",
                  "gap_trips"} <= set(first["jobs"])
-            and first["limits"] is None
+            and isinstance(first["limits"], dict)
+            and set(first["limits"]) == {"cpu", "as", "fsize", "nproc", "source"}
+            and first["limits"]["as"] == 8 * 1024**3
+            and first["limits"]["fsize"] == 1024**3
+            and first["limits"]["cpu"] is None
+            and first["limits"]["source"] in ("kernel", "configured")
             and isinstance(first["sessions"], list)
             and isinstance(first["log"], dict)
             and isinstance(first["log"]["tail"], list)
             and first["log"]["path"].endswith("kernel.log"),
-            json.dumps({"kernel": first["kernel"], "jobs": first["jobs"]})[:400],
+            json.dumps({"kernel": first["kernel"], "jobs": first["jobs"],
+                        "limits": first["limits"]})[:400],
         )
 
         server.tool("exec", code="observability_warmup = 0")  # spawn the kernel
@@ -1606,6 +1927,7 @@ def main():
     discovery_invariants(workdir)
     cancellation_recovery(workdir)
     gap_guard_suite(workdir)
+    limits_suite(workdir)
     observability_suite(workdir)
     stdout_hygiene(workdir)
 

@@ -118,7 +118,7 @@ echo "sage   : $SAGE_PY  (runs the kernel)"
 if [ "$SRC" != "$DST" ]; then
   mkdir -p "$DST"
   install -m 0644 "$SRC/sage_mcp.py" "$SRC/sage_client.py" "$SRC/sage_kernel.py" \
-    "$SRC/subproc.py" "$DST/"
+    "$SRC/subproc.py" "$SRC/limits.py" "$DST/"
   chmod 0755 "$DST/sage_mcp.py" "$DST/sage_kernel.py"
 fi
 

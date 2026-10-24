@@ -28,13 +28,20 @@ A persistent Sage kernel, not a proof checker. Tools: `exec`, `poll`, `reset`,
   input -- try a different invariant or representation. `SAGE_MCP_GAP_LIMIT`
   (default 3, `0` disables) changes the threshold; your own prints of that text
   do not trip it.
+- Resource limits (server-side `SAGE_MCP_LIMITS`: `cpu`, `as=8G`, `fsize=1G`,
+  `nproc`, and `RLIMIT_CORE=0` always) bound the kernel and the children
+  `run_file`/`notebook` start. A job that trips one fails with
+  `ResourceLimitError: RLIMIT_...` (or `MemoryError`, or `EAGAIN` from `fork`)
+  and the kernel survives: collect it with `poll`. `cpu` counts from after
+  Sage's import; `nproc` is a margin over the tasks your UID already runs
+  (machine-wide), not a count of the kernel's children.
 - `status` shows pid/uptime, live MCP clients, sessions, active jobs, the last
-  error, the log path (`${SAGE_MCP_STATE:-/tmp/sage-mcp-$UID}/kernel.log`) and one
-  line of counters: `jobs: N run, N failed, N interrupted; gap-guard: N;
-  restarts: N`.
+  error, the limits, the log path
+  (`${SAGE_MCP_STATE:-/tmp/sage-mcp-$UID}/kernel.log`) and one line of counters:
+  `jobs: N run, N failed, N interrupted; gap-guard: N; restarts: N`.
 - `sage://kernel/status` (`application/json`) is the same thing for a client that
   wants data instead of prose: kernel state/pid/uptime/restarts, `jobs` counters,
-  `last_error`, `sessions`, and the last 20 lines of `kernel.log`. The counters
+  `last_error`, `sessions`, `limits`, and the last 20 lines of `kernel.log`. The counters
   reset when the kernel restarts; `counters_since` says since when.
 - Sessions are never evicted; use `drop` to free one (it refuses sessions with a
   running job). Use `reset` to empty a namespace but keep the session.

@@ -35,4 +35,4 @@ simple-sage-mcp = "sage_mcp:main"
 simple-sage-mcp-check = "sage_mcp:check_main"
 
 [tool.setuptools]
-py-modules = ["sage_mcp", "sage_client", "sage_kernel", "subproc"]
+py-modules = ["sage_mcp", "sage_client", "sage_kernel", "subproc", "limits"]

@@ -32,6 +32,7 @@ import time
 import traceback
 from multiprocessing.connection import AuthenticationError, Listener
 
+import limits as limits_mod
 from sage_client import check_sock_path, load_or_create_key, private_dir
 
 OUTPUT_CAP = 4 * 1024 * 1024  # chars per job, ~4 MB; hard cap, with notice
@@ -45,6 +46,54 @@ def _int_env(name, default):
         return int(os.environ.get(name, default))
     except (TypeError, ValueError):
         return default
+
+
+class ResourceLimitError(BaseException):
+    """A configured rlimit tripped: the *job* fails, the kernel survives.
+
+    BaseException on purpose: an ordinary ``except Exception`` in user code must
+    not turn "this job is too big" into a SIGKILL for the whole kernel (the hard
+    limit is the backstop if it is caught anyway).
+    """
+
+
+LIMITS = {}  # SAGE_MCP_LIMITS as configured for this kernel (status reports it)
+_LIMIT_TRIPPED = False  # an idle trip is logged once, not every second
+
+
+def _on_limit(signum, frame):
+    """Convert SIGXCPU/SIGXFSZ into a job error instead of a dead kernel.
+
+    Outside a job there is nothing to raise into: note it once (SIGXCPU repeats
+    every second while the process is over its soft limit) and keep serving.
+    """
+    global _LIMIT_TRIPPED
+    if signum == signal.SIGXCPU:
+        what = "RLIMIT_CPU (cpu=%s) exhausted: the process used its whole CPU budget" % (
+            limits_mod.human("cpu", LIMITS),
+        )
+    else:
+        what = "RLIMIT_FSIZE (fsize=%s): a write went over the file-size limit" % (
+            limits_mod.human("fsize", LIMITS),
+        )
+    what += (
+        "; the job stopped, the kernel and its sessions are intact -- for more "
+        "room stop the kernel with interrupt(force=true) and restart it with a "
+        "larger SAGE_MCP_LIMITS"
+    )
+    job = _CURRENT
+    if job is None:
+        if not _LIMIT_TRIPPED:
+            _LIMIT_TRIPPED = True
+            _log("resource limit outside a job: %s" % what)
+        return
+    job.note = "[limits] " + what
+    # One raise per job: SIGXFSZ/SIGXCPU are delivered again while the job is
+    # unwinding, and a second raise would replace the error already recorded.
+    if job.limit_guarded:
+        return
+    job.limit_guarded = True
+    raise ResourceLimitError(what)
 
 
 # A GAP crash-restart loop (`structure_description()` on hostile input forks a
@@ -128,13 +177,38 @@ _CLIENTS = {}  # client id -> time of its last request
 _CLIENTS_LOCK = threading.Lock()
 
 
+LOG_MAX = _int_env("SAGE_MCP_LOG_MAX", 8 * 1024 * 1024)  # bytes; 0 disables
+
+
+def _rotate_log():
+    """kernel.log -> kernel.log.1 once it reaches LOG_MAX (8 MB by default).
+
+    RLIMIT_FSIZE would otherwise let a chatty kernel earn SIGXFSZ on its own log.
+    The log is fd 1/2 (dup2), so the rotation rebinds those descriptors and every
+    writer -- the routers' fallback and _LOG -- follows.
+    """
+    if not LOG_MAX or not LOG_PATH:
+        return
+    try:
+        if os.path.getsize(LOG_PATH) < LOG_MAX:
+            return
+        os.replace(LOG_PATH, LOG_PATH + ".1")
+        fd = os.open(LOG_PATH, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        os.dup2(fd, 1)
+        os.dup2(fd, 2)
+        os.close(fd)
+    except OSError:
+        pass
+
+
 def _log(msg):
     """Kernel diagnostics go to the original stderr, never through the router."""
     try:
         with _LOG_LOCK:
+            _rotate_log()
             _LOG.write(str(msg).rstrip("\n") + "\n")
             _LOG.flush()
-    except Exception:
+    except BaseException:  # a limit signal raised in here must not kill us
         pass
 
 
@@ -180,6 +254,7 @@ class Job:
         "id", "session", "code", "preparse", "submitted", "started", "finished",
         "state", "parts", "nbytes", "truncated", "error", "repr", "done", "lock",
         "cancel", "blocked", "owner", "gap_crashes", "gap_guarded", "note",
+        "limit_guarded",
     )
 
     def __init__(self, jid, session, code, preparse, owner=None):
@@ -204,6 +279,7 @@ class Job:
         self.gap_crashes = 0  # GAP crash markers seen on stderr, per job
         self.gap_guarded = False  # did this job already get its one SIGINT?
         self.note = None  # prepended to the job's result text
+        self.limit_guarded = False  # did a rlimit already raise into this job?
 
     def append(self, text, stream="stdout", origin=""):
         if not text:
@@ -480,6 +556,10 @@ def _clear_running():
 
 def _run_job(job):
     global _CURRENT
+    try:  # per job, because the per-UID task count drifts (limits.py)
+        limits_mod.arm_nproc(LIMITS)
+    except limits_mod.LimitError as exc:
+        _log("could not arm nproc: %s" % exc)
     job.state = "running"
     job.started = time.time()
     with _CURRENT_LOCK:
@@ -507,6 +587,7 @@ def _run_job(job):
                     )
                 job.repr = text
     except BaseException as exc:  # nothing escapes
+        job.limit_guarded = True  # a late limit signal must not clobber the error
         job.error = _format_error(exc)
     finally:
         _clear_running()
@@ -546,6 +627,9 @@ def _executor_main():
             # The interrupt landed in the sliver between _run_job's handler and
             # its finally; that finally has already released the job.
             _log("SIGINT outside a job: ignored")
+        except ResourceLimitError as exc:
+            # Same sliver, for a limit: the job is already released.
+            _log("resource limit outside a job: %s" % exc)
         except BaseException:
             _log("internal executor error:\n" + traceback.format_exc())
             try:
@@ -698,6 +782,7 @@ def op_status(req):
         "python": sys.version.split()[0],
         "gap_trips": STATS.gap_trips,
         "counters_since": STATS.since,
+        "limits": limits_mod.as_json(LIMITS, "kernel"),
     }
 
 
@@ -796,7 +881,11 @@ class _Handler:
 
     def _send(self, payload):
         try:
-            self.conn.send_bytes(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+            # errors="replace": a job may print a lone surrogate (os.fsdecode of
+            # non-UTF-8 bytes); the reply must still be a valid frame (C19).
+            self.conn.send_bytes(
+                json.dumps(payload, ensure_ascii=False).encode("utf-8", "replace")
+            )
         except Exception:
             pass
 
@@ -857,7 +946,16 @@ def _accept_loop(listener):
             continue
         except OSError:
             return  # the listener was closed: shutting down
-        threading.Thread(target=_serve_conn, args=(conn,), name="conn", daemon=True).start()
+        try:
+            threading.Thread(
+                target=_serve_conn, args=(conn,), name="conn", daemon=True
+            ).start()
+        except RuntimeError as exc:  # e.g. RLIMIT_NPROC: a job must not blind us
+            _log("could not start a connection thread: %s" % exc)
+            try:
+                conn.close()
+            except OSError:
+                pass
 
 # startup
 
@@ -884,7 +982,7 @@ def _write_state(path):
 
 
 def main():
-    global _LOG, STATE_FILE, LOG_PATH, SAGE_VERSION, SOCK_PATH
+    global _LOG, STATE_FILE, LOG_PATH, SAGE_VERSION, SOCK_PATH, LIMITS
     ap = argparse.ArgumentParser(description="sage-mcp kernel")
     ap.add_argument("--state-file", required=True, help="where to publish {pid,sock}")
     ap.add_argument("--log-file", default=None, help="redirect stdout/stderr here")
@@ -907,6 +1005,23 @@ def main():
         sys.stderr = os.fdopen(2, "w", buffering=1)
     _log("=== sage-mcp kernel booting (pid %d) %s ==="
          % (os.getpid(), time.strftime("%Y-%m-%d %H:%M:%S")))
+
+    # Limits before the import: `import sage.all` peaks near 4 GB of address
+    # space, so RLIMIT_AS must already hold.  `cpu` and `nproc` are applied
+    # *after* the import: RLIMIT_CPU counts from exec (Sage's import costs
+    # seconds) and RLIMIT_NPROC counts tasks, threads included (the import
+    # starts threads, so a small margin would break it).
+    try:
+        LIMITS = limits_mod.parse()
+        limits_mod.no_core()  # always, whatever else is configured
+        limits_mod.apply(LIMITS, kinds=("as", "fsize"))
+    except limits_mod.LimitError as exc:
+        raise SystemExit("sage-mcp kernel: SAGE_MCP_LIMITS: %s" % exc)
+    # A limit must fail the job, never the kernel: these handlers raise into the
+    # running job (SIGXCPU/SIGXFSZ default action would kill the kernel).
+    signal.signal(signal.SIGXCPU, _on_limit)
+    signal.signal(signal.SIGXFSZ, _on_limit)
+    _log("limits: %s" % limits_mod.describe(LIMITS))
 
     # Log first, then take over the streams: from here on kernel diagnostics go
     # through _log() (original stderr) and user output through the routers.
@@ -931,15 +1046,32 @@ def main():
     # sage.all does not export `time`, but a Sage REPL has it, the preparser
     # rewrites time.sleep(0.4) for it, and the sleep patch lives on it.
     _BASE.setdefault("time", time)
+    if LIMITS.get("cpu"):
+        try:
+            applied = limits_mod.apply(LIMITS, kinds=("cpu",))
+        except limits_mod.LimitError as exc:
+            raise SystemExit("sage-mcp kernel: SAGE_MCP_LIMITS: %s" % exc)
+        _log("limits applied after the import: cpu=%s" % applied.get("cpu"))
+    if LIMITS.get("nproc"):
+        _log("limits: nproc=%s is armed before each job (a margin over the UID's "
+             "task count)" % limits_mod.human("nproc", LIMITS))
 
     authkey = load_or_create_key(os.path.dirname(STATE_FILE))
     listener = _bind_server(SOCK_PATH, authkey)
     _write_state(STATE_FILE)
     _log("listening on unix:%s (authkey), state=%s, sage=%s"
          % (SOCK_PATH, STATE_FILE, SAGE_VERSION))
-    threading.Thread(
-        target=_accept_loop, args=(listener,), name="conn", daemon=True
-    ).start()
+    try:
+        threading.Thread(
+            target=_accept_loop, args=(listener,), name="conn", daemon=True
+        ).start()
+    except RuntimeError as exc:  # almost always an nproc limit below Sage's needs
+        raise SystemExit(
+            "sage-mcp kernel: cannot start the accept thread (%s).  Sage's import "
+            "already created %d threads; SAGE_MCP_LIMITS nproc=%s is per-UID, so it "
+            "must cover every task you run, not just this kernel."
+            % (exc, threading.active_count(), limits_mod.human("nproc", LIMITS))
+        )
 
     try:
         _executor_main()

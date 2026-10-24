@@ -53,7 +53,8 @@ any registration at any time with `./install.sh --check` or
 `state` (`idle` / `busy` / `unreachable` / `not running`), uptime, `restarts`,
 the `jobs` counters (`run`, `failed`, `interrupted`, `queued`, `last_job`,
 `gap_trips`), `last_error` with the job and session that produced it,
-`sessions`, `limits` (`null` until the resource-limit work lands), and the log
+`sessions`, `limits` (the `cpu`/`as`/`fsize`/`nproc` values that apply, plus
+`source`: `kernel` when it answered, `configured` when it did not), and the log
 `path` plus its last 20 lines (read from the file's tail, so it answers while a
 job runs). The counters live **in the kernel** and reset when it restarts;
 `counters_since` says since when, so they are never read as lifetime totals. The
@@ -111,6 +112,10 @@ which stops when the last server exits. See [DESIGN.md](DESIGN.md) for the rest.
 `running.json`, `kernel.log`, created `0700`) and `SAGE_CWD` (working directory
 for `exec` and `run_file`, default the server's cwd).
 
+`SAGE_MCP_LOG_MAX` (default 8 MiB, `0` disables) is where `kernel.log` is rotated
+to `kernel.log.1` (one generation kept), so `SAGE_MCP_LIMITS`' `fsize` can never
+bite the kernel's own log by accident.
+
 `SAGE_MCP_GAP_LIMIT` (default `3`; `0` disables it) is the **GAP crash-loop
 guard**. `structure_description()` on hostile input makes GAP crash-restart in a
 loop, forking a process per crash; no timeout catches that, because the cell
@@ -125,14 +130,67 @@ by your own code on stdout are ignored; Sage's own markers (printed from
 is watched as well. Per-process limits are the backstop for a fork storm that
 outruns the markers.
 
+## Limits
+
+`SAGE_MCP_LIMITS` bounds what the kernel -- and the children `run_file` and
+`notebook` start -- may consume, so a runaway job fails instead of taking the
+machine with it:
+
+```bash
+SAGE_MCP_LIMITS="cpu=3600,as=8G,fsize=1G,nproc=off"   # the defaults
+```
+
+| limit | default | scope | on trip |
+| --- | --- | --- | --- |
+| `cpu` | off | kernel | `SIGXCPU` is caught: the job fails with `ResourceLimitError`, the kernel keeps running |
+| `as` | 8 GiB | kernel + children | `MemoryError` -> job error |
+| `fsize` | 1 GiB | kernel + children | `SIGXFSZ`/`EFBIG` -> job error |
+| `nproc` | off | **per UID, machine-wide** | `fork` gets `EAGAIN` -> job error |
+| core | always `0` | kernel + children | no core dumps in `/tmp` |
+
+Sizes take a `K`/`M`/`G` suffix; `off`/`0` disables a limit (the inherited one is
+left alone); keys you do not mention keep their default, so
+`SAGE_MCP_LIMITS="cpu=60"` only adds a CPU budget. A typo is an error naming the
+knob, not a silently ignored key. Only the *soft* limit is lowered
+(`hard = min(soft + slack, inherited hard)`), so a job that needs more room gets
+it by stopping the kernel (`interrupt(force=true)`) and starting a fresh one with
+a different `SAGE_MCP_LIMITS`.
+
+Two details worth knowing before setting them:
+
+- **`cpu` is a budget for the kernel's life**, counted from just after Sage's
+  import -- the import itself costs seconds of CPU, and charging it to the first
+  job would make `cpu=2` unusable. After a CPU trip the kernel is on its last few
+  CPU seconds: restart it with a larger budget.
+- **`nproc` is a margin over your UID's tasks, not a count of the kernel's
+  children.** Linux counts every process *and thread* of the real UID (so the
+  limit is machine-wide, and a value smaller than what you already run breaks
+  your session). `nproc=200` therefore means "200 more tasks than I run now"; it
+  is armed before each job (and each child spawn) over the settled count, because
+  an absolute number captured at boot goes stale. Sage's import starts threads, so
+  `nproc` is applied after the import, alongside `cpu`; `as`/`fsize`/core are
+  applied *before* it, which matters: Sage peaks near 4 GiB of address space, so
+  keep `as` comfortably above that.
+
+A job that trips a limit fails with `ResourceLimitError: RLIMIT_...`, the result
+text is prefixed with `[limits] ...`, the kernel survives, and `status` (its
+`last error:` and `limits:` lines) plus `sage://kernel/status` (`limits`) say
+which limit applies.
+
 ## Tests
 
 ```bash
-# 108 checks over MCP stdio (official client), ~100 s
+# 24 conformance cases, one row each, ~95 s
+/path/to/sage-env/bin/python tests/conformance.py        # or --only C13,C15
+
+# 122 checks over MCP stdio (official client), ~135 s
 /path/to/sage-env/bin/python tests/acceptance.py
 
 # 10 checks as a Sage script, ~10 s (`singular` must be on PATH)
 PATH=/path/to/sage-env/bin:$PATH sage tests/interrupt_ownership.sage
+
+# the frozen tools/list contract (8 tools, 0 mismatches)
+/path/to/sage-env/bin/python tests/snapshot_tools.py --compare
 ```
 
 `acceptance.py` checks the invariants that are easy to regress: busy-vs-dead,
@@ -140,9 +198,23 @@ spawn serialisation, stale state files, dead launchers, an honest stop, output
 caps, `since` offsets, log isolation, shared-kernel ownership, socket privacy and
 the authkey, adoption across a server restart, the three discovery routes, a
 cancelled `exec` still being recoverable, the `run_file` contract, the notebook
-cycle, the GAP crash-loop guard, the status resource and its counters, and that a
-handler's stray `print` cannot reach the wire. `sage_mcp.py --check` (behind
-`install.sh --check` and `simple-sage-mcp-check`) is the 7-check smoke test.
+cycle, the GAP crash-loop guard, the resource limits (each one fails its job and leaves
+the kernel alive, children inherit them, the log rotates), the status resource
+and its counters, and that a handler's stray `print` cannot reach the wire.
+
+`conformance.py` is the matrix of PLAN §6: the 24 protocol-level cases
+(C01-C24), one row each, every request through the official client, and a
+non-zero exit if any case fails. It owns its state directories, so it never
+touches your kernel. Two cases are deliberate about their own setup: C13 fails
+loudly when it cannot get a `tools/call` in flight to cancel, and C15 fails
+loudly when it cannot get two servers onto one kernel -- a skipped hard case
+would prove nothing.
+
+`sage_mcp.py --check` (behind `install.sh --check` and
+`simple-sage-mcp-check`) is the 8-check smoke test; its last check runs the
+C01/C04/C08/C17/C20 subset of that matrix through the same harness. In an
+install without `tests/` (pip/uvx ship no tests) that check is reported as
+`SKIP` and left out of the totals -- a skipped check is never a pass.
 
 ## License
 

@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 import time
 
+import limits
 import sage_client
 
 INLINE_LIMIT = 20000  # chars of each stream handed back to the model
@@ -43,6 +44,13 @@ def sage_python():
 def sage_binary():
     candidate = os.path.join(os.path.dirname(sage_python()), "sage")
     return candidate if os.access(candidate, os.X_OK) else shutil.which("sage")
+
+
+def _limits_config():
+    try:
+        return limits.parse()
+    except limits.LimitError:
+        return {}
 
 
 def _child_env():
@@ -80,6 +88,10 @@ def _run(command, cwd, stdin_bytes, timeout, log_path=None):
     With `log_path` both streams go to that file (nbconvert) and the returned
     streams are empty; otherwise they are captured in temp files and capped.
     """
+    try:  # children inherit it: re-armed because the per-UID count drifts
+        limits.arm_nproc(_limits_config())
+    except limits.LimitError:
+        pass
     out_fh = tempfile.TemporaryFile()
     err_fh = tempfile.TemporaryFile()
     sink = open(log_path, "ab") if log_path else None

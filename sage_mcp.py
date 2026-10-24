@@ -17,6 +17,7 @@ import functools
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -32,6 +33,7 @@ from mcp.server.mcpserver import MCPServer  # noqa: E402
 from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 from pydantic import Field  # noqa: E402
 
+import limits as limits_mod
 import subproc  # noqa: E402
 from sage_client import (  # noqa: E402
     KernelBusy,
@@ -61,6 +63,9 @@ mcp = MCPServer(
 # The job each session submitted last, so an exec whose *reply* was cancelled
 # can still be collected: status names it, poll(job_id) drains it.
 LAST_JOB = {}
+
+# SAGE_MCP_LIMITS as this server applied it (main(), so children inherit).
+LIMITS = {}
 
 # helpers
 
@@ -142,6 +147,23 @@ def _log_tail_lines(path, lines=20, budget=8192):
     return [row for row in rows if row.strip()][-lines:]
 
 
+def _limits(snapshot):
+    """The `limits` object: the kernel applied them, so its answer wins.
+
+    When the kernel does not answer, what this server configured is the honest
+    fallback (same environment) -- `source` says which one it is.
+    """
+    reported = snapshot.get("limits")
+    if isinstance(reported, dict):
+        return reported
+    if LIMITS:
+        return limits_mod.as_json(LIMITS, "configured")
+    try:
+        return limits_mod.as_json(limits_mod.parse(), "configured")
+    except limits_mod.LimitError:
+        return None
+
+
 def status_json():
     """PLAN §5: the kernel's counters plus the few facts only the server knows."""
     client = get_client()
@@ -192,7 +214,7 @@ def status_json():
             if last
             else None
         ),
-        "limits": None,  # filled in by the limits work (PLAN §7)
+        "limits": _limits(snap),
         "log": {"path": log_path, "tail": _log_tail_lines(log_path)},
     }
 
@@ -507,6 +529,9 @@ def tool_status() -> str:
         )
     else:
         lines.append("last error: none")
+    limits_seen = _limits(snapshot)
+    if limits_seen:
+        lines.append("limits: " + limits_mod.describe(limits_seen))
     lines.append("log: " + log_path)
     return "\n".join(lines)
 
@@ -636,8 +661,10 @@ Usage: sage_mcp.py --check [--config mcp.json] [--name sage] [--timeout S]
 
 Spawns the given (or registered) server against a throwaway SAGE_MCP_STATE and
 checks, through the official MCP client: spawn, initialize, tools/list, the
-kernel tools, exec `2+2`, status, and interrupt(force=true).  Exit 0 only when
-every check passed; the caller's live kernel is never touched."""
+kernel tools, exec `2+2`, status, and interrupt(force=true).  Then it runs the
+smoke subset of the conformance matrix (C01, C04, C08, C17, C20) through that
+same harness.  Exit 0 only when every check passed; the caller's live kernel is
+never touched.  In an install without tests/ the subset is reported as skipped."""
 
 
 def _mcp_entry(path, name="sage"):
@@ -733,6 +760,37 @@ async def _probe(session, state_dir, timeout):
     return out
 
 
+SMOKE_CASES = ("C01", "C04", "C08", "C17", "C20")  # the matrix, smoke subset
+
+
+def conformance_smoke(timeout=CHECK_TIMEOUT):
+    """Run the smoke subset of tests/conformance.py; (name, ok-or-None, detail).
+
+    `None` means "not runnable here" (a pip/uvx install ships no tests), which is
+    printed as SKIP and left out of the totals: a skipped check is never a pass.
+    """
+    name = "conformance smoke subset " + ",".join(SMOKE_CASES)
+    script = os.path.join(HERE, "tests", "conformance.py")
+    if not os.path.exists(script):
+        return name, None, "tests/conformance.py is not part of this install"
+    env = os.environ.copy()
+    env.pop("SAGE_MCP_STATE", None)  # the matrix owns one state dir per server
+    env.setdefault("SAGE_CWD", "/tmp")
+    try:
+        run = subprocess.run(
+            [sys.executable, script, "--only", ",".join(SMOKE_CASES), "--quiet"],
+            env=env,
+            cwd=os.path.dirname(script),
+            capture_output=True,
+            text=True,
+            timeout=max(180.0, timeout * 3),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return name, False, "%s: %s" % (type(exc).__name__, exc)
+    output = [line for line in run.stdout.strip().splitlines() if line.strip()]
+    return name, run.returncode == 0, (output[-1] if output else "(no output)")
+
+
 def check(command, args, extra_env=None, timeout=CHECK_TIMEOUT):
     """Run the smoke test; return a list of (name, ok, detail)."""
     state_dir = tempfile.mkdtemp(prefix="sage-check-")
@@ -762,8 +820,10 @@ def check(command, args, extra_env=None, timeout=CHECK_TIMEOUT):
     finally:
         if not results:
             results.append((label, False, "the server did not start"))
+        results.append(conformance_smoke(timeout))
         for name, ok, detail in results:
-            print("[%s] %s" % ("PASS" if ok else "FAIL", name))
+            mark = "SKIP" if ok is None else ("PASS" if ok else "FAIL")
+            print("[%s] %s" % (mark, name))
             for line in str(detail).rstrip().splitlines() if detail else []:
                 print("       " + line)
         shutil.rmtree(state_dir, ignore_errors=True)
@@ -800,16 +860,36 @@ def check_main(argv=None):
         print(CHECK_DOC.strip())
         return 2
     results = check(command, args, extra_env, timeout=timeout)
-    failed = [name for name, ok, _ in results if not ok]
+    failed = [name for name, ok, _ in results if ok is False]
+    skipped = [name for name, ok, _ in results if ok is None]
     print()
-    print("%d checks, %d failed" % (len(results), len(failed)))
+    print(
+        "%d checks, %d failed%s"
+        % (
+            len(results) - len(skipped),
+            len(failed),
+            "; %d skipped" % len(skipped) if skipped else "",
+        )
+    )
     return 0 if not failed else 1
 
 
 def main(argv=None):
+    global LIMITS
     argv = sys.argv[1:] if argv is None else list(argv)
     if "--check" in argv:
         return check_main(argv)
+    # The server applies the same limits as the kernel so run_file/notebook
+    # children inherit them.  `cpu` and `nproc` stay kernel-scoped (PLAN §7):
+    # CPU here would bound the *server's* lifetime CPU, and an nproc small enough
+    # to stop a fork storm breaks Sage's import, which starts threads.
+    try:
+        LIMITS = limits_mod.parse()
+        limits_mod.no_core()
+        limits_mod.apply(LIMITS, kinds=("as", "fsize"))
+    except limits_mod.LimitError as exc:
+        print("sage-mcp: SAGE_MCP_LIMITS: %s" % exc, file=sys.stderr)
+        return 2
     client = get_client()
     try:
         mcp.run(transport="stdio")
