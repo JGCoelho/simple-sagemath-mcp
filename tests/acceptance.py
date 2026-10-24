@@ -1430,8 +1430,12 @@ def limits_suite(workdir):
     finally:
         cleanup(server)
 
-    # RLIMIT_NPROC: a margin over the per-UID task count; a fork loop gets EAGAIN
-    server = serve("nproc", SAGE_MCP_LIMITS="nproc=8")
+    # RLIMIT_NPROC: a margin over the per-UID task count; a fork loop gets EAGAIN.
+    # The margin is 16, not 8, and the loop runs well past it: the tasks of this
+    # UID drift while the loop runs (Sage's thread pool exits, other processes come
+    # and go), and with a thin margin the loop could run out of attempts before
+    # the *limit* was reached -- a flake of the test, not of the mechanism.
+    server = serve("nproc", SAGE_MCP_LIMITS="nproc=16")
     try:
         server.tool("exec", code="np_probe = 0")
         code = """
@@ -1454,12 +1458,12 @@ def settle():
 
 
 settle()
-kernel_limits.arm_nproc({"nproc": 8})  # the helper the kernel itself uses
+kernel_limits.arm_nproc({"nproc": 16})  # the helper the kernel itself uses
 soft, _hard = resource.getrlimit(resource.RLIMIT_NPROC)
 used = kernel_limits.uid_tasks()
 print("armed soft=%d tasks=%d margin=%d" % (soft, used, soft - used))
 kids, note = [], ""
-for i in range(20):
+for i in range(16 + 40):  # the margin, plus room for the count to drift
     try:
         child = os.fork()
     except OSError as exc:
@@ -1470,7 +1474,7 @@ for i in range(20):
         os._exit(0)
     kids.append(child)
 else:
-    note = "no EAGAIN after 20 attempts"
+    note = "no EAGAIN after %d attempts" % (16 + 40)
 for child in kids:
     try:
         os.waitpid(child, 0)
@@ -1485,7 +1489,7 @@ print("kids=%d %s" % (len(kids), note))
         after, after_err, _ = server.tool("exec", code="np_probe + 5")
         record(
             "§7: RLIMIT_NPROC margin: a capped fork loop gets EAGAIN, kernel survives",
-            "margin=8" in text
+            "margin=16" in text
             and "EAGAIN at attempt" in text
             and "no EAGAIN" not in text
             and not after_err
@@ -1495,7 +1499,7 @@ print("kids=%d %s" % (len(kids), note))
         shown = reported(server)
         record(
             "§7: nproc is reported as the configured margin",
-            shown.get("nproc") == 8 and shown.get("source") == "kernel",
+            shown.get("nproc") == 16 and shown.get("source") == "kernel",
             json.dumps(shown),
         )
     finally:

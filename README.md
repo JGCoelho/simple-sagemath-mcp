@@ -264,6 +264,31 @@ written -- so a registration that only works because *your* shell exports
 `tests/` (pip/uvx ship none) that subset is `SKIP` and left out of the totals; a
 skipped check is never a pass.
 
+## Not in this release
+
+Honest gaps, in the order they would be closed:
+
+- **No CI.** The suites run by hand (they are in `Tests` above). A realistic
+  split, written down in `PLAN.md` §11: a fast job on GitHub-hosted runners with
+  no SageMath (byte-compile every module, `--help`/`--version`, `--suite
+  cli_suite`, the no-Sage diagnosis, and `server.json` against the registry
+  schema -- ~1 minute), and a full job inside the `sagemath/sagemath` image for
+  the kernel suites (~6 minutes plus the image pull). The fast job cannot run the
+  conformance matrix: C01 asserts the eight tools, and without Sage `notebook` is
+  correctly not advertised.
+- **Not on PyPI yet.** The wheel and sdist build clean (`python -m build`,
+  `twine check`) and `server.json` is ready, but the release is deliberately
+  unpublished for now; install from git. A published version is permanent, and
+  the security posture ("no sandbox") has to be right before strangers run it.
+- **No Docker image.** The only way to get `pip`/`uvx` users without SageMath
+  working, and the honest way to make "reproducible" true.
+- **`tests/` is not shipped**, so `--check`'s conformance subset reports `SKIP`
+  for an installed package (never counted as a pass).
+- **One maintainer, Linux only** (`AF_UNIX`, `/proc`, `rlimits`).
+- Two `nproc` checks depend on the machine-wide task count of your UID, so a
+  heavily loaded machine can still flake them; the test margin is 16 with 56 fork
+  attempts to make the drift irrelevant.
+
 ## License
 
 MIT -- see `LICENSE`. What changed in each release: `CHANGELOG.md`.
