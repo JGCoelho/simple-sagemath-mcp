@@ -40,6 +40,18 @@ registration at any time with `./install.sh --check` or
 `simple-sage-mcp-check /path/to/python /path/to/sage_mcp.py`. `sage_mcp.py --help`
 lists the options and the environment variables.
 
+## Scope and safety
+
+This is a **general kernel, not a curated math API, and not a sandbox**. Code sent
+to `exec`, `run_file` or `notebook` runs as *you*, on your machine, with your
+files and your network: the kernel is an ordinary Sage process, and
+`SAGE_MCP_LIMITS` bounds its resources, not its privileges. There is no allow-list,
+no seccomp, no filesystem or network isolation, and nothing stops a job from
+reading `~/.ssh` or writing anywhere you can. So: run work you would run yourself,
+do not drive it from untrusted input, and there is no HTTP transport to expose --
+it is a stdio server over a private Unix socket, and that is the whole surface.
+Linux only: it relies on `AF_UNIX`, `/proc` and `rlimits`.
+
 ## Persistent state and sessions
 
 ### One kernel per state directory

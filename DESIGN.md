@@ -155,3 +155,13 @@ the call times out -- either throws that work away or leaves it running with no
 way to read the result. If you want a job dead, do it explicitly: `interrupt`
 first, then `poll` to collect the `KeyboardInterrupt`. Silence is never
 interpreted as "cancel".
+
+## What this is not
+
+No sandbox, no allow-list, no seccomp, no network or filesystem isolation: a job
+runs with the server's own privileges, and `SAGE_MCP_LIMITS` is a resource bound
+(a runaway job fails) rather than a security boundary. XBP Europe's server is the
+one to read if a *sandboxed* subset of Sage is what you want; this is a general
+kernel for work you would run yourself, and the two-interpreter split keeps `mcp`
+out of the Sage environment rather than keeping code away from your files.
+
