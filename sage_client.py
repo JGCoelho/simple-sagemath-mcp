@@ -466,8 +466,8 @@ class Client:
                     if _alive(pid):
                         raise KernelDown(
                             "kernel pid %s is alive but not accepting connections "
-                            "(%s); refusing to start a second kernel — use `kill`"
-                            % (pid, exc)
+                            "(%s); refusing to start a second kernel — use "
+                            "interrupt(force=true)" % (pid, exc)
                         )
                     reason = "the previous kernel (pid %s) stopped answering" % (pid,)
         else:

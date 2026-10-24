@@ -85,7 +85,7 @@ def _on_limit(signum, frame):
     if job is None:
         if not _LIMIT_TRIPPED:
             _LIMIT_TRIPPED = True
-            _log("resource limit outside a job: %s" % what)
+            _log("resource limit outside a job: %s" % what, rotate=False)
         return
     job.note = "[limits] " + what
     # One raise per job: SIGXFSZ/SIGXCPU are delivered again while the job is
@@ -99,10 +99,13 @@ def _on_limit(signum, frame):
 # A GAP crash-restart loop (`structure_description()` on hostile input forks a
 # process per crash) is not caught by any timeout, because the cell never ends.
 # The guard counts the markers GAP writes and interrupts the job.  Sage prints
-# them with `print()` -- i.e. on **stdout**, from `sage/interfaces/gap.py`
-# ("crashed or quit executing" / "Restarting Gap and trying again") -- so stdout
-# counts only when the write comes from that module (`_is_gap_interface`);
-# stderr counts from anywhere, and only while GAP is actually loaded.
+# them with `print()` from `sage/interfaces/gap.py` ("crashed or quit executing"
+# / "Restarting Gap and trying again"), so the evidence is the *writer*:
+# `_is_gap_interface(origin)` (a frame in that file) on either stream, or -- for
+# a job that is really driving the interface -- any stderr once a gap.py frame
+# has written something.  "GAP is loaded" is NOT evidence: `from sage.all import
+# *` imports `sage.interfaces.gap` in every kernel, so the old `sys.modules` gate
+# was true for every job and a user echoing the marker tripped the guard.
 GAP_CRASH = re.compile(r"(Gap crashed|Restarting Gap)")
 GAP_LIMIT = _int_env("SAGE_MCP_GAP_LIMIT", 3)  # 0 disables the guard
 
@@ -151,7 +154,9 @@ STATS = Stats()
 
 # global state
 _LOG = sys.stderr  # the kernel log is the original stderr (-> kernel.log)
-_LOG_LOCK = threading.Lock()
+# Reentrant: a limit signal (SIGXCPU/SIGXFSZ) can arrive while this thread is
+# inside _log, and its handler logs too.
+_LOG_LOCK = threading.RLock()
 
 _JOBS = {}  # job_id -> Job
 _JOBS_LOCK = threading.RLock()
@@ -201,11 +206,16 @@ def _rotate_log():
         pass
 
 
-def _log(msg):
-    """Kernel diagnostics go to the original stderr, never through the router."""
+def _log(msg, rotate=True):
+    """Kernel diagnostics go to the original stderr, never through the router.
+
+    `rotate=False` is for callers inside a signal handler: renaming the log and
+    rebinding fd 1/2 from a handler can interleave with a writer mid-write.
+    """
     try:
         with _LOG_LOCK:
-            _rotate_log()
+            if rotate:
+                _rotate_log()
             _LOG.write(str(msg).rstrip("\n") + "\n")
             _LOG.flush()
     except BaseException:  # a limit signal raised in here must not kill us
@@ -253,8 +263,8 @@ class Job:
     __slots__ = (
         "id", "session", "code", "preparse", "submitted", "started", "finished",
         "state", "parts", "nbytes", "truncated", "error", "repr", "done", "lock",
-        "cancel", "blocked", "owner", "gap_crashes", "gap_guarded", "note",
-        "limit_guarded",
+        "cancel", "blocked", "owner", "gap_crashes", "gap_guarded", "gap_touched",
+        "note", "limit_guarded",
     )
 
     def __init__(self, jid, session, code, preparse, owner=None):
@@ -276,8 +286,9 @@ class Job:
         self.cancel = False
         self.blocked = False  # was something already running/queued at submit?
         self.owner = owner  # client id of the MCP server that submitted it
-        self.gap_crashes = 0  # GAP crash markers seen on stderr, per job
+        self.gap_crashes = 0  # GAP crash markers seen, per job
         self.gap_guarded = False  # did this job already get its one SIGINT?
+        self.gap_touched = False  # did a gap.py frame write anything at all?
         self.note = None  # prepended to the job's result text
         self.limit_guarded = False  # did a rlimit already raise into this job?
 
@@ -285,44 +296,48 @@ class Job:
         if not text:
             return
         with self.lock:
-            if self.truncated:
-                return
-            room = OUTPUT_CAP - self.nbytes
-            if len(text) > room:
-                self.parts.append(text[: max(0, room)])
-                self.nbytes += max(0, room)
-                self.parts.append(
-                    "\n[output truncated at 4 MB — further output dropped]\n"
-                )
-                self.truncated = True
-                return
-            self.parts.append(text)
-            self.nbytes += len(text)
+            if not self.truncated:
+                room = OUTPUT_CAP - self.nbytes
+                if len(text) > room:
+                    self.parts.append(text[: max(0, room)])
+                    self.nbytes += max(0, room)
+                    self.parts.append(
+                        "\n[output truncated at 4 MB — further output dropped]\n"
+                    )
+                    self.truncated = True
+                else:
+                    self.parts.append(text)
+                    self.nbytes += len(text)
+        # Markers are counted even once the cap has dropped the text: a chatty
+        # job must not be able to escape the guard by filling its output first.
         if stream == "stderr" or _is_gap_interface(origin):
             self._gap_guard(text, stream, origin)
 
     def _gap_guard(self, text, stream, origin):
-        """One SIGINT per job when GAP crash-restarts (see GAP_LIMIT).
+        """One SIGINT per job when GAP's own interface writes crash markers.
 
-        Only while GAP is loaded, so a user echoing the marker (or code that
-        never touched GAP) cannot trip it.  The signal is the same self-SIGINT
-        that `interrupt` uses: the job ends as KeyboardInterrupt, the session
-        and its variables survive, and `poll` still collects everything.
+        The evidence is the writer (see GAP_CRASH above): a gap.py frame, or a
+        stderr write from a job that has already written through gap.py.  A job
+        that merely has `sage.interfaces.gap` imported -- which `from sage.all
+        import *` does for every job -- cannot trip it, and neither can a user
+        echoing the marker.  The signal is the same self-SIGINT that `interrupt`
+        uses; what it *did* is decided when the job ends (`_finish_gap_note`),
+        because the job may catch the KeyboardInterrupt and run on.
         """
-        if not GAP_LIMIT or self.gap_guarded or "sage.interfaces.gap" not in sys.modules:
+        if not GAP_LIMIT:
             return
-        if stream != "stderr" and not _is_gap_interface(origin):
+        from_gap = _is_gap_interface(origin)
+        if from_gap:
+            self.gap_touched = True  # this job really is driving the interface
+        if not (from_gap or (stream == "stderr" and self.gap_touched)):
             return
+        if self.gap_guarded:
+            return  # one signal per job, however many markers follow
         self.gap_crashes += len(GAP_CRASH.findall(text))
         if self.gap_crashes < GAP_LIMIT:
             return
         self.gap_guarded = True
         STATS.gap_trips += 1
-        self.note = (
-            "[gap-guard] interrupted after %d 'Gap crashed' markers; "
-            "structure_description() forks a process per crash on this input — "
-            "try a different invariant/representation." % self.gap_crashes
-        )
         _log(
             "gap guard: %d crash markers in job %s -> SIGINT"
             % (self.gap_crashes, self.id)
@@ -595,8 +610,35 @@ def _run_job(job):
         job.state = "done"
         with _CURRENT_LOCK:
             _CURRENT = None  # route later output to the real stream again
+        _finish_gap_note(job)
         STATS.finished(job)
         job.done.set()
+
+
+def _finish_gap_note(job):
+    """Say what the guard's SIGINT actually did, once the job has ended.
+
+    The signal is asynchronous: the job may swallow the KeyboardInterrupt and
+    finish normally, so the note cannot be written at trip time -- it would
+    claim an interruption that never happened.  The "interrupted" counter needs
+    no fixing here: `Stats.finished` counts a KeyboardInterrupt error, and a job
+    that continued has no error.
+    """
+    if not job.gap_guarded:
+        return
+    if job.error and job.error.startswith("KeyboardInterrupt"):
+        job.note = (
+            "[gap-guard] interrupted after %d 'Gap crashed' markers; "
+            "structure_description() forks a process per crash on this input — "
+            "try a different invariant/representation." % job.gap_crashes
+        )
+        return
+    job.note = (
+        "[gap-guard] %d 'Gap crashed' markers; SIGINT was sent but the job "
+        "continued (it caught KeyboardInterrupt), so nothing was stopped — "
+        "if this is structure_description(), stop the job yourself with "
+        "interrupt or the crash loop will not end." % job.gap_crashes
+    )
 
 
 def _error_line(text, limit=300):

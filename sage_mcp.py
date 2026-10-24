@@ -621,24 +621,21 @@ def tool_notebook(
 ) -> str:
     """Jupyter notebook helper for the kernels SageMath ships. check: validate and summarise. extract: print the code cells. clear: strip outputs (atomically). run: execute with nbconvert (atomically, to <name>.out.ipynb unless out/in_place is given) and report how many cells ended in error."""
     action = str(action or "").strip().lower()
-    if action not in ("check", "run", "clear", "extract"):
+    if action not in subproc.NOTEBOOK_ACTIONS:
         raise ToolError(
             "action must be one of check, run, clear, extract (got %r)" % (action,)
         )
     if not path:
         raise ToolError("notebook needs a path to an .ipynb file")
     try:
-        if action == "check":
-            return subproc.check(path)
-        if action == "extract":
-            return subproc.extract(path)
-        if action == "clear":
-            return subproc.clear(path, out=out, in_place=bool(in_place))
-        return subproc.run_notebook(
+        # One interpreter decides and executes: every action runs in Sage's
+        # python (subproc.notebook), so this process imports no nbformat.
+        return subproc.notebook(
+            action,
             path,
             out=out,
             in_place=bool(in_place),
-            cell_timeout_s=int(_as_float(cell_timeout_s, 120)),
+            cell_timeout_s=_as_float(cell_timeout_s, 120),
             timeout_s=None if timeout_s is None else _as_float(timeout_s, 0),
             state_dir=get_client().state_dir,
         )
@@ -661,10 +658,14 @@ Usage: sage_mcp.py --check [--config mcp.json] [--name sage] [--timeout S]
 
 Spawns the given (or registered) server against a throwaway SAGE_MCP_STATE and
 checks, through the official MCP client: spawn, initialize, tools/list, the
-kernel tools, exec `2+2`, status, and interrupt(force=true).  Then it runs the
-smoke subset of the conformance matrix (C01, C04, C08, C17, C20) through that
-same harness.  Exit 0 only when every check passed; the caller's live kernel is
-never touched.  In an install without tests/ the subset is reported as skipped."""
+kernel tools, exec `2+2`, status, and interrupt(force=true).  The server is
+started the way its client would start it: with `--config`, in that entry's
+`env` and nothing else (SAGE_MCP_STATE points at a throwaway dir, and the
+command's own directory leads PATH), so a registration that only works because
+this shell exports SAGE_PYTHON fails here.  Then it runs the smoke subset of the
+conformance matrix (C01, C04, C08, C17, C20) against that same registration.
+Exit 0 only when every check passed; the caller's live kernel is never touched.
+In an install without tests/ the subset is reported as skipped."""
 
 
 def _mcp_entry(path, name="sage"):
@@ -763,19 +764,61 @@ async def _probe(session, state_dir, timeout):
 SMOKE_CASES = ("C01", "C04", "C08", "C17", "C20")  # the matrix, smoke subset
 
 
-def conformance_smoke(timeout=CHECK_TIMEOUT):
+def _server_env(command, extra_env, state_dir):
+    """The environment the *client* gives the server: the entry's env, nothing
+    inherited from this shell.
+
+    The check exists to answer "can the client start this registration?", so
+    inheriting this shell's SAGE_PYTHON/PATH would answer a different question:
+    it passed a registration that a client with a minimal PATH cannot start (the
+    shell had exported the Sage interpreter `install.sh` had found).  Only
+    SAGE_MCP_STATE is ours -- it points at a throwaway state dir, never the live
+    kernel -- and PATH starts at the command's own directory, which is where that
+    interpreter's Sage normally lives.
+    """
+    env = {str(k): str(v) for k, v in (extra_env or {}).items()}
+    env["SAGE_MCP_STATE"] = state_dir
+    env["PATH"] = os.pathsep.join(
+        [os.path.dirname(os.path.abspath(command)), env.get("PATH") or "/usr/bin:/bin"]
+    )
+    return env
+
+
+def conformance_smoke(timeout=CHECK_TIMEOUT, server=None, gate=True):
     """Run the smoke subset of tests/conformance.py; (name, ok-or-None, detail).
+
+    `server` is the registration `(command, args, env)` the subset must drive:
+    the matrix spawns *that* entry, exactly as a client would, so the subset
+    cannot pass while the entry it describes fails.  The harness itself still
+    runs on this interpreter (it needs `mcp`); only the server under test comes
+    from the registration.
 
     `None` means "not runnable here" (a pip/uvx install ships no tests), which is
     printed as SKIP and left out of the totals: a skipped check is never a pass.
+    `gate=False` means a check in this same run already failed in a way that
+    makes a passing subset a lie (exec does not work), so it is reported FAIL.
     """
     name = "conformance smoke subset " + ",".join(SMOKE_CASES)
     script = os.path.join(HERE, "tests", "conformance.py")
     if not os.path.exists(script):
         return name, None, "tests/conformance.py is not part of this install"
+    if not gate:
+        return name, False, (
+            "the exec check failed in this run, so no job can run: the subset is "
+            "reported as failed rather than proving anything about a different server"
+        )
     env = os.environ.copy()
     env.pop("SAGE_MCP_STATE", None)  # the matrix owns one state dir per server
     env.setdefault("SAGE_CWD", "/tmp")
+    if server is not None:
+        command, args, entry_env = server
+        env["SAGE_MCP_TEST_SERVER"] = json.dumps(
+            {
+                "command": command,
+                "args": [str(arg) for arg in args],
+                "env": {str(k): str(v) for k, v in (entry_env or {}).items()},
+            }
+        )
     try:
         run = subprocess.run(
             [sys.executable, script, "--only", ",".join(SMOKE_CASES), "--quiet"],
@@ -787,8 +830,14 @@ def conformance_smoke(timeout=CHECK_TIMEOUT):
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return name, False, "%s: %s" % (type(exc).__name__, exc)
-    output = [line for line in run.stdout.strip().splitlines() if line.strip()]
-    return name, run.returncode == 0, (output[-1] if output else "(no output)")
+    output = [line.strip() for line in run.stdout.strip().splitlines() if line.strip()]
+    summary = output[-1] if output else "(no output)"
+    if run.returncode == 0:
+        return name, True, summary
+    # Say *which* cases failed: the subset runs against the registration now, so
+    # a failure is usually the registration's own verdict, not a harness accident.
+    rows = [line for line in output if " FAIL " in line]
+    return name, False, "\n".join([summary] + rows[:4])
 
 
 def check(command, args, extra_env=None, timeout=CHECK_TIMEOUT):
@@ -796,11 +845,7 @@ def check(command, args, extra_env=None, timeout=CHECK_TIMEOUT):
     state_dir = tempfile.mkdtemp(prefix="sage-check-")
     label = "spawn " + " ".join([command] + list(args))
     results = []
-    env = os.environ.copy()
-    env.update({str(k): str(v) for k, v in (extra_env or {}).items()})
-    env["SAGE_MCP_STATE"] = state_dir  # never the caller's live kernel
-    env.setdefault("SAGE_CWD", "/tmp")
-    env["PATH"] = os.path.dirname(command) + os.pathsep + env.get("PATH", "")
+    env = _server_env(command, extra_env, state_dir)
     params = StdioServerParameters(command=command, args=list(args), env=env, cwd="/tmp")
 
     async def probe():
@@ -820,7 +865,14 @@ def check(command, args, extra_env=None, timeout=CHECK_TIMEOUT):
     finally:
         if not results:
             results.append((label, False, "the server did not start"))
-        results.append(conformance_smoke(timeout))
+        exec_ok = any(
+            name == "exec runs Sage code" and ok for name, ok, _ in results
+        )
+        results.append(
+            conformance_smoke(
+                timeout, server=(command, args, extra_env or {}), gate=exec_ok
+            )
+        )
         for name, ok, detail in results:
             mark = "SKIP" if ok is None else ("PASS" if ok else "FAIL")
             print("[%s] %s" % (mark, name))

@@ -150,17 +150,19 @@ def _raw_replies(state_dir, lines, last_id=7, wait=30.0):
 
     Only C24 needs this: the official client refuses to send a non-JSON line, and
     a "parse error" can only be observed by producing one.  Everything else here
-    is the official client.
+    is the official client.  The server is A.server_spec()'s (a registration when
+    `--check` drives the subset), not this file's own copy.
     """
-    env = A.server_params(state_dir).env
+    command, args, env, cwd = A.server_spec()
+    env = dict(env, SAGE_MCP_STATE=state_dir)
     proc = subprocess.Popen(
-        [A.PYTHON, A.SERVER],
+        [command] + args,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         text=True,
         env=env,
-        cwd=A.ROOT,
+        cwd=cwd,
     )
     replies = []
     try:
@@ -191,7 +193,16 @@ def _raw_replies(state_dir, lines, last_id=7, wait=30.0):
 
 
 def _cancel_and_collect(server, session):
-    """C13: cancel a blocking tools/call, then find and poll the job it left."""
+    """C13: cancel a blocking tools/call, then find and poll the job it left.
+
+    The warm-up is a precondition of the *harness*, not of the product: on a cold
+    server the first exec pays the kernel spawn (Sage takes seconds), so a cancel
+    0.6 s in would land before the job was ever submitted and there would be
+    nothing to recover.  It runs in its own session, so `last job per session`
+    still names only the job this case submitted.  (`--only C13` on a fresh
+    kernel is how this was found: it failed with a message that blamed `status`.)
+    """
+    server.tool("exec", code="warm = 1", session="C13-warm")
     arguments = {
         "code": "print('c13-marker')\nimport time\ntime.sleep(4)\nc13_state = 2",
         "session": session,
@@ -199,14 +210,15 @@ def _cancel_and_collect(server, session):
     }
     if not server.cancel_tool("exec", arguments, after=0.6):
         raise AssertionError(
-            "harness could not get a tools/call in flight: the request completed "
-            "before the cancel, so cancellation was never exercised"
+            "harness precondition not met: the request finished before the cancel, "
+            "so cancellation was never exercised (not a verdict on the server)"
         )
     match = re.search(r"\b%s=(j\d+)" % re.escape(session), server.tool("status")[0])
     if not match:
         raise AssertionError(
-            "the cancelled request left no job in status (last job per session is "
-            "missing), so there is nothing to collect"
+            "harness precondition not met: after a warm kernel the cancelled "
+            "tools/call left no job in status, so the request never reached the "
+            "kernel and there is nothing to collect (not a verdict on the server)"
         )
     return match.group(1), wait_finished(server, match.group(1), deadline=30)
 
@@ -556,25 +568,34 @@ def c21(ctx):
 
 
 def c22(ctx):
-    """GAP crash-restart markers trip the guard once; the session survives."""
+    """GAP crash-restart markers trip the guard once; the session survives.
+
+    The markers must come from `sage/interfaces/gap.py` -- that is the guard's
+    evidence (the writer), not the text and not "GAP is imported".
+    """
     server = ctx.shared()
-    server.tool("exec", code="import sage.interfaces.gap\nc22 = 41", session="C22")
+    _, gap = A.gap_stand_in(ctx.dir("C22"), "gapfake")
+    server.tool("exec", code="c22 = 41", session="C22")
     trips = doc(server)["jobs"]["gap_trips"]
-    text, is_error, _ = server.tool(
+    echoed, echoed_error, _ = server.tool(
         "exec",
         code="import sys\nfor _ in range(4):\n    print('Gap crashed', file=sys.stderr)",
         session="C22",
     )
+    text, is_error, _ = server.tool(
+        "exec", code=gap + "for _ in range(2):\n    gap_fake.eval('x')", session="C22"
+    )
     kept, kept_error, _ = server.tool("exec", code="c22", session="C22")
     ok = (
-        not is_error
+        not (is_error or echoed_error)
+        and "[gap-guard]" not in echoed
         and text.startswith("[gap-guard] interrupted after 3 'Gap crashed' markers")
         and "KeyboardInterrupt" in text
         and doc(server)["jobs"]["gap_trips"] == trips + 1
         and not kept_error
         and kept.strip() == "41"
     )
-    return ok, "trips %d -> %d, session keeps c22=%r" % (
+    return ok, "trips %d -> %d, echoed markers ignored, session keeps c22=%r" % (
         trips,
         doc(server)["jobs"]["gap_trips"],
         kept.strip(),

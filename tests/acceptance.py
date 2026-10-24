@@ -65,18 +65,49 @@ def record(name, ok, detail=""):
             print("       " + line)
 
 
-def server_params(state_dir, extra_env=None):
+def server_spec():
+    """(command, args, env, cwd) of the server under test.
+
+    Default: this interpreter + this repo's `sage_mcp.py`, with PATH widened so
+    that the server can discover Sage (two interpreters: PLAN §1.2).
+
+    `SAGE_MCP_TEST_SERVER` (JSON `{command, args, env}`) replaces that with an
+    arbitrary *registration*: `sage_mcp.py --check` passes it so the conformance
+    subset drives the same entry a client would start, in the environment that
+    entry declares and nothing inherited from the checking shell.  Otherwise the
+    subset would prove things about the harness's own server, not the entry.
+    """
+    spec = os.environ.get("SAGE_MCP_TEST_SERVER")
+    if spec:
+        data = json.loads(spec)
+        command = str(data["command"])
+        args = [str(arg) for arg in data.get("args") or []]
+        env = {str(k): str(v) for k, v in (data.get("env") or {}).items()}
+        # The command's own directory first: that is where the entry's
+        # interpreter finds Sage when the entry does not set SAGE_PYTHON.
+        env["PATH"] = os.pathsep.join(
+            [os.path.dirname(os.path.abspath(command)), env.get("PATH") or "/usr/bin:/bin"]
+        )
+        return command, args, env, "/tmp"
     env = os.environ.copy()
-    env["SAGE_MCP_STATE"] = state_dir
-    env.setdefault("SAGE_CWD", "/tmp")
-    # The server discovers Sage itself; PATH is what makes that possible when it
-    # runs on a plain Python (two interpreters: PLAN §1.2).
     dirs = [os.path.dirname(PYTHON)]
     if os.path.dirname(SAGE_PYTHON) not in dirs:
         dirs.append(os.path.dirname(SAGE_PYTHON))
     env["PATH"] = os.pathsep.join(dirs + [env.get("PATH", "")])
+    return PYTHON, [SERVER], env, ROOT
+
+
+def server_params(state_dir, extra_env=None, spec=None):
+    if spec is None:
+        command, args, env, cwd = server_spec()
+    else:  # a stand-in interpreter for one test (D1/D4): same env, other command
+        command, args, env = spec
+        cwd = "/tmp"
+    env = dict(env)
+    env["SAGE_MCP_STATE"] = state_dir
+    env.setdefault("SAGE_CWD", "/tmp")
     env.update(extra_env or {})
-    return StdioServerParameters(command=PYTHON, args=[SERVER], env=env, cwd=ROOT)
+    return StdioServerParameters(command=command, args=args, env=env, cwd=cwd)
 
 
 class Server:
@@ -88,7 +119,7 @@ class Server:
     open, which closes the server's stdin -- exactly a client shutting down.
     """
 
-    def __init__(self, state_dir, extra_env=None, errlog=None):
+    def __init__(self, state_dir, extra_env=None, errlog=None, spec=None):
         self.state_dir = state_dir
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, daemon=True)
@@ -98,7 +129,7 @@ class Server:
         self._closed = False
         self._errlog = errlog or sys.stderr
         self._task = asyncio.run_coroutine_threadsafe(
-            self._serve(state_dir, extra_env), self._loop
+            self._serve(state_dir, extra_env, spec), self._loop
         )
         if not self._ready.wait(180):
             raise AssertionError("the server did not answer initialize")
@@ -106,11 +137,11 @@ class Server:
             self.close()
             raise AssertionError("the server failed to start: %s" % (self._task.exception(),))
 
-    async def _serve(self, state_dir, extra_env):
+    async def _serve(self, state_dir, extra_env, spec=None):
         self._stop = asyncio.Event()
         try:
             async with stdio_client(
-                server_params(state_dir, extra_env), errlog=self._errlog
+                server_params(state_dir, extra_env, spec), errlog=self._errlog
             ) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
@@ -220,6 +251,11 @@ def _strip_error_prefix(tool_name, text):
     fixed = "Error executing tool %s" % tool_name
     if text.startswith(fixed + ": "):
         return text[len(fixed) + 2:]
+    if text.strip() == "Unknown tool: %s" % tool_name:
+        # The SDK's own answer for a tool that was never registered -- the exact
+        # result D1's "not advertised" case expects.  It never reaches a handler,
+        # so there is no diagnosis that could have been swallowed.
+        return text
     ERROR_TEXT.append("%s: %r" % (tool_name, text[:200]))
     return text
 
@@ -995,13 +1031,45 @@ def stdout_hygiene(workdir):
 # --------------------------------------------------------------------------
 # §4: the GAP crash-loop guard
 # --------------------------------------------------------------------------
-def gap_guard_suite(workdir):
-    """GAP crash-restart markers on *stderr* interrupt the job, once per job.
+def gap_stand_in(workdir, name="gapfake"):
+    """(path, loader-code) of a stand-in `sage/interfaces/gap.py`.
 
-    No real GAP crash is needed: the marker text on stderr is what the kernel's
-    router matches, and that is what GAP writes when it crash-restarts.  The
-    guard's second condition is `"sage.interfaces.gap" in sys.modules`, so the
-    job imports it first; that is also what makes the stdout case meaningful.
+    The guard trips on the *writer* of the crash marker -- a frame in that file --
+    so the tests need a module that prints from that path.  No real GAP crash is
+    needed, and a job cannot impersonate the interface by printing the same text
+    from its own code (that is the D2 defect this fixture exists to prove is
+    gone).
+    """
+    path = os.path.join(workdir, name, "sage", "interfaces", "gap.py")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(
+            "import sys\n"
+            "def eval(line='x'):\n"
+            "    print(\"** Gap crashed or quit executing '%s' **\" % line)\n"
+            "    print('Restarting Gap and trying again')\n"
+            "    return line\n"
+            "def eval_stderr(line='x'):\n"
+            "    print('Gap crashed', file=sys.stderr)\n"
+            "    return line\n"
+        )
+    loader = (
+        "import importlib.util as u\n"
+        "spec = u.spec_from_file_location('fakegap', %r)\n"
+        "gap_fake = u.module_from_spec(spec)\n"
+        "spec.loader.exec_module(gap_fake)\n"
+    ) % path
+    return path, loader
+
+
+def gap_guard_suite(workdir):
+    """§4: the guard interrupts a job when *GAP itself* crash-restarts.
+
+    The evidence is the writer, not the marker text and not "GAP is imported":
+    Sage prints the markers from `sage/interfaces/gap.py`, so a stand-in module at
+    that path is what trips the guard, while a job echoing the same text (or one
+    that merely has the module in `sys.modules`, which `from sage.all import *`
+    does for *every* job) must not.
     """
     sys.path.insert(0, ROOT)
     import sage_client as sc
@@ -1011,44 +1079,70 @@ def gap_guard_suite(workdir):
         "for _ in range(%d):\n"
         "    print('Gap crashed', file=sys.stderr)\n"
     )
+    _, gap = gap_stand_in(workdir)
     state_dir = os.path.join(workdir, "gap")
     server = Server(state_dir)
     client = sc.Client(state_dir)
+
+    def jobs():
+        return json.loads(server.resource("sage://kernel/status")[1])["jobs"]
+
     try:
-        out, err, _ = server.tool("exec", code="import sage.interfaces.gap")
+        out, err, _ = server.tool(
+            "exec",
+            code="import sage.interfaces.gap\ngap_imported = 1\n",
+        )
         record(
-            "§4: GAP is loaded in the kernel (the guard's precondition)",
+            "§4: (precondition) sage.interfaces.gap is importable and imported",
             not err and "Error" not in out,
             (out.strip() or "(no output)")[:80],
         )
 
-        trips = client.op("status")["gap_trips"]
-        out, err, _ = server.tool("exec", code=markers % 2)
+        # D2: the vacuous gate.  The old guard fired on `"sage.interfaces.gap" in
+        # sys.modules`, which `from sage.all import *` makes true in every job.
+        out, err, _ = server.tool(
+            "exec",
+            code="import sys\ngap_echoed = 1\n" + (markers % 4),
+        )
         record(
-            "§4: two crash markers do not trip the guard",
+            "§4: a job echoing the markers (module imported) does not trip it (D2)",
+            not err
+            and "[gap-guard]" not in out
+            and "KeyboardInterrupt" not in out
+            and jobs()["gap_trips"] == 0,
+            "gap_trips=%s, last=%r" % (jobs()["gap_trips"], out.strip().splitlines()[-1:]),
+        )
+
+        out, err, _ = server.tool(
+            "exec", code="import sys\nfor _ in range(4): print('Gap crashed')\n"
+        )
+        record(
+            "§4: markers on stdout from the job's own code are ignored",
             not err and "[gap-guard]" not in out and "KeyboardInterrupt" not in out,
             (out.strip() or "(no output)").splitlines()[-1],
         )
 
-        out, err, _ = server.tool(
-            "exec", code="import sys\nfor _ in range(4): print('hi', file=sys.stderr)\n"
-        )
+        # Two markers (one gap_fake.eval) are below the threshold of 3.
+        out, err, _ = server.tool("exec", code=gap + "gap_fake.eval('a')\ngap_two = 1\n")
         record(
-            "§4: ordinary stderr warnings do not trip the guard",
+            "§4: two crash markers from gap.py do not trip the guard",
             not err and "[gap-guard]" not in out and "KeyboardInterrupt" not in out,
             (out.strip() or "(no output)").splitlines()[-1],
         )
 
         server.tool("exec", code="gap_kept = 41")
-        out, err, _ = server.tool("exec", code=markers % 4)
+        trips = jobs()["gap_trips"]
+        out, err, _ = server.tool(
+            "exec", code=gap + "for _ in range(2):\n    gap_fake.eval('x')\n"
+        )
         record(
-            "§4: the third marker interrupts the job and prepends the notice",
+            "§4: the third gap.py marker interrupts the job and prepends the notice",
             not err
             and out.startswith("[gap-guard] interrupted after 3 'Gap crashed' markers")
             and "KeyboardInterrupt" in out,
             "\n".join(out.strip().splitlines()[:2]),
         )
-        after = client.op("status")["gap_trips"]
+        after = jobs()["gap_trips"]
         record(
             "§4: gap_trips counts the trip",
             after == trips + 1,
@@ -1067,7 +1161,17 @@ def gap_guard_suite(workdir):
             kept.strip(),
         )
 
-        out, _, _ = server.tool("exec", code=markers % 3, timeout_s=0)
+        # The same markers on stderr also count, because gap.py is the writer.
+        out, err, _ = server.tool(
+            "exec", code=gap + "for _ in range(3):\n    gap_fake.eval_stderr('x')\n"
+        )
+        record(
+            "§4: gap.py's stderr markers trip it too (the writer decides)",
+            "[gap-guard]" in out and "KeyboardInterrupt" in out,
+            (out.strip() or "(no output)").splitlines()[0][:90],
+        )
+
+        out, _, _ = server.tool("exec", code=gap + "for _ in range(2):\n    gap_fake.eval('x')\n", timeout_s=0)
         jid = _first_job_id(out)
         final = ""
         deadline = time.time() + 25
@@ -1085,11 +1189,13 @@ def gap_guard_suite(workdir):
         )
 
         burst = (
-            "import sys\n"
-            "try:\n"
-            "    for _ in range(3): print('Gap crashed', file=sys.stderr)\n"
+            gap
+            + "try:\n"
+            "    for _ in range(2):\n"
+            "        gap_fake.eval('x')\n"
             "except KeyboardInterrupt:\n"
-            "    for _ in range(5): print('Restarting Gap', file=sys.stderr)\n"
+            "    for _ in range(5):\n"
+            "        gap_fake.eval('again')\n"
             "    print('survived one burst')\n"
         )
         out, err, _ = server.tool("exec", code=burst)
@@ -1099,42 +1205,56 @@ def gap_guard_suite(workdir):
             (out.strip() or "(no output)").splitlines()[-1],
         )
 
+        # D3: the signal is asynchronous; a job may swallow it and run on.  The
+        # note must describe that, and the job must not count as interrupted.
+        before_swallow = jobs()
         out, err, _ = server.tool(
-            "exec", code="import sys\nfor _ in range(5): print('Gap crashed')\n"
+            "exec",
+            code=gap
+            + "try:\n"
+            "    for _ in range(4):\n"
+            "        gap_fake.eval('x')\n"
+            "except KeyboardInterrupt:\n"
+            "    print('swallowed the SIGINT')\n"
+            "print('JOB COMPLETED')\n"
+            "gap_swallowed = 1\n",
+        )
+        after_swallow = jobs()
+        record(
+            "§4: a job that swallows the guard's SIGINT says so, not 'interrupted' (D3)",
+            not err
+            and "JOB COMPLETED" in out
+            and "SIGINT was sent but the job continued" in out
+            and "interrupted after" not in out
+            and after_swallow["interrupted"] == before_swallow["interrupted"]
+            and after_swallow["gap_trips"] == before_swallow["gap_trips"] + 1,
+            "%r / interrupted %s -> %s"
+            % (
+                out.strip().splitlines()[0][:70],
+                before_swallow["interrupted"],
+                after_swallow["interrupted"],
+            ),
         )
         record(
-            "§4: crash markers on stdout are ignored",
-            not err and "[gap-guard]" not in out and "KeyboardInterrupt" not in out,
-            (out.strip() or "(no output)").splitlines()[-1],
+            "§4: (the swallowed job really finished)",
+            server.tool("exec", code="gap_swallowed")[0].strip() == "1",
+            "gap_swallowed=%r" % server.tool("exec", code="gap_swallowed")[0].strip(),
         )
 
-        # Sage prints the *real* markers with print(), i.e. on stdout, from
-        # sage/interfaces/gap.py ("crashed or quit executing" / "Restarting Gap
-        # and trying again").  A module that prints from that path stands in for
-        # the real interface, so this proves the guard is not dead on stdout.
-        fake = os.path.join(workdir, "gapfake", "sage", "interfaces")
-        os.makedirs(fake, exist_ok=True)
-        with open(os.path.join(fake, "gap.py"), "w", encoding="utf-8") as fh:
-            fh.write(
-                "def eval(line='x'):\n"
-                "    print(\"** Gap crashed or quit executing '%s' **\" % line)\n"
-                "    print('Restarting Gap and trying again')\n"
-                "    return line\n"
-            )
-        loader = (
-            "import importlib.util as u\n"
-            "spec = u.spec_from_file_location('fakegap', %r)\n"
-            "mod = u.module_from_spec(spec)\n"
-            "spec.loader.exec_module(mod)\n"
-            "gap_fake_n = 0\n"
+        # D3: the cap used to return before the guard, so a chatty job escaped it.
+        out, err, _ = server.tool(
+            "exec",
+            code=gap
+            + "for _ in range(200):\n"
+            "    print('x' * 40000)\n"
             "for _ in range(2):\n"
-            "    mod.eval('x')\n"
-            "gap_fake_n += 1\n"
-        ) % os.path.join(fake, "gap.py")
-        out, err, _ = server.tool("exec", code=loader)
+            "    gap_fake.eval('x')\n"
+            "print('not reached')\n",
+            timeout_s=90,
+        )
         record(
-            "§4: GAP's own stdout markers (sage/interfaces/gap.py) do trip it",
-            "[gap-guard]" in out and "KeyboardInterrupt" in out,
+            "§4: markers after the 4 MB cap are still counted (D3)",
+            "truncated at 4 MB" in out and "[gap-guard]" in out and "KeyboardInterrupt" in out,
             (out.strip() or "(no output)").splitlines()[0][:90],
         )
 
@@ -1157,7 +1277,9 @@ def gap_guard_suite(workdir):
     disabled = Server(os.path.join(workdir, "gap-off"), {"SAGE_MCP_GAP_LIMIT": "0"})
     try:
         disabled.tool("exec", code="import sage.interfaces.gap")
-        out, err, _ = disabled.tool("exec", code=markers % 5)
+        out, err, _ = disabled.tool(
+            "exec", code=gap + "for _ in range(3):\n    gap_fake.eval('x')\n"
+        )
         record(
             "§4: SAGE_MCP_GAP_LIMIT=0 disables the guard",
             not err and "[gap-guard]" not in out and "KeyboardInterrupt" not in out,
@@ -1579,10 +1701,9 @@ def observability_suite(workdir):
             "before=%s after=%s" % (after_fail, after_int),
         )
 
-        server.tool("exec", code="import sage.interfaces.gap")
+        _, gap = gap_stand_in(workdir, "gapfake-obs")
         server.tool(
-            "exec",
-            code="import sys\nfor _ in range(3): print('Gap crashed', file=sys.stderr)\n",
+            "exec", code=gap + "for _ in range(2):\n    gap_fake.eval('x')\n"
         )
         after_gap = jobs()
         record(
@@ -1710,6 +1831,43 @@ def cancellation_recovery(workdir):
         )
     finally:
         server.close()
+
+
+def log_reentrancy_check():
+    """§7: `_log` is reentrant, because a limit signal can arrive inside it.
+
+    The SIGXCPU/SIGXFSZ handler logs from the same thread that may already be
+    inside `_log`, and the lock used to be a plain `Lock`: that deadlocks the
+    kernel on the one path whose job is to keep it alive.  `RLock`, and the
+    handler skips log rotation (renaming the log mid-write is not something to do
+    from a signal handler).
+    """
+    code = (
+        "import sys\n"
+        "sys.path.insert(0, %r)\n"
+        "import sage_kernel as k\n"
+        "k._LOG = open('/dev/null', 'w')\n"
+        "with k._LOG_LOCK:  # exactly the state a signal handler interrupts\n"
+        "    k._log('logged from inside the lock')\n"
+        "print('reentrant')\n" % ROOT
+    )
+    try:
+        done = subprocess.run(
+            [PYTHON, "-c", code], capture_output=True, text=True, timeout=60
+        )
+        lines = (done.stdout or done.stderr).strip().splitlines()
+        record(
+            "§7: _log is reentrant (a limit signal inside it cannot deadlock)",
+            done.returncode == 0 and "reentrant" in done.stdout,
+            lines[-1] if lines else "(no output)",
+        )
+    except subprocess.TimeoutExpired:
+        record(
+            "§7: _log is reentrant (a limit signal inside it cannot deadlock)",
+            False,
+            "timed out: _log deadlocked on its own lock, so a limit signal would "
+            "wedge the kernel instead of failing the job",
+        )
 
 
 # --------------------------------------------------------------------------
@@ -1899,6 +2057,312 @@ def discovery_invariants(workdir):
 
 
 # --------------------------------------------------------------------------
+# run D: the interpreter that decides is the interpreter that executes (D1)
+# --------------------------------------------------------------------------
+def interpreter_without(workdir, module, name):
+    """A stand-in interpreter that cannot import `module`.
+
+    `sys.modules[module] = None` makes `import module` raise ImportError, which is
+    what a plain Python without nbformat (D1) or a Sage without it (D4) really
+    does -- without touching the real environment.
+    """
+    path = os.path.join(workdir, name)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(
+            "#!%s\n"
+            "import os, runpy, sys\n"
+            "sys.modules[%r] = None  # any import of it raises ImportError\n"
+            "if sys.argv[1] == '-c':\n"
+            "    exec(compile(sys.argv[2], '<c>', 'exec'), {'__name__': '__main__'})\n"
+            "elif sys.argv[1] == '-m':\n"
+            "    name = sys.argv[2]\n"
+            "    sys.argv = [name] + sys.argv[3:]\n"
+            "    runpy.run_module(name, run_name='__main__', alter_sys=True)\n"
+            "else:\n"
+            "    script = sys.argv[1]\n"
+            "    sys.argv = sys.argv[1:]\n"
+            "    sys.path[0] = os.path.dirname(os.path.abspath(script))\n"
+            "    runpy.run_path(script, run_name='__main__')\n" % (PYTHON, module)
+        )
+    os.chmod(path, 0o755)
+    return path
+
+
+def notebook_interpreter_suite(workdir):
+    """D1: `notebook` is advertised iff the interpreter that runs it can do it.
+
+    Two servers, one broken interpreter each.  (a) The documented install: the
+    server is any Python with `mcp`, so it cannot import nbformat itself -- the
+    tool must still be advertised *and* all four actions must work, which is also
+    the proof that the server process never imports nbformat/nbconvert.  (b)
+    Sage's interpreter cannot read notebooks -- the tool must not be advertised,
+    and a call must fail instead of dying with a message-less "Error executing".
+    """
+    nb = make_notebook(os.path.join(workdir, "interpreter.ipynb"))
+    blocked_server = interpreter_without(workdir, "nbformat", "nonb_server.py")
+    state = os.path.join(workdir, "d1-server")
+    server = Server(
+        state, spec=(blocked_server, [SERVER], server_params(state).env)
+    )
+    try:
+        names = [tool["name"] for tool in server.tools()]
+        record(
+            "D1: `notebook` is advertised even though the server cannot import nbformat",
+            "notebook" in names,
+            ", ".join(names),
+        )
+        out, err, _ = server.tool("notebook", action="check", path=nb)
+        record(
+            "D1: notebook check runs in Sage's interpreter (server has no nbformat)",
+            not err and out.startswith("OK   ") and "cells=3 (code=2" in out,
+            out,
+        )
+        out, err, _ = server.tool("notebook", action="extract", path=nb)
+        record(
+            "D1: notebook extract runs there too",
+            not err and out.startswith("# extracted from") and "2 + 2" in out,
+            (out.splitlines() or [""])[0],
+        )
+        out, err, _ = server.tool("notebook", action="run", path=nb, cell_timeout_s=60)
+        expected = os.path.join(workdir, "interpreter.out.ipynb")
+        record(
+            "D1: notebook run executes and publishes <name>.out.ipynb",
+            not err
+            and out.startswith("wrote ")
+            and os.path.exists(expected)
+            and "cells with errors: 0" in out,
+            out,
+        )
+        out, err, _ = server.tool(
+            "notebook", action="clear", path=expected, in_place=True
+        )
+        record(
+            "D1: notebook clear strips the outputs",
+            not err and "cleared outputs in 2 code cells" in out,
+            out,
+        )
+    finally:
+        server.close()
+
+    blocked_sage = interpreter_without(workdir, "nbformat", "nonb_sage.py")
+    server = Server(os.path.join(workdir, "d1-sage"), {"SAGE_PYTHON": blocked_sage})
+    try:
+        names = [tool["name"] for tool in server.tools()]
+        record(
+            "D1: a Sage interpreter without nbformat -> `notebook` is not advertised",
+            "notebook" not in names,
+            ", ".join(names),
+        )
+        out, err, _ = server.tool("notebook", action="check", path=nb)
+        record(
+            "D1: ... and no action pretends to work (an error, not silence)",
+            bool(err) and "notebook" in out,
+            out.splitlines()[0][:100] if out.strip() else "(empty)",
+        )
+    finally:
+        server.close()
+
+
+# --------------------------------------------------------------------------
+# run D: --check tests the *registration*, in the client's environment (D4/D5)
+# --------------------------------------------------------------------------
+def check_config(workdir, name, command, args, env):
+    path = os.path.join(workdir, name)
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(
+            {
+                "mcpServers": {
+                    "sage": {
+                        "command": command,
+                        "args": list(args),
+                        "env": dict(env),
+                        "exposure": "direct",
+                    }
+                }
+            },
+            fh,
+        )
+    return path
+
+
+def run_check(config, extra_env=None, timeout=900):
+    """`sage_mcp.py --check --config config` -> (exit code, all output).
+
+    SAGE_PYTHON is dropped from the checker's own environment on purpose: what is
+    being tested is what the *registration* carries, so a leftover export here
+    would mask exactly the defect D5 is about.
+    """
+    env = {key: value for key, value in os.environ.items() if key != "SAGE_PYTHON"}
+    env.update(extra_env or {})
+    done = subprocess.run(
+        [PYTHON, SERVER, "--check", "--config", config],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd="/tmp",
+        timeout=timeout,
+    )
+    return done.returncode, done.stdout + done.stderr
+
+
+def _smoke_line(text):
+    return [
+        line.strip()
+        for line in text.splitlines()
+        if "conformance smoke subset" in line
+    ][:1] or ["(no subset line)"]
+
+
+def check_suite(workdir):
+    """D4/D5: `--check` must verify the registration, in the client's env.
+
+    D4: the matrix subset used to run against `sys.executable` + this repo's
+    server, so it printed PASS for a registration whose exec cannot run at all.
+    D5: the server used to be spawned from `os.environ.copy()`, so it passed a
+    registration that only worked because `install.sh` had exported the Sage
+    interpreter the *shell* found.
+    """
+    # D4: an exec that cannot run fails the subset in the same run.
+    broken = check_config(workdir, "check-broken.json", "/bin/false", [], {})
+    code, text = run_check(broken, {"PATH": "/usr/bin:/bin"})
+    smoke = _smoke_line(text)
+    record(
+        "D4: a registration whose exec cannot run fails the matrix subset too",
+        code != 0 and smoke[0].startswith("[FAIL] conformance smoke subset"),
+        "%s / exit=%s" % (smoke[0], code),
+    )
+
+    # D4: and it really spawns *that* server: a registration that advertises 7
+    # tools (its Sage cannot read notebooks) fails C04 while exec still works.
+    blocked_sage = interpreter_without(workdir, "nbformat", "nonb_sage_d4.py")
+    partial = check_config(
+        workdir,
+        "check-partial.json",
+        PYTHON,
+        [SERVER],
+        {"SAGE_CWD": "/tmp", "SAGE_PYTHON": blocked_sage},
+    )
+    code, text = run_check(partial, {"PATH": "/usr/bin:/bin"})
+    smoke = _smoke_line(text)
+    record(
+        "D4: the subset drives the registration (7 tools -> C04 fails, exec fine)",
+        code != 0
+        and smoke[0].startswith("[FAIL] conformance smoke subset")
+        and "[PASS] exec runs Sage code" in text,
+        "%s / exec=%s" % (smoke[0], "[PASS] exec runs Sage code" in text),
+    )
+
+    # D5: a complete registration, checked in an environment with no Sage on PATH
+    # and no SAGE_PYTHON: everything must come from the entry itself.
+    good = check_config(
+        workdir,
+        "check-good.json",
+        PYTHON,
+        [SERVER],
+        {"SAGE_CWD": "/tmp", "SAGE_PYTHON": PYTHON},
+    )
+    code, text = run_check(good, {"PATH": "/usr/bin:/bin"})
+    summary = [row for row in text.splitlines() if "checks," in row and "failed" in row]
+    record(
+        "D5: a complete registration passes in the client's own environment",
+        code == 0 and summary and summary[0].strip().startswith("8 checks, 0 failed"),
+        (summary[0].strip() if summary else "(no summary)") + " / exit=%s" % code,
+    )
+
+    # D5: a registration with no SAGE_PYTHON, whose command lives outside Sage's
+    # bin directory, must fail with the discovery diagnosis -- and install.sh
+    # must give the same verdict now that it stops exporting its own SAGE_PYTHON.
+    bin_dir = os.path.join(workdir, "bare-bin")
+    os.makedirs(bin_dir, exist_ok=True)
+    linked = os.path.join(bin_dir, "python")
+    if not os.path.exists(linked):
+        os.symlink(PYTHON, linked)
+    bare = check_config(
+        workdir, "check-bare.json", linked, [SERVER], {"SAGE_CWD": "/tmp"}
+    )
+    diagnosis = "no interpreter that can 'import sage.all'"
+    code, text = run_check(bare, {"PATH": "/usr/bin:/bin"})
+    record(
+        "D5: a registration without SAGE_PYTHON fails with the discovery diagnosis",
+        code != 0 and diagnosis in text,
+        ([row for row in text.splitlines() if "checks," in row] or ["(no summary)"])[-1]
+        .strip(),
+    )
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in ("SAGE_PYTHON",)
+    }
+    env["PATH"] = os.pathsep.join([os.path.dirname(PYTHON), "/usr/bin:/bin"])
+    done = subprocess.run(
+        ["bash", os.path.join(ROOT, "install.sh"), "--check", bare],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd="/tmp",
+        timeout=900,
+    )
+    text = done.stdout + done.stderr
+    record(
+        "D5: install.sh --check no longer lends its SAGE_PYTHON to the registration",
+        done.returncode != 0
+        and diagnosis in text
+        and "8 checks, 0 failed" not in text,
+        ([row for row in text.splitlines() if "checks," in row] or ["(no summary)"])[-1]
+        .strip(),
+    )
+
+
+# --------------------------------------------------------------------------
+# run D, do NOT fix: interrupt(force=true) has no owner check (documented)
+# --------------------------------------------------------------------------
+def ownership_pin(workdir):
+    """Pin the documented, deliberately unfixed hole in `interrupt(force=true)`.
+
+    `interrupt` (SIGINT) is owner-checked; `force=true` is not, because it is the
+    escape hatch for a wedged kernel whose owner is gone.  It is therefore
+    machine-level: any client sharing the state dir can stop the kernel and
+    destroy another client's work.  DESIGN.md and README say exactly that; this
+    check fails if either half changes.
+    """
+    state = os.path.join(workdir, "pin-state")
+    owner = Server(state)
+    other = Server(state)  # a second MCP server on the same kernel
+    try:
+        out, _, _ = owner.tool(
+            "exec", code="import time; time.sleep(6); pinned = 1", session="pin",
+            timeout_s=0,
+        )
+        _first_job_id(out)
+        time.sleep(0.8)
+        refused, refused_err, _ = other.tool("interrupt")
+        forced, forced_err, _ = other.tool("interrupt", force=True)
+        record(
+            "§0 (documented): another client's interrupt is refused, force=true is not",
+            refused_err
+            and "not yours" in refused
+            and not forced_err
+            and "kernel stopped" in forced,
+            "interrupt: %r / force: %r"
+            % (
+                (refused.strip().splitlines() or [""])[0][:45],
+                (forced.strip().splitlines() or [""])[0][:40],
+            ),
+        )
+        after, after_err, _ = owner.tool("exec", code="'pinned' in globals()")
+        record(
+            "§0 (documented): the force-stop destroyed the owner's kernel and work",
+            not after_err
+            and after.startswith("[kernel restarted:")
+            and after.strip().splitlines()[-1] == "False",
+            (after.strip().splitlines() or ["(nothing)"])[0][:90],
+        )
+    finally:
+        owner.close()
+        other.close()
+
+
+# --------------------------------------------------------------------------
 def main():
     global PYTHON
     args = sys.argv[1:]
@@ -1927,8 +2391,12 @@ def main():
     discovery_invariants(workdir)
     cancellation_recovery(workdir)
     gap_guard_suite(workdir)
+    log_reentrancy_check()
     limits_suite(workdir)
     observability_suite(workdir)
+    notebook_interpreter_suite(workdir)
+    check_suite(workdir)
+    ownership_pin(workdir)
     stdout_hygiene(workdir)
 
     record(

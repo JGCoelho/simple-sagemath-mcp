@@ -28,6 +28,13 @@ the tool descriptions carry.
 - **`SIGINT` cannot kill the kernel.** An interrupt outside a job is logged and
   ignored, and only the client that owns the running job may send it, so a
   subagent cannot cancel your computation.
+- **`interrupt(force=true)` has no owner check, and that is deliberate.** It is
+  the escape hatch for a kernel that is wedged so badly its owner is gone, so it
+  is **machine-level**: any MCP server that shares the state directory may stop
+  the kernel and destroy another client's work. The refusal message for `SIGINT`
+  says "not yours"; `force=true` is documented (README, tool description) and
+  pinned by an acceptance check instead of being silently allowed. Removing the
+  hole would mean leaving a wedged kernel unstoppable.
 - **Stopping is honest.** `interrupt(force=true)` tries a graceful shutdown, then
   `SIGTERM`, then `SIGKILL`, and if the signal fails it keeps the state files and
   reports the pid rather than pretending the kernel is gone.
@@ -98,11 +105,15 @@ the job unwinds, and a second raise would replace the error already recorded
 (`Job.limit_guarded`). Outside a job the handler only notes the trip once, because
 `SIGXCPU` repeats every second above the soft limit.
 
-The server applies the same `as`/`fsize`/core so `run_file` and `notebook`
-children inherit them, but not `cpu` (it would bound the server's lifetime) or
-`nproc` (a margin that small breaks anything the server starts). `kernel.log` is
-rotated at 8 MiB (`SAGE_MCP_LOG_MAX`) into one `.1` generation, because the log is
-fd 1/2 and would otherwise be the first casualty of `fsize`.
+The server applies the same `as`/`fsize`/core at startup, so `run_file` and
+`notebook` children inherit them, and it re-arms the `nproc` margin immediately
+before each child spawn (`subproc._run`) -- the same "current tasks + margin" rule
+the kernel uses per job, never at startup, because a margin that small would break
+anything the server starts later. `cpu` is the one limit the server leaves alone:
+it counts against the *server's* lifetime, not a child's, so a server-level budget
+would kill the transport instead of the job. `kernel.log` is rotated at 8 MiB
+(`SAGE_MCP_LOG_MAX`) into one `.1` generation, because the log is fd 1/2 and would
+otherwise be the first casualty of `fsize`.
 
 ## The conformance matrix
 

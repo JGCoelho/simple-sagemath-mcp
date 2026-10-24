@@ -8,14 +8,18 @@ capped.
 
 `lang=python` is **Sage's** interpreter, not `sys.executable`: the server may
 run on a plain Python that has `mcp` but no Sage (DESIGN.md, two interpreters).
-`nbformat` is imported lazily and only for reading/validating/writing a
-notebook in this process; execution is always an `nbconvert` child.
+The same rule holds for `notebook`: `available()` asks *Sage's* interpreter, and
+all four actions run in it (this very file, executed by that interpreter), so the
+server imports neither `nbformat` nor `nbconvert` -- and the tool is advertised
+exactly when the interpreter that will run it can do the work.
 """
 
+import argparse
 import os
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -225,7 +229,14 @@ def run_file(path, lang="auto", args=None, timeout_s=None, stdin=None, cwd=None)
         raise SubprocessError(text)
     return text
 
-# notebook: read/check/clear here, execute as an nbconvert child
+# notebook: *one* interpreter decides and executes
+#
+# `available()` probes Sage's python and the four actions run there too, as this
+# file executed by that interpreter.  The server therefore imports nothing but
+# `mcp`: with the nbformat import in the server process, a documented install
+# (plain Python + `mcp` next to Sage) advertised the tool and every action died
+# with the SDK's message-less "Error executing tool notebook".
+NOTEBOOK_ACTIONS = ("check", "extract", "clear", "run")
 _AVAILABLE = []  # cached: one probe per server process
 
 
@@ -233,7 +244,9 @@ def available():
     """True when *Sage's* interpreter can read and execute notebooks.
 
     Asking our own sys.path would answer for the wrong interpreter: the server
-    may run on a plain Python with only `mcp` installed.
+    may run on a plain Python with only `mcp` installed.  The probe asks for
+    exactly what the child imports, so "advertised" and "runnable" cannot
+    disagree.
     """
     if not _AVAILABLE:
         ok = False
@@ -259,6 +272,70 @@ def available():
     return _AVAILABLE[0]
 
 
+def notebook(
+    action, path, out=None, in_place=False, cell_timeout_s=120, timeout_s=None,
+    state_dir=None,
+):
+    """Run one notebook action in Sage's interpreter; return its text.
+
+    `run` executes the notebook with nbconvert (atomically publishing
+    `<name>.out.ipynb`), always as a child: a Jupyter kernel must never run in
+    the server.  The child enforces the real budget (per cell plus slack) and
+    kills its own nbconvert, so `budget` here is only a backstop for a wedged
+    child.
+    """
+    if not path:
+        raise SubprocessError("notebook needs a path to an .ipynb file")
+    action = (action or "").strip().lower()
+    if action not in NOTEBOOK_ACTIONS:
+        raise SubprocessError(
+            "action must be one of %s (got %r)" % (", ".join(NOTEBOOK_ACTIONS), action)
+        )
+    if not available():
+        raise SubprocessError(
+            "notebook needs nbformat, nbconvert and nbclient in Sage's interpreter "
+            "(%s); install them there and restart the server"
+            % (sage_client.resolve_python() or "Sage not found",)
+        )
+    argv = [
+        sage_python(),
+        os.path.abspath(__file__),
+        "--notebook",
+        action,
+        "--path",
+        os.path.abspath(os.path.expanduser(str(path))),
+    ]
+    if out:
+        argv += ["--out", os.path.abspath(os.path.expanduser(str(out)))]
+    if in_place:
+        argv.append("--in-place")
+    argv += ["--cell-timeout", "%g" % float(cell_timeout_s)]
+    if timeout_s:
+        argv += ["--timeout", "%g" % float(timeout_s)]
+    if state_dir:
+        argv += ["--state-dir", str(state_dir)]
+    budget = min(max(float(timeout_s or MAX_TIMEOUT) + 60.0, 60.0), MAX_TIMEOUT)
+    exit_code, stdout, stderr, timed_out, _ = _run(
+        argv,
+        os.path.abspath(os.environ.get("SAGE_CWD") or os.getcwd()),
+        None,
+        budget,
+    )
+    if timed_out:
+        raise SubprocessError(
+            "notebook %s did not finish within %.0fs; the whole process group was "
+            "killed.\n%s" % (action, budget, stderr.strip())
+        )
+    if exit_code != 0:
+        raise SubprocessError(
+            stderr.strip()
+            or stdout.strip()
+            or "notebook %s failed (exit %s)" % (action, exit_code)
+        )
+    return stdout.rstrip("\n")
+
+
+# -- the child: this file, executed by Sage's interpreter ------------------
 def _read(path):
     import nbformat
 
@@ -304,7 +381,7 @@ def _code_cells(nb):
     return [cell for cell in nb.cells if cell.cell_type == "code"]
 
 
-def check(path):
+def _check(path):
     import nbformat
 
     path, nb = _read(path)
@@ -330,7 +407,7 @@ def check(path):
     )
 
 
-def extract(path):
+def _extract(path):
     path, nb = _read(path)
     code = _code_cells(nb)
     lines = ["# extracted from %s (%d code cells)" % (path, len(code))]
@@ -339,7 +416,7 @@ def extract(path):
     return "\n".join(lines)
 
 
-def clear(path, out=None, in_place=False):
+def _clear(path, out=None, in_place=False):
     path, nb = _read(path)
     cleared = 0
     for cell in _code_cells(nb):
@@ -355,7 +432,7 @@ def clear(path, out=None, in_place=False):
     )
 
 
-def run_notebook(
+def _run_notebook(
     path, out=None, in_place=False, cell_timeout_s=120, timeout_s=None, state_dir=None
 ):
     """Execute a notebook with nbconvert, atomically publishing `<name>.out.ipynb`."""
@@ -430,3 +507,50 @@ def run_notebook(
         if any(out.get("output_type") == "error" for out in cell.get("outputs") or [])
     )
     return "wrote %s (cells with errors: %d)" % (dest, errors)
+
+
+def notebook_child(argv):
+    """The child entry point: one notebook action, in this interpreter.
+
+    The result text goes to stdout (the server hands it back as the tool's
+    result); a failure goes to stderr with exit 1, so the server can report the
+    real message instead of a bare "the child failed".
+    """
+    parser = argparse.ArgumentParser(prog="subproc.py --notebook")
+    parser.add_argument("--notebook", dest="action", required=True, choices=NOTEBOOK_ACTIONS)
+    parser.add_argument("--path", required=True)
+    parser.add_argument("--out", default=None)
+    parser.add_argument("--in-place", action="store_true")
+    parser.add_argument("--cell-timeout", type=float, default=120.0)
+    parser.add_argument("--timeout", type=float, default=None)
+    parser.add_argument("--state-dir", default=None)
+    args = parser.parse_args(argv)
+    try:
+        if args.action == "check":
+            print(_check(args.path))
+        elif args.action == "extract":
+            print(_extract(args.path))
+        elif args.action == "clear":
+            print(_clear(args.path, args.out, args.in_place))
+        else:
+            print(
+                _run_notebook(
+                    args.path,
+                    out=args.out,
+                    in_place=args.in_place,
+                    cell_timeout_s=args.cell_timeout,
+                    timeout_s=args.timeout,
+                    state_dir=args.state_dir,
+                )
+            )
+    except SubprocessError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    except (OSError, ValueError) as exc:
+        print("%s: %s" % (type(exc).__name__, exc), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(notebook_child(sys.argv[1:]))

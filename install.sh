@@ -81,9 +81,10 @@ if [ "$CHECK_ONLY" = 1 ]; then
   [ -f "$CONFIG" ] || die "nothing to check: $CONFIG does not exist.
        Run ./install.sh first, or pass the config: ./install.sh --check <mcp.json>"
   # Re-testing a registration means starting what the client would start: the
-  # entry's own `command`, not whatever python this shell happens to have. A
-  # bare shell usually has no Sage on PATH, and a python3 without `mcp` turns
-  # the check into a ModuleNotFoundError traceback instead of a verdict.
+  # entry's own `command`, and its own `env` and nothing else (sage_mcp.py --check
+  # builds that environment).  In particular this shell's SAGE_PYTHON is NOT
+  # exported into the checker: the whole point is to fail a registration that a
+  # client with a minimal PATH cannot start, exactly as the client would.
   json_py="$(command -v python3 || true)"
   registered=""
   if [ -n "$json_py" ]; then
@@ -97,7 +98,6 @@ if [ "$CHECK_ONLY" = 1 ]; then
        Install it:  python3 -m pip install 'mcp>=2.3,<3'   or set SAGE_PYTHON."
   echo "config : $CONFIG"
   echo "checker: $SPY"
-  [ -n "$SAGE_PY" ] && export SAGE_PYTHON="$SAGE_PY"
   exec "$SPY" "$SRC/sage_mcp.py" --check --config "$CONFIG" ${2:+--name "$2"}
 fi
 
@@ -150,7 +150,9 @@ print("registered the %r entry in %s" % ("sage", path))
 EOF
 
 echo
+# No SAGE_PYTHON in this shell either: the entry carries its own (written above),
+# and the verification must fail the way a client would if it did not.
 echo "verifying the registration (a throwaway kernel, never the live one):"
-SAGE_PYTHON="$SAGE_PY" "$SPY" "$SRC/sage_mcp.py" --check --config "$MCP_JSON"
+"$SPY" "$SRC/sage_mcp.py" --check --config "$MCP_JSON"
 echo
 echo "done. Restart the client (in Pi: reload MCP servers) to pick it up."

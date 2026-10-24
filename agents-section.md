@@ -20,11 +20,15 @@ A persistent Sage kernel, not a proof checker. Tools: `exec`, `poll`, `reset`,
   or subagent), and does nothing when the kernel is idle.
 - `interrupt(force=true)` stops the kernel instead of the job: all variables are
   lost, the next `exec` starts a fresh one and prefixes its output with
-  `[kernel restarted: ...]`.
+  `[kernel restarted: ...]`. It has **no owner check** (unlike plain
+  `interrupt`): it is the escape hatch for a wedged kernel, so any client sharing
+  the state directory can use it and lose another client's work.
 - A GAP crash-restart loop (e.g. `structure_description()` on hostile input) is
-  caught by the guard: the job's result starts with `[gap-guard] interrupted
-  after N 'Gap crashed' markers ...`, the job ended as `KeyboardInterrupt`, the
-  session keeps its variables, and `poll` collects it. Do not retry the same
+  caught by the guard when *GAP's own interface* writes the markers: the job's
+  result starts with `[gap-guard] interrupted after N 'Gap crashed' markers ...`,
+  the job ended as `KeyboardInterrupt`, the session keeps its variables, and
+  `poll` collects it. If the job catches the interrupt and continues, the result
+  says `SIGINT was sent but the job continued` instead. Do not retry the same
   input -- try a different invariant or representation. `SAGE_MCP_GAP_LIMIT`
   (default 3, `0` disables) changes the threshold; your own prints of that text
   do not trip it.

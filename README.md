@@ -41,10 +41,10 @@ any registration at any time with `./install.sh --check` or
 | `exec` | `code`*, `session`="default", `timeout_s`=120 (0 = return at once), `preparse`=true | stdout, then the repr of the last expression; on timeout the partial output plus a job id to `poll` |
 | `poll` | `job_id`*, `wait_s`=0, `since`=0 | new output since the offset, ending in `[job finished in 6.0s]` or `[still running 12s; …]` |
 | `status` | — | kernel/session/job/client state, last error, log path |
-| `interrupt` | `force`=false | `SIGINT` the running job (it fails with `KeyboardInterrupt`, variables are kept); `force=true` stops the kernel and loses them |
+| `interrupt` | `force`=false | `SIGINT` the running job (it fails with `KeyboardInterrupt`, variables are kept); `force=true` stops the kernel and loses them -- no owner check, so any client sharing the state dir may use it |
 | `reset` / `drop` | `session`; `sessions`=[], `all`=false | empty a namespace; free idle sessions (refuses a busy one) |
 | `run_file` | `path`*, `lang`="auto", `args`=[], `timeout_s`=120, `stdin`, `cwd` | exit code and duration, then stdout/stderr inline; a non-zero exit is an error carrying both |
-| `notebook` | `action`*, `path`*, `out`, `in_place`, `cell_timeout_s`=120, `timeout_s` | `check` / `extract` / `clear` / `run`; advertised only when `nbformat`+`nbconvert`+`nbclient` import |
+| `notebook` | `action`*, `path`*, `out`, `in_place`, `cell_timeout_s`=120, `timeout_s` | `check` / `extract` / `clear` / `run`; all four run in Sage's interpreter, and the tool is advertised only when *that* interpreter has `nbformat`+`nbconvert`+`nbclient` |
 
 ## Status resource
 
@@ -60,7 +60,10 @@ job runs). The counters live **in the kernel** and reset when it restarts;
 `counters_since` says since when, so they are never read as lifetime totals. The
 server adds what only it knows: its own pid, version, live `clients`, `spawns`
 and `restarts`. The `status` tool carries the same numbers in one line:
-`jobs: N run, N failed, N interrupted; gap-guard: N; restarts: N`.
+`jobs: N run, N failed, N interrupted; gap-guard: N; restarts: N`. It prints one
+more line than that, on purpose: `last job per session: default=j41, …` is what
+makes a cancelled `exec` recoverable (the reply is gone, the job is not), so it
+is kept and asserted rather than folded into a frozen format.
 
 ## Why `poll` exists
 
@@ -124,11 +127,15 @@ they are written and, at the limit, interrupts that job **once** -- the same
 `SIGINT` as `interrupt`, so it ends as a `KeyboardInterrupt`, the session keeps
 its variables, and `poll` collects it. The result text is prefixed with
 `[gap-guard] interrupted after N 'Gap crashed' markers ...`, the trip is logged to
-`kernel.log`, and the count is in `status`/the status resource. Markers written
-by your own code on stdout are ignored; Sage's own markers (printed from
-`sage/interfaces/gap.py`, i.e. on stdout) are what the guard is for, and stderr
-is watched as well. Per-process limits are the backstop for a fork storm that
-outruns the markers.
+`kernel.log`, and the count is in `status`/the status resource. The evidence is
+the **writer**, not the text: Sage prints the markers from
+`sage/interfaces/gap.py`, so only a write from that file (on stdout or stderr),
+or a stderr write from a job that has already written through it, counts. A job
+echoing the words -- or one that merely has `sage.interfaces.gap` imported, which
+`from sage.all import *` does for every job -- cannot trip it. If the job catches
+the interrupt and runs on, the result says so (`SIGINT was sent but the job
+continued`) instead of claiming an interruption that did not happen. Per-process
+limits are the backstop for a fork storm that outruns the markers.
 
 ## Limits
 
@@ -145,7 +152,7 @@ SAGE_MCP_LIMITS="cpu=3600,as=8G,fsize=1G,nproc=off"   # the defaults
 | `cpu` | off | kernel | `SIGXCPU` is caught: the job fails with `ResourceLimitError`, the kernel keeps running |
 | `as` | 8 GiB | kernel + children | `MemoryError` -> job error |
 | `fsize` | 1 GiB | kernel + children | `SIGXFSZ`/`EFBIG` -> job error |
-| `nproc` | off | **per UID, machine-wide** | `fork` gets `EAGAIN` -> job error |
+| `nproc` | off | **per UID, machine-wide** | `fork`/`Popen` gets `EAGAIN`: the job (or the `run_file`/`notebook` child spawn) fails |
 | core | always `0` | kernel + children | no core dumps in `/tmp` |
 
 Sizes take a `K`/`M`/`G` suffix; `off`/`0` disables a limit (the inherited one is
@@ -180,10 +187,10 @@ which limit applies.
 ## Tests
 
 ```bash
-# 24 conformance cases, one row each, ~95 s
+# 24 conformance cases, one row each, ~70 s
 /path/to/sage-env/bin/python tests/conformance.py        # or --only C13,C15
 
-# 122 checks over MCP stdio (official client), ~135 s
+# 140 checks over MCP stdio (official client), ~195 s
 /path/to/sage-env/bin/python tests/acceptance.py
 
 # 10 checks as a Sage script, ~10 s (`singular` must be on PATH)
@@ -198,23 +205,40 @@ spawn serialisation, stale state files, dead launchers, an honest stop, output
 caps, `since` offsets, log isolation, shared-kernel ownership, socket privacy and
 the authkey, adoption across a server restart, the three discovery routes, a
 cancelled `exec` still being recoverable, the `run_file` contract, the notebook
-cycle, the GAP crash-loop guard, the resource limits (each one fails its job and leaves
-the kernel alive, children inherit them, the log rotates), the status resource
-and its counters, and that a handler's stray `print` cannot reach the wire.
+cycle (including the two-interpreter rule: the tool is advertised iff the
+interpreter that runs it can, and the server itself never imports nbformat), the
+GAP crash-loop guard (the writer decides, and the note describes what the signal
+actually did), the resource limits (each one fails its job and leaves
+the kernel alive, children inherit them, the log rotates, `_log` is reentrant), the
+status resource
+and its counters, `--check` driving a registration in the client's own environment,
+the documented `force=true` ownership hole, and that a handler's stray `print`
+cannot reach the wire.
 
 `conformance.py` is the matrix of PLAN §6: the 24 protocol-level cases
 (C01-C24), one row each, every request through the official client, and a
 non-zero exit if any case fails. It owns its state directories, so it never
-touches your kernel. Two cases are deliberate about their own setup: C13 fails
-loudly when it cannot get a `tools/call` in flight to cancel, and C15 fails
-loudly when it cannot get two servers onto one kernel -- a skipped hard case
-would prove nothing.
+touches your kernel. Two cases are deliberate about their own setup: C13 warms the
+kernel before it cancels (a cold server cannot have a job in flight, and that
+harness dependency is not a product verdict), and C15 fails loudly when it cannot
+get two servers onto one kernel -- a skipped hard case would prove nothing.
 
 `sage_mcp.py --check` (behind `install.sh --check` and
 `simple-sage-mcp-check`) is the 8-check smoke test; its last check runs the
-C01/C04/C08/C17/C20 subset of that matrix through the same harness. In an
-install without `tests/` (pip/uvx ship no tests) that check is reported as
-`SKIP` and left out of the totals -- a skipped check is never a pass.
+C01/C04/C08/C17/C20 subset of that matrix through the same harness. That subset
+spawns **the registration** -- its `command`, `args` and `env` exactly as written
+(`SAGE_MCP_TEST_SERVER` carries them to the harness), and the checks before it run
+the server in that same environment, never in the checking shell's: a registration
+that only works because *your* shell has `SAGE_PYTHON` exported is reported as
+broken, the way the client would find it. In an install without `tests/` (pip/uvx
+ship no tests) the subset is reported as `SKIP` and left out of the totals -- a
+skipped check is never a pass.
+
+`interrupt` is owner-checked; `interrupt(force=true)` is not. It is the escape
+hatch for a kernel that is wedged past answering its owner, which makes it
+**machine-level**: any server sharing `SAGE_MCP_STATE` can stop the kernel and
+lose another client's work. The tool description, `DESIGN.md` and an acceptance
+check say so, so the behaviour cannot change silently.
 
 ## License
 
