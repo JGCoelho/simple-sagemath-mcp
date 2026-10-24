@@ -29,7 +29,8 @@ and running `2+2` through it. Another client needs the block it prints:
     "sage": {
       "command": "/path/to/python-with-mcp/bin/python",
       "args": ["/path/to/sage-mcp/sage_mcp.py"],
-      "env": {"SAGE_PYTHON": "/path/to/sage-env/bin/python", "SAGE_CWD": "/tmp"}
+      "env": {"SAGE_PYTHON": "/path/to/sage-env/bin/python", "SAGE_CWD": "/tmp"},
+      "timeout": 600
     }
   }
 }
@@ -132,6 +133,13 @@ within `timeout_s`), and `poll(job_id, since=N)` returns the output produced sin
 offset `N` -- incremental, never a re-run. To cancel, do it explicitly: `interrupt`,
 then `poll` to collect the `KeyboardInterrupt`. Silence is never read as "cancel".
 
+A wait can be longer than your client's request timeout, so `exec`, `poll`,
+`run_file` and `notebook` send an MCP progress notification every 10 s while they
+wait; a progress notification resets that timeout (pi's default is 60 s, and its
+`mcp.json` entry for `sage` sets `"timeout": 600`). A client that asks for no
+progress keeps the old behaviour exactly, which is why `timeout_s=0` plus `poll`
+is still the shape for a job that may run for hours.
+
 `interrupt` is owner-checked: only the client whose job is running may send it.
 `interrupt(force=true)` is not, on purpose -- it is the escape hatch for a kernel
 wedged past answering its owner, so it is **machine-level**: any client sharing the
@@ -233,7 +241,7 @@ interruption that did not happen.
 # 24 conformance cases, one row each, ~70 s
 /path/to/sage-env/bin/python tests/conformance.py        # or --only C13,C15
 
-# 151 checks over MCP stdio through the official client, ~190 s
+# 154 checks over MCP stdio through the official client, ~220 s
 /path/to/sage-env/bin/python tests/acceptance.py
 
 # one suite instead of all of them (~7 s): the names come from --list-suites

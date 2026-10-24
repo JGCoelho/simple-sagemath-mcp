@@ -39,6 +39,10 @@ Two things worth noticing:
 
 - `wait_s=20` blocked until the job ended, instead of polling in a loop. With no
   `wait_s` the same call would have answered `[still running 9s; …]` immediately.
+- That wait is safe even though it outlives a client's own request timeout: the
+  server reports progress every 10 s while it waits, and a progress notification
+  resets the client's timeout. Nothing needs to be fire-and-forget unless the job
+  is longer than the timeout you configured.
 - The agent's turn can end here and the job keeps going; a later `poll`, from this
   server or the next one that adopts the kernel, still collects it from the
   offset it was given. A `poll` with `since=0` after that returns the whole

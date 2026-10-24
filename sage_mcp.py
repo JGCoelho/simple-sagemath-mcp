@@ -14,6 +14,7 @@ without touching the live kernel.
 
 import asyncio
 import functools
+import inspect
 import json
 import os
 import shutil
@@ -29,7 +30,7 @@ if HERE not in sys.path:
 
 from mcp import ClientSession, StdioServerParameters  # noqa: E402
 from mcp.client.stdio import stdio_client  # noqa: E402
-from mcp.server.mcpserver import MCPServer  # noqa: E402
+from mcp.server.mcpserver import Context, MCPServer  # noqa: E402
 from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
 from pydantic import Field  # noqa: E402
 
@@ -230,6 +231,17 @@ def kernel_status() -> str:
 def _tool_errors(fn):
     """Kernel trouble is anticipated: tell the model, keep the message."""
 
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def awrapper(*args, **kwargs):
+            try:
+                return await fn(*args, **kwargs)
+            except (KernelBusy, KernelDown, KernelError) as exc:
+                raise ToolError(str(exc))
+
+        return awrapper
+
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         try:
@@ -238,6 +250,69 @@ def _tool_errors(fn):
             raise ToolError(str(exc))
 
     return wrapper
+
+
+# -- progress ---------------------------------------------------------------
+#
+# A tool that waits longer than the client's per-request timeout used to look
+# like a failure: the client aborts the request while the job keeps running, and
+# the job id is lost.  Progress notifications reset that timeout, so the wait is
+# sliced into `PROGRESS_SLICE_S` steps and each step that finds the job still
+# running reports elapsed time.  The slice must stay well under the smallest
+# timeout a client is likely to use (pi's default is 60 s).
+#
+# Notifications are advisory: a client that did not ask for progress (no
+# progressToken) makes report_progress a no-op, and any failure here must not
+# turn a working tool call into an error.
+PROGRESS_SLICE_S = 10.0
+
+
+async def _report(ctx, label, elapsed, total):
+    if ctx is None:
+        return
+    try:
+        await ctx.report_progress(
+            elapsed,
+            total if total and total > 0 else None,
+            "%s: still running %ss" % (label, _fmt_secs(elapsed)),
+        )
+    except Exception:  # noqa: BLE001 - progress is advisory, never fatal
+        pass
+
+
+async def _wait_job(ctx, client, job_id, budget, since, label):
+    """Wait up to `budget` seconds for a job, reporting progress as it waits.
+
+    Returns the last job snapshot (None if `budget` ran out before the first
+    step).  Repeating the kernel's `wait` with the same `since` is stateless, so
+    slicing changes nothing but who is kept informed.
+    """
+    start = time.monotonic()
+    reply = None
+    while True:
+        remaining = budget - (time.monotonic() - start)
+        if remaining <= 0:
+            return reply
+        chunk = min(PROGRESS_SLICE_S, remaining)
+        reply = await asyncio.to_thread(
+            functools.partial(
+                client.op, "wait", _timeout=chunk + 5.0, job_id=job_id, timeout=chunk, since=since
+            )
+        )
+        if reply["job"].get("state") == "done":
+            return reply
+        await _report(ctx, label, time.monotonic() - start, budget)
+
+
+async def _run_with_progress(ctx, call, label, total=None):
+    """Run a blocking call off the event loop, reporting progress meanwhile."""
+    task = asyncio.ensure_future(asyncio.to_thread(call))
+    start = time.monotonic()
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=PROGRESS_SLICE_S)
+        if done:
+            return task.result()
+        await _report(ctx, label, time.monotonic() - start, total)
 
 # tools
 
@@ -248,7 +323,7 @@ def _tool_errors(fn):
 @_tool_errors
 
 
-def tool_exec(
+async def tool_exec(
     code: Annotated[str, Field(description="Code to execute.")],
     session: Annotated[str, Field(description=SESSION_DOC)] = "default",
     timeout_s: Annotated[
@@ -261,6 +336,7 @@ def tool_exec(
         Field(description="Apply the Sage preparser (2^10 -> 1024, R.<x> = ...). "
                           "false runs raw Python (2^10 is XOR)."),
     ] = True,
+    ctx: Context = None,  # type: ignore[assignment]  # injected by the SDK
 ) -> str:
     """Run Sage/Python in the long-lived kernel: stdout, then the repr of the last expression (or '(no output)'). Code runs on the kernel's main thread, one job at a time, so cysignals Sage code works; state persists per session. timeout_s is NOT a computation limit: on expiry you get the partial output and a job id, and the job keeps running (collect it with poll). timeout_s=0 returns at once. A submitted job waits behind the running one ("[queued: another job is running]"); if that one holds the GIL the submit itself is refused after ~10 s ("[kernel busy ...]", the job was not submitted) -- check status or interrupt, then retry."""
     if os.environ.get("SAGE_MCP_STDOUT_NOISE"):
@@ -284,13 +360,16 @@ def tool_exec(
         prefix = "[kernel restarted: %s (pid %s)]" % (reason, state["pid"])
 
     try:
-        reply = client.op(
-            "submit",
-            _timeout=10.0,
-            session=session,
-            code=code,
-            preparse=bool(preparse),
-            wait=0,
+        reply = await asyncio.to_thread(
+            functools.partial(
+                client.op,
+                "submit",
+                _timeout=10.0,
+                session=session,
+                code=code,
+                preparse=bool(preparse),
+                wait=0,
+            )
         )
     except KernelBusy as exc:
         return _join(
@@ -308,15 +387,16 @@ def tool_exec(
         return _join(prefix, _job_text(job, job_id))
 
     try:
-        reply = client.op(
-            "wait", _timeout=timeout + 5.0, job_id=job_id, timeout=timeout, since=0
-        )
-        job = reply["job"]
+        # Sliced so progress notifications keep the client's request alive.
+        reply = await _wait_job(ctx, client, job_id, timeout, 0, "exec")
     except KernelBusy:
         # The kernel cannot answer right now (a computation holds the GIL).
         # The job keeps running: report what we last saw and how to collect it.
-        pass
+        reply = None
+    if reply is not None:
+        job = reply["job"]
     return _join(prefix, _job_text(job, job_id))
+
 
 MAX_POLL_WAIT = 3600.0
 
@@ -327,7 +407,7 @@ MAX_POLL_WAIT = 3600.0
 @_tool_errors
 
 
-def tool_poll(
+async def tool_poll(
     job_id: Annotated[str, Field(description="Job id such as j7.")],
     since: Annotated[
         int,
@@ -339,6 +419,7 @@ def tool_poll(
         Field(description="Block up to this many seconds waiting for the job to "
                           "finish (0 = return immediately, the default)."),
     ] = 0,
+    ctx: Context = None,  # type: ignore[assignment]  # injected by the SDK
 ) -> str:
     """Collect a job started by exec. since = the offset the previous call printed (0 to start), so you get only new output. wait_s blocks until the job finishes or that many seconds pass (0 = return immediately, the default)."""
     if not job_id:
@@ -349,12 +430,21 @@ def tool_poll(
     try:
         if wait > 0:
             # Optional blocking collection: the kernel waits on the job's done
-            # event and returns the same snapshot `poll` would.
-            reply = client.op(
-                "wait", _timeout=wait + 15.0, job_id=str(job_id), timeout=wait, since=offset
-            )
+            # event and returns the same snapshot `poll` would, in slices that
+            # let progress notifications keep the client's request alive.
+            reply = await _wait_job(ctx, client, str(job_id), wait, offset, "poll")
+            if reply is None:  # the budget went before the first step
+                reply = await asyncio.to_thread(
+                    functools.partial(
+                        client.op, "poll", _timeout=10.0, job_id=str(job_id), since=offset
+                    )
+                )
         else:
-            reply = client.op("poll", _timeout=10.0, job_id=str(job_id), since=offset)
+            reply = await asyncio.to_thread(
+                functools.partial(
+                    client.op, "poll", _timeout=10.0, job_id=str(job_id), since=offset
+                )
+            )
     except KernelBusy as exc:
         raise ToolError("kernel busy: %s" % exc)
     job = reply["job"]
@@ -583,7 +673,7 @@ def tool_interrupt(
 @mcp.tool(name="run_file", structured_output=False)
 
 
-def tool_run_file(
+async def tool_run_file(
     path: Annotated[
         str,
         Field(description="The file to run (absolute or relative to this server's cwd)."),
@@ -603,11 +693,23 @@ def tool_run_file(
         str | None,
         Field(description="Working directory (default: the file's own directory)."),
     ] = None,
+    ctx: Context = None,  # type: ignore[assignment]  # injected by the SDK
 ) -> str:
     """Run a file that already exists and return its output inline: exit code, duration, stdout and stderr. Nothing is copied or stored -- the file you name is the file that runs, with cwd = its own directory. lang=auto guesses from the extension and honours a #! for executables; lang=python uses Sage's own interpreter (so `from sage.all import *` works) and lang=sage shells out to `sage`. A non-zero exit or a timeout is an error, with the output attached; the timeout kills the whole process group."""
     try:
-        return subproc.run_file(
-            path=path, lang=lang, args=args, timeout_s=timeout_s, stdin=stdin, cwd=cwd
+        return await _run_with_progress(
+            ctx,
+            functools.partial(
+                subproc.run_file,
+                path=path,
+                lang=lang,
+                args=args,
+                timeout_s=timeout_s,
+                stdin=stdin,
+                cwd=cwd,
+            ),
+            "run_file",
+            _as_float(timeout_s, 120),
         )
     except subproc.SubprocessError as exc:
         raise ToolError(str(exc))
@@ -616,7 +718,7 @@ def tool_run_file(
 @_tool_errors
 
 
-def tool_notebook(
+async def tool_notebook(
     action: Annotated[Literal["check", "run", "clear", "extract"], Field()],
     path: Annotated[str, Field(description=".ipynb file.")],
     out: Annotated[
@@ -633,6 +735,7 @@ def tool_notebook(
     timeout_s: Annotated[
         float | None, Field(description="Overall wall clock budget for run.")
     ] = None,
+    ctx: Context = None,  # type: ignore[assignment]  # injected by the SDK
 ) -> str:
     """Jupyter notebook helper for the kernels SageMath ships. check: validate and summarise. extract: print the code cells. clear: strip outputs (atomically). run: execute with nbconvert (atomically, to <name>.out.ipynb unless out/in_place is given) and report how many cells ended in error."""
     action = str(action or "").strip().lower()
@@ -645,14 +748,20 @@ def tool_notebook(
     try:
         # One interpreter decides and executes: every action runs in Sage's
         # python (subproc.notebook), so this process imports no nbformat.
-        return subproc.notebook(
-            action,
-            path,
-            out=out,
-            in_place=bool(in_place),
-            cell_timeout_s=_as_float(cell_timeout_s, 120),
-            timeout_s=None if timeout_s is None else _as_float(timeout_s, 0),
-            state_dir=get_client().state_dir,
+        return await _run_with_progress(
+            ctx,
+            functools.partial(
+                subproc.notebook,
+                action,
+                path,
+                out=out,
+                in_place=bool(in_place),
+                cell_timeout_s=_as_float(cell_timeout_s, 120),
+                timeout_s=None if timeout_s is None else _as_float(timeout_s, 0),
+                state_dir=get_client().state_dir,
+            ),
+            "notebook",
+            None if timeout_s is None else _as_float(timeout_s, 0),
         )
     except subproc.SubprocessError as exc:
         raise ToolError(str(exc))

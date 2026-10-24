@@ -6,7 +6,8 @@
       "env": {
         "SAGE_CWD": "/tmp",
         "SAGE_PYTHON": "/path/to/sage-env/bin/python"
-      }
+      },
+      "timeout": 600
     }
   }
 }

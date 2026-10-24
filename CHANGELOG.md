@@ -4,6 +4,25 @@ The tool surface is frozen: eight tools, with the names, parameters and result
 texts pinned by `tests/snapshots/tools-list.json`. Changes that would alter any
 of them are breaking and get a major version.
 
+## Unreleased
+
+- **Long waits cannot be mistaken for failures.** `exec`, `poll`, `run_file` and
+  `notebook` now send an MCP progress notification every 10 s while they wait.
+  Clients reset their per-request timeout on a progress notification, so a wait
+  longer than that timeout ends normally instead of being aborted while the job
+  keeps running (and losing its job id). The tool surface is unchanged: a client
+  that asks for no progress token sees byte-identical results, and the frozen
+  `tools/list` snapshot still matches.
+- **`"timeout": 600`** for `sage` in `example.mcp.json`, with the same entry in
+  this machine's `mcp.json`.
+- New `progress_suite` in `tests/acceptance.py` (154 checks): it asserts the
+  notifications, their cadence, their `total`, and that a call without a progress
+  token is unaffected.
+- `agents-section.md` and `README.md` document the progress behaviour, and
+  `agents-section.md` now warns that the preparser makes integer literals Sage
+  `Integer`s, which breaks Python's `statistics.mean`/`variance` unless the values
+  are cast with `int()`.
+
 ## 1.0.0
 
 First release.

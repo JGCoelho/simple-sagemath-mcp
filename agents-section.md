@@ -57,11 +57,25 @@ A persistent Sage kernel, not a proof checker. Tools: `exec`, `poll`, `reset`,
 - Several Pi sessions/subagents share one kernel: their jobs queue on it, and it is
   stopped only when the last of them exits (a subagent finishing cannot kill your
   run).
-- Long jobs: set `timeout_s` generously in the first `exec`.
+- Long jobs: set `timeout_s` generously in the first `exec`. Long waits are
+  safe: `exec`, `poll`, `run_file` and `notebook` emit
+  `notifications/progress` every 10 s while they wait, and a progress
+  notification resets the client's per-request timeout (pi's `mcp.json` sets
+  `"timeout": 600` for `sage`). A client that asked for no progress token gets
+  the same calls as before, so a wait beyond that timeout still wants
+  `timeout_s=0` plus `poll`.
 - To verify that state was really lost (after `interrupt(force=true)`), test `'name' in globals()`:
   short names such as `n`, `N`, `e`, `i` and `pi` are Sage predefines (`N` is
   `numerical_approx`), so a `NameError` probe can resolve to an unrelated
   function and lie.
+- The kernel preparses by default, so **integer literals are Sage `Integer`s,
+  not Python `int`s**. Python's `statistics.mean`, `variance`, `stdev`,
+  `pstdev`, `harmonic_mean` and `quantiles` then fail with `TypeError:
+  unsupported operand type(s) for *: 'method' and 'method'` -- Sage exposes
+  `numerator`/`denominator` as *methods* and `fractions.Fraction` multiplies
+  them. Pass Python ints (`statistics.mean([int(x) for x in data])`) or use
+  `fmean`, `median`, `mode` or `geometric_mean`, which never build a Fraction;
+  `preparse=false` avoids it too but loses `2^10` and `R.<x>`.
 - Do not use Sage for file editing or shell commands, only for math or
   calculations.
 - `run_file(path, lang="auto", args=[], timeout_s=120, stdin=None, cwd=None)`

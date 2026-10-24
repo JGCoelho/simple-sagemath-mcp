@@ -196,6 +196,31 @@ class Server:
             text = _strip_error_prefix(tool_name, text)
         return text, is_error, result
 
+    def tool_progress(self, tool_name, **arguments):
+        """`tool`, with a progress callback attached: (text, is_error, notes).
+
+        `notes` is [(progress, total, message)] exactly as the client received
+        them, so a test can assert that a long wait kept reporting.
+        """
+        notes = []
+
+        async def on_progress(progress, total, message):
+            notes.append((progress, total, message))
+
+        result = self._result(
+            self._session.call_tool(tool_name, arguments, progress_callback=on_progress),
+            "tools/call %s (progress)" % tool_name,
+        )
+        text = "".join(
+            getattr(block, "text", "")
+            for block in result.content or []
+            if getattr(block, "type", None) == "text"
+        )
+        is_error = bool(result.is_error)
+        if is_error:
+            text = _strip_error_prefix(tool_name, text)
+        return text, is_error, notes
+
     def ping(self):
         return self._result(self._session.send_ping(), "ping", 30)
 
@@ -432,6 +457,56 @@ def notebook_suite(server, workdir):
 # --------------------------------------------------------------------------
 # the suite
 # --------------------------------------------------------------------------
+def progress_suite(workdir):
+    """A wait longer than the client's own timeout must stay alive.
+
+    Every client has a per-request timeout (pi's default is 60 s) and a progress
+    notification resets it. The server therefore slices its waits and reports
+    while it waits: without this, a 90 s job under `timeout_s=120` looked like a
+    failed call and its job id was lost.
+    """
+    server = Server(os.path.join(workdir, "progress"))
+    # Longer than one progress slice, so a wait that reports has to report.
+    slow = "import time\ntime.sleep(12)\nprint('slow done')"
+    try:
+        text, is_err, notes = server.tool_progress("exec", code=slow, timeout_s=40)
+        record(
+            "exec reports progress while it waits",
+            not is_err
+            and "slow done" in text
+            and notes
+            and all(message and "still running" in message for _, _, message in notes)
+            and all(total == 40 for _, total, _ in notes),
+            "%d notification(s): %r" % (len(notes), notes[0][2] if notes else None),
+        )
+
+        text, _, _ = server.tool("exec", code=slow, timeout_s=0)
+        job_id = None
+        for token in text.replace("[", " ").replace("]", " ").replace("'", " ").split():
+            if token.startswith("j") and token[1:].isdigit():
+                job_id = token
+                break
+        text, is_err, notes = server.tool_progress("poll", job_id=job_id, wait_s=40)
+        record(
+            "poll reports progress while it waits",
+            job_id is not None
+            and not is_err
+            and "job finished in" in text
+            and notes,
+            "%d notification(s), job %s" % (len(notes), job_id),
+        )
+
+        # Most clients send no progressToken at all: nothing may change for them.
+        text, is_err, _ = server.tool("exec", code="print('quiet')", timeout_s=20)
+        record(
+            "without a progress token the same wait works",
+            not is_err and text.strip() == "quiet",
+            repr(text[:20]),
+        )
+    finally:
+        server.close()
+
+
 def suite(server, workdir):
     out, err, _ = server.tool("exec", code="1+1")
     record("exec 1+1 -> 2", out.strip() == "2", out)
@@ -2391,6 +2466,7 @@ def iter_suites(workdir, selected=None):
         ("stdout_hygiene", lambda: stdout_hygiene(workdir)),
         ("cli_suite", cli_suite),
         ("discovery_visibility_suite", lambda: discovery_visibility_suite(workdir)),
+        ("progress_suite", lambda: progress_suite(workdir)),
     ]
     if not selected:
         return suites
