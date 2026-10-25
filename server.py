@@ -6,10 +6,12 @@
 # Run:      python server.py     (the python of your Sage install, see install.sh)
 # Install:  ./install.sh
 
+import argparse
 import asyncio
 import json
 import os
 import re
+import sys
 import time
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -34,18 +36,11 @@ class Config:
 
     @classmethod
     def load(cls, path: Path | None = None) -> "Config":
+        """Read server.json next to this file. Ignore unknown keys."""
+        path = path or Path(__file__).with_suffix(".json")
         known = {f.name for f in fields(cls)}
-        data = {}
-        if path is None:
-            path = Path(__file__).with_suffix(".json")
-        if path.exists():
-            data.update({k: v for k, v in json.loads(path.read_text()).items()
-                         if k in known})
-        for name in known:
-            env = os.environ.get(f"SAGE_MCP_{name.upper()}")
-            if env is not None:
-                data[name] = float(env)
-        return cls(**data)     
+        data = json.loads(path.read_text()) if path.exists() else {}
+        return cls(**{k: v for k, v in data.items() if k in known})
 
 CFG = Config.load()
 
@@ -58,8 +53,16 @@ GAP_CRASH_LIMIT = 3
 
 _kernel_lock = asyncio.Lock()
 
+def _stop_kernel(km: KernelManager, kc: BlockingKernelClient) -> None:
+    """Stop the channels and the kernel. Ignore the errors of a dead kernel."""
+    for fn in (kc.stop_channels, lambda: km.shutdown_kernel(now=True)):
+        try:
+            fn()
+        except Exception:
+            pass
+
+
 def _start_kernel() -> tuple[KernelManager, BlockingKernelClient]:
-    import sys
     # The kernel must be Sage. SAGE_PYTHON lets the server run on another python.
     py = os.environ.get("SAGE_PYTHON") or sys.executable
     km = KernelManager(kernel_name="python3")
@@ -80,22 +83,13 @@ def _start_kernel() -> tuple[KernelManager, BlockingKernelClient]:
         kc.wait_for_ready(timeout=CFG.kernel_ready_timeout)
     except BaseException:
         # Do not leave a live kernel and its channels behind.
-        for fn in (kc.stop_channels, lambda: km.shutdown_kernel(now=True)):
-            try:
-                fn()
-            except Exception:
-                pass
+        _stop_kernel(km, kc)
         raise
     return km, kc
 
 
 def _reset_kernel(state: dict) -> None:
-    km, kc = state["km"], state["kc"]
-    for fn in (kc.stop_channels, lambda: km.shutdown_kernel(now=True)):
-        try:
-            fn()
-        except Exception:
-            pass
+    _stop_kernel(state["km"], state["kc"])
     state["km"], state["kc"] = _start_kernel()
 
 
@@ -108,7 +102,7 @@ def _execute_sync(state: dict, code: str, session: str = "default",
                   filename: str = "<sage_exec>", *, timeout: float | None = None
                   ) -> list[dict]:
     """Run code in one session namespace. Return the outputs in notebook order."""
-    t = timeout or CFG.kernel_read_timeout
+    t = CFG.kernel_read_timeout if timeout is None else timeout
     km, kc = state["km"], state["kc"]
     if not km.is_alive():
         _reset_kernel(state)
@@ -171,12 +165,14 @@ else:
                 if name == "stderr":
                     gap_crashes += len(GAP_CRASH_PATTERN.findall(c.get("text", "")))
                     if gap_crashes >= GAP_CRASH_LIMIT:
+                        # Becomes an error output. Do not wait for the reply after
+                        # the interrupt: an interrupted GAP may not send it.
                         km.interrupt_kernel()
                         outs.append({"output_type": "error", "ename": "GapCrashLoop",
                                      "evalue": "GAP crashed repeatedly. The execution "
                                      "was interrupted to stop a runaway process.",
                                      "traceback": []})
-                        break
+                        return outs
             elif mt in ("execute_result", "display_data"):
                 md = dict(c.get("metadata") or {})
                 # The wrapper marks the value of the last expression.
@@ -198,10 +194,6 @@ else:
             f"the Sage kernel failed ({type(e).__name__}: {e}). "
             "The kernel restarted. All sessions lost."
         ) from e
-
-    if gap_crashes >= GAP_CRASH_LIMIT:
-        # The kernel may not send the reply after the interrupt. Do not wait.
-        return outs
 
     try:
         drain_deadline = time.monotonic() + CFG.shell_drain_timeout
@@ -306,8 +298,7 @@ async def sage_lifespan(server):
         yield state
     finally:
         if state["km"] is not None:
-            await asyncio.to_thread(state["kc"].stop_channels)
-            await asyncio.to_thread(state["km"].shutdown_kernel, now=True)
+            await asyncio.to_thread(_stop_kernel, state["km"], state["kc"])
 
 
 mcp = FastMCP("SageMath", lifespan=sage_lifespan)
@@ -319,12 +310,12 @@ async def _invoke(ctx: Context, fn, *args, **kwargs):
         if state["km"] is None:
             state["km"], state["kc"] = await asyncio.to_thread(_start_kernel)
         task = asyncio.create_task(asyncio.to_thread(fn, state, *args, **kwargs))
-        while not task.done():
+        while True:
             done, _ = await asyncio.wait({task}, timeout=CFG.heartbeat_interval)
-            if not done:
-                await ctx.report_progress(progress=0, total=None,
-                                          message="Sage kernel still running...")
-        return await task
+            if done:
+                return task.result()
+            await ctx.report_progress(progress=0, total=None,
+                                      message="Sage kernel still running...")
 
 
 @mcp.tool()
@@ -411,4 +402,10 @@ async def sage_interrupt(ctx: Context) -> dict:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="SageMath MCP server.")
+    parser.add_argument("--directory", metavar="DIR",
+                        help="start the kernel in this directory")
+    args = parser.parse_args()
+    if args.directory:
+        os.chdir(args.directory)
     mcp.run()

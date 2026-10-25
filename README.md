@@ -29,11 +29,15 @@ host. For pi the file is `~/.pi/agent/mcp.json`. Claude uses `.mcp.json` or
   "mcpServers": {
     "sage": {
       "command": "/path/to/sage/env/bin/python",
-      "args": ["/path/to/simple-sagemath-mcp/server.py"]
+      "args": ["/path/to/simple-sagemath-mcp/server.py",
+               "--directory", "/path/to/your/work"]
     }
   }
 }
 ```
+
+`--directory` starts the kernel in that directory, so a relative path in the
+code of the agent points at your work and not at the home directory.
 
 If the script cannot find Sage, give the interpreter yourself:
 
@@ -227,10 +231,8 @@ Defaults live in `server.json` next to `server.py`:
 | `shell_drain_timeout` | 30 | seconds to drain the shell channel |
 | `kernel_ready_timeout` | 60 | seconds to wait for a new kernel |
 
-`SAGE_MCP_<KEY>` environment variables override the file, for example
-`SAGE_MCP_KERNEL_READ_TIMEOUT=60`. Note that most MCP clients start the server
-with a **sanitized environment**, so these variables often do not arrive. Use
-`server.json` when you need a different value.
+Change a value in `server.json`. Environment variables do not work: most MCP
+clients start the server with a **sanitized environment**.
 
 ## Requirements
 
@@ -249,7 +251,7 @@ folder takes about 25 s.
 
 ```bash
 PY=/path/to/sage/env/bin/python     # the python that install.sh found
-"$PY" test/test_config.py          # config only, no kernel, 6 tests
+"$PY" test/test_config.py          # config only, no kernel, 4 tests
 "$PY" test/test_exec.py            # sage_exec and the session tools, 14 tests
 "$PY" test/test_notebook.py        # notebooks, 8 tests
 ```
@@ -259,16 +261,4 @@ The files use `unittest`, so `pytest test/` also works.
 ## Limits
 
 - No magics, no `!` shell commands.
-- A session stays in the kernel until `sage_stop` or the end of the server. Many
-  different session names grow the kernel memory.
-- An interrupt that arrives just after a timeout can hit the next call.
-- `sage_exec` gives the plain text value only. LaTeX and HTML are for notebooks.
-- Stored error outputs keep the ANSI colours of the kernel traceback.
 
-## Inspiration
-
-The tool surface follows [szeider/mcp-sage](https://github.com/szeider/mcp-sage)
-(`sage_exec`, `sage_interrupt`, Jupyter kernel protocol, injected `KernelSpec`,
-and the GAP crash-loop guard). The differences are: Sage preparse on every call,
-one kernel with named namespaces instead of one kernel per session, and native
-notebook support.
