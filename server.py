@@ -99,7 +99,7 @@ def _reset_kernel(state: dict) -> None:
 # Do not use ctx.session_id: with the default protocol it changes on each call.
 
 def _execute_sync(state: dict, code: str, session: str = "default",
-                  filename: str = "<sage_exec>", *, timeout: float | None = None
+                  filename: str = "<exec>", *, timeout: float | None = None
                   ) -> list[dict]:
     """Run code in one session namespace. Return the outputs in notebook order."""
     t = CFG.kernel_read_timeout if timeout is None else timeout
@@ -146,7 +146,7 @@ else:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(f"sage_exec exceeded {t}s")
+                raise TimeoutError(f"exec exceeded {t}s")
             try:
                 msg = kc.get_iopub_msg(timeout=min(remaining, 5.0))
             except Empty:
@@ -318,7 +318,7 @@ async def _invoke(ctx: Context, fn, *args, **kwargs):
                                       message="Sage kernel still running...")
 
 
-@mcp.tool()
+@mcp.tool(name="exec")
 async def sage_exec(ctx: Context, code: str, session: str = "default",
                     timeout: float | None = None) -> dict:
     """Run Sage code in a persistent kernel. The kernel keeps the variables of the session.
@@ -332,7 +332,7 @@ async def sage_exec(ctx: Context, code: str, session: str = "default",
     return {"stdout": stdout, "stderr": stderr, "result": result, "error": error}
 
 
-@mcp.tool()
+@mcp.tool(name="exec_notebook")
 async def sage_exec_notebook(ctx: Context, path: str, session: str = "default",
                              cells: list[int] | None = None) -> dict:
     """Run the code cells of a Jupyter notebook in a persistent kernel.
@@ -344,7 +344,7 @@ async def sage_exec_notebook(ctx: Context, path: str, session: str = "default",
     return {"path": path, "cells": await _run_nb(ctx, nb, path, session, cells)}
 
 
-@mcp.tool()
+@mcp.tool(name="write_notebook")
 async def sage_write_notebook(ctx: Context, path: str, cells: list[str],
                               run: bool = False, session: str = "default",
                               overwrite: bool = False) -> dict:
@@ -368,13 +368,13 @@ async def sage_write_notebook(ctx: Context, path: str, cells: list[str],
             "cells": await _run_nb(ctx, _load_nb(path), path, session)}
 
 
-@mcp.tool()
+@mcp.tool(name="list")
 async def sage_list(ctx: Context) -> dict:
     """List the session names."""
     return {"sessions": sorted(ctx.lifespan_context["sessions"])}
 
 
-@mcp.tool()
+@mcp.tool(name="stop")
 async def sage_stop(ctx: Context, session: str = "default") -> dict:
     """Remove a session and its variables from the kernel."""
     state = ctx.lifespan_context
@@ -388,7 +388,7 @@ async def sage_stop(ctx: Context, session: str = "default") -> dict:
     return {"dropped": session}
 
 
-@mcp.tool()
+@mcp.tool(name="interrupt")
 async def sage_interrupt(ctx: Context) -> dict:
     """Stop the running computation. The kernel keeps the variables of the session."""
     state = ctx.lifespan_context

@@ -81,14 +81,14 @@ between calls.
 
 | Tool | Purpose |
 |------|---------|
-| `sage_exec` | Run Sage code in a session namespace |
-| `sage_exec_notebook` | Run the code cells of a notebook and write the outputs into it |
-| `sage_write_notebook` | Write a Sage notebook, validate it, and optionally run it |
-| `sage_interrupt` | Stop the running computation. The kernel keeps its state |
-| `sage_list` | Show the session names that the server has used |
-| `sage_stop` | Remove a session and free its variables |
+| `exec` | Run Sage code in a session namespace |
+| `exec_notebook` | Run the code cells of a notebook and write the outputs into it |
+| `write_notebook` | Write a Sage notebook, validate it, and optionally run it |
+| `interrupt` | Stop the running computation. The kernel keeps its state |
+| `list` | Show the session names that the server has used |
+| `stop` | Remove a session and free its variables |
 
-### `sage_exec(code, session="default", timeout=None)`
+### `exec(code, session="default", timeout=None)`
 
 Runs code and returns four fields:
 
@@ -106,7 +106,7 @@ Runs code and returns four fields:
 Use the same `session` name in each call to keep the same variables. Different
 names cannot see each other.
 
-### `sage_exec_notebook(path, session="default", cells=None)`
+### `exec_notebook(path, session="default", cells=None)`
 
 Runs the code cell in order, in one namespace, and **writes the outputs into the
 notebook file**. The result looks as if a user ran the notebook: stream output,
@@ -123,7 +123,7 @@ notebook file**. The result looks as if a user ran the notebook: stream output,
 - The run stops at the first error. The report names the cell and the error.
 - The file is written through a temp file, so a failed write cannot break it.
 
-### `sage_write_notebook(path, cells, run=false, session="default", overwrite=false)`
+### `write_notebook(path, cells, run=false, session="default", overwrite=false)`
 
 Writes a notebook from a list of code strings. One string is one cell. The
 notebook gets the `sagemath` kernelspec metadata, is checked with
@@ -136,7 +136,7 @@ it is also executed.
 
 The tool does not replace an existing file unless you set `overwrite=true`.
 
-### `sage_interrupt()`
+### `interrupt()`
 
 Sends Ctrl+C to the kernel. The running call fails with `KeyboardInterrupt` and
 the session keeps its variables — the first thing to try for a runaway loop.
@@ -144,7 +144,7 @@ the session keeps its variables — the first thing to try for a runaway loop.
 The kernel has one process, so the interrupt is kernel-wide: it also stops work
 in other sessions. That follows from the one-kernel design.
 
-### `sage_list()`
+### `list()`
 
 Returns the session names that this server has used:
 
@@ -152,7 +152,7 @@ Returns the session names that this server has used:
 {"sessions": ["default", "find"]}
 ```
 
-### `sage_stop(session="default")`
+### `stop(session="default")`
 
 Removes a session and its variables from the kernel, and returns
 `{"dropped": "find"}`. Use it to free memory after a task. An unknown name
@@ -171,7 +171,7 @@ f = x^3 - 2*x + 1
 f
 ```
 
-After `sage_exec_notebook("nb.ipynb")` the file holds
+After `exec_notebook("nb.ipynb")` the file holds
 
 ```
 cell 2   execute_result   execution_count=3
@@ -256,7 +256,7 @@ folder takes about 25 s.
 ```bash
 PY=/path/to/sage/env/bin/python     # the python that install.sh found
 "$PY" test/test_config.py          # config only, no kernel, 4 tests
-"$PY" test/test_exec.py            # sage_exec and the session tools, 14 tests
+"$PY" test/test_exec.py            # exec and the session tools, 14 tests
 "$PY" test/test_notebook.py        # notebooks, 8 tests
 ```
 

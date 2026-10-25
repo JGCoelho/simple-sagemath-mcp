@@ -17,14 +17,14 @@ import _mcp
 
 
 class TestNotebook(unittest.TestCase):
-    """sage_write_notebook and sage_exec_notebook against the live kernel."""
+    """write_notebook and exec_notebook against the live kernel."""
 
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.dir)
 
     def write(self, name, cells, **kw):
-        return _mcp.call("sage_write_notebook", path=str(self.dir / name),
+        return _mcp.call("write_notebook", path=str(self.dir / name),
                          cells=cells, **kw)
 
     def read(self, name):
@@ -61,7 +61,7 @@ class TestNotebook(unittest.TestCase):
 
     def test_run_selected_cells(self):
         self.write("part.ipynb", ["c = 1", "c = 2", "c + 10"], run=False, overwrite=True)
-        r = _mcp.call("sage_exec_notebook", path=str(self.dir / "part.ipynb"),
+        r = _mcp.call("exec_notebook", path=str(self.dir / "part.ipynb"),
                       session="part", cells=[0, 2])
         self.assertEqual([c["cell"] for c in r["cells"]], [0, 2])
         nb = self.read("part.ipynb")
@@ -69,7 +69,7 @@ class TestNotebook(unittest.TestCase):
         self.assertEqual(nb.cells[2].outputs[0].data["text/plain"], "11")
 
     def test_magics_are_rejected(self):
-        err = _mcp.call_error("sage_write_notebook", path=str(self.dir / "magic.ipynb"),
+        err = _mcp.call_error("write_notebook", path=str(self.dir / "magic.ipynb"),
                               cells=["%matplotlib inline"])
         self.assertIn("IPython magics are not supported", err)
 
@@ -85,7 +85,7 @@ class TestNotebook(unittest.TestCase):
             nbformat.v4.new_code_cell("m = 4"),
             nbformat.v4.new_code_cell("m + 1")])
         nbformat.write(nb, str(self.dir / "md.ipynb"))
-        r = _mcp.call("sage_exec_notebook", path=str(self.dir / "md.ipynb"))
+        r = _mcp.call("exec_notebook", path=str(self.dir / "md.ipynb"))
         self.assertEqual([c["cell"] for c in r["cells"]], [1, 2])
         nb = self.read("md.ipynb")
         self.assertEqual(nb.cells[0].cell_type, "markdown")
@@ -93,7 +93,7 @@ class TestNotebook(unittest.TestCase):
     def test_not_a_notebook_is_an_error(self):
         bad = self.dir / "bad.json"
         bad.write_text(json.dumps({"hello": "world"}))
-        err = _mcp.call_error("sage_exec_notebook", path=str(bad))
+        err = _mcp.call_error("exec_notebook", path=str(bad))
         self.assertIsNotNone(err)
 
 
