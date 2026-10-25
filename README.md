@@ -9,6 +9,10 @@ cell.
 This is an experimental server. It is small on purpose: one file, six tools,
 no daemon.
 
+The special point of this server is **native Jupyter notebook support**: it runs
+notebook files cell by cell and writes the results back, with LaTeX and HTML
+output in the cells.
+
 ## Install
 
 ```bash
@@ -236,8 +240,8 @@ clients start the server with a **sanitized environment**.
 
 ## Requirements
 
-- SageMath 10.x. Run `./install.sh`, or set `SAGE_PYTHON` to the python of your
-  Sage install.
+- SageMath 10.x. Tested with Sage 10.8 on Linux. Run `./install.sh`, or set
+  `SAGE_PYTHON` to the python of your Sage install.
 - `fastmcp` and `nbformat`, installed into that same python (`install.sh` does
   this).
 - `jupyter_client` and `ipykernel`, which are part of the Sage environment.
@@ -261,4 +265,8 @@ The files use `unittest`, so `pytest test/` also works.
 ## Limits
 
 - No magics, no `!` shell commands.
+
+**This is not a sandbox.** The kernel runs the code that the agent sends, with
+your user permissions and access to your files. Use a container or a separate
+user if you do not trust the agent.
 
