@@ -6,29 +6,19 @@ An MCP server that gives an agent a **persistent SageMath kernel**: one warm
 Sage process, many named namespaces, and Jupyter notebooks you can run cell by
 cell.
 
-This is an experimental server. It is small on purpose: one file, four tools,
+This is an experimental server. It is small on purpose: one file, six tools,
 no daemon.
 
-## Why a persistent kernel
-
-A new Sage process takes about 1.7 s and 200 MB before it can answer `2+2`.
-Without a persistent kernel, an agent that loads a graph file, inspects it, and
-then asks for its automorphism group must load the file three times.
-
-This server starts one kernel on the first call, keeps it, and gives each
-session name its own namespace. Variables, imports, and loaded data survive
-between calls.
-
 ## Install
-
-You need SageMath 10.x. `install.sh` does the rest: it finds the python of
-your Sage, installs `fastmcp` and `nbformat` there, and prints the config block.
 
 ```bash
 git clone https://github.com/JGCoelho/simple-sagemath-mcp.git
 cd simple-sagemath-mcp
 ./install.sh
 ```
+
+You need SageMath 10.x. `install.sh` finds the python of your Sage, installs
+`fastmcp` and `nbformat` there, and prints the config block to paste.
 
 Add the block that it prints to the MCP config of your host, then restart the
 host. For pi the file is `~/.pi/agent/mcp.json`. Claude uses `.mcp.json` or
@@ -59,11 +49,25 @@ PY=/path/to/sage/env/bin/python          # the python of your Sage
 "$PY" server.py                         # starts on stdio and waits for input
 ```
 
-`SAGE_PYTHON` also lets the server itself run on a different python (for
-example under `pipx` or `uvx`). The server then starts the kernel with the
-python in `SAGE_PYTHON`.
+`SAGE_PYTHON` also lets the server itself run on a different python. The server
+then starts the kernel with the python in `SAGE_PYTHON`. `server.py` has a
+PEP 723 header, so `uv` can run it with no install step:
+
+```bash
+SAGE_PYTHON=/path/to/sage/python uv run server.py
+```
 
 The tool list is read at connect time. Start the host again after a change.
+
+## Why a persistent kernel
+
+A new Sage process takes about 1.7 s and 200 MB before it can answer `2+2`.
+Without a persistent kernel, an agent that loads a graph file, inspects it, and
+then asks for its automorphism group must load the file three times.
+
+This server starts one kernel on the first call, keeps it, and gives each
+session name its own namespace. Variables, imports, and loaded data survive
+between calls.
 
 ## Tools
 
@@ -73,19 +77,23 @@ The tool list is read at connect time. Start the host again after a change.
 | `sage_exec_notebook` | Run the code cells of a notebook and write the outputs into it |
 | `sage_write_notebook` | Write a Sage notebook, validate it, and optionally run it |
 | `sage_interrupt` | Stop the running computation. The kernel keeps its state |
+| `sage_list` | Show the session names that the server has used |
+| `sage_stop` | Remove a session and free its variables |
 
-### `sage_exec(code, session="default")`
+### `sage_exec(code, session="default", timeout=None)`
 
-Runs code and returns three fields:
+Runs code and returns four fields:
 
 ```json
-{"stdout": "", "result": "9", "error": null}
+{"stdout": "out\n", "stderr": "", "result": "9", "error": null}
 ```
 
-- `stdout` — everything the code printed.
+- `stdout` / `stderr` — what the code printed on each stream. They stay apart.
 - `result` — the value of the last expression, as text. `null` when the last
   statement is not an expression.
 - `error` — `"ZeroDivisionError: rational division by zero"`, or `null`.
+- `timeout` — seconds for this call. The default is `kernel_read_timeout` from
+  `server.json`. On a timeout the call fails and the variables stay.
 
 Use the same `session` name in each call to keep the same variables. Different
 names cannot see each other.
@@ -98,8 +106,8 @@ notebook file**. The result looks as if a user ran the notebook: stream output,
 
 ```json
 {"path": "find.ipynb",
- "cells": [{"cell": 0, "stdout": "", "result": null, "error": null},
-           {"cell": 1, "stdout": "42\n", "result": null, "error": null}]}
+ "cells": [{"cell": 0, "stdout": "", "stderr": "", "result": null, "error": null},
+           {"cell": 1, "stdout": "42\n", "stderr": "", "result": null, "error": null}]}
 ```
 
 - `cells` — run only these cell indexes, for example `[0, 2]`. Empty means all
@@ -127,6 +135,20 @@ the session keeps its variables — the first thing to try for a runaway loop.
 
 The kernel has one process, so the interrupt is kernel-wide: it also stops work
 in other sessions. That follows from the one-kernel design.
+
+### `sage_list()`
+
+Returns the session names that this server has used:
+
+```json
+{"sessions": ["default", "find"]}
+```
+
+### `sage_stop(session="default")`
+
+Removes a session and its variables from the kernel, and returns
+`{"dropped": "find"}`. Use it to free memory after a task. An unknown name
+returns `{"error": "no such session: find"}`.
 
 ## Notebook support
 
@@ -187,10 +209,12 @@ multi-line input, and the Jupyter notebook output format for free.
 - **One kernel.** All calls are serialized by one lock. A 3 s job in one session
   delays a call in another session. This is deliberate: one kernel uses 200 MB,
   and the target machine has about 3 GB free.
-- **Failure policy.** A timeout (2400 s by default) raises `TimeoutError` and
-  **keeps** the variables. A dead kernel is detected during the run (the read
-  waits in 5 s slices and checks `is_alive()`), the kernel restarts, and the
-  error says that all sessions were lost.
+- **Failure policy.** A timeout (`timeout` on the call, or 2400 s by default)
+  raises `TimeoutError` and **keeps** the variables. A dead kernel is detected
+  during the run (the read waits in 5 s slices and checks `is_alive()`), the
+  kernel restarts, and the error says that all sessions were lost. Three lines
+  that match `Gap crashed` on stderr stop the run with a `GapCrashLoop` error,
+  because GAP can start processes without limit.
 
 ## Configuration
 
@@ -221,12 +245,12 @@ with a **sanitized environment**, so these variables often do not arrive. Use
 
 Run from this directory, with the python that has `fastmcp` (`install.sh`
 prints it). The tests share one client and one kernel per file, so the whole
-folder takes about 20 s.
+folder takes about 25 s.
 
 ```bash
 PY=/path/to/sage/env/bin/python     # the python that install.sh found
-"$PY" test/test_config.py          # config only, no kernel
-"$PY" test/test_exec.py            # sage_exec, 10 tests
+"$PY" test/test_config.py          # config only, no kernel, 6 tests
+"$PY" test/test_exec.py            # sage_exec and the session tools, 14 tests
 "$PY" test/test_notebook.py        # notebooks, 8 tests
 ```
 
@@ -235,8 +259,8 @@ The files use `unittest`, so `pytest test/` also works.
 ## Limits
 
 - No magics, no `!` shell commands.
-- A session namespace is never freed. Many different session names grow the
-  kernel memory. There is no `sage_drop` tool yet.
+- A session stays in the kernel until `sage_stop` or the end of the server. Many
+  different session names grow the kernel memory.
 - An interrupt that arrives just after a timeout can hit the next call.
 - `sage_exec` gives the plain text value only. LaTeX and HTML are for notebooks.
 - Stored error outputs keep the ANSI colours of the kernel traceback.
@@ -244,6 +268,7 @@ The files use `unittest`, so `pytest test/` also works.
 ## Inspiration
 
 The tool surface follows [szeider/mcp-sage](https://github.com/szeider/mcp-sage)
-(`sage_exec`, `sage_interrupt`, Jupyter kernel protocol, injected `KernelSpec`).
-The differences are: Sage preparse on every call, one kernel with named
-namespaces instead of one kernel per session, and native notebook support.
+(`sage_exec`, `sage_interrupt`, Jupyter kernel protocol, injected `KernelSpec`,
+and the GAP crash-loop guard). The differences are: Sage preparse on every call,
+one kernel with named namespaces instead of one kernel per session, and native
+notebook support.

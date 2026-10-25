@@ -2,6 +2,7 @@
 # Run from the repo root, with the python of your Sage: python test/test_exec.py
 
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -19,15 +20,15 @@ class TestSummarise(unittest.TestCase):
         outs = [{"output_type": "stream", "name": "stdout", "text": "a\n"},
                 {"output_type": "execute_result", "data": {"text/plain": "5"},
                  "metadata": {}}]
-        self.assertEqual(_summarise(outs), ("a\n", "5", None))
+        self.assertEqual(_summarise(outs), ("a\n", "", "5", None))
 
     def test_error(self):
         outs = [{"output_type": "error", "ename": "ZeroDivisionError",
                  "evalue": "division by zero", "traceback": ["line"]}]
-        self.assertEqual(_summarise(outs), ("", None, "ZeroDivisionError: division by zero"))
+        self.assertEqual(_summarise(outs), ("", "", None, "ZeroDivisionError: division by zero"))
 
     def test_no_output(self):
-        self.assertEqual(_summarise([]), ("", None, None))
+        self.assertEqual(_summarise([]), ("", "", None, None))
 
 
 class TestExec(unittest.TestCase):
@@ -65,6 +66,38 @@ class TestExec(unittest.TestCase):
         r = _mcp.call("sage_exec", code="display(41 + 1)")
         self.assertEqual(r["result"], "42")
         self.assertIsNone(r["error"])
+
+    def test_stderr_is_separate(self):
+        r = _mcp.call("sage_exec", code="import sys\n"
+                      "print('out')\nprint('bad', file=sys.stderr)")
+        self.assertEqual(r["stdout"], "out\n")
+        self.assertEqual(r["stderr"], "bad\n")
+
+    def test_timeout_keeps_the_variables(self):
+        _mcp.call("sage_exec", code="t = 5", session="tmo")
+        err = _mcp.call_error("sage_exec", code="while True: pass",
+                              session="tmo", timeout=1)
+        self.assertIn("exceeded 1", err)
+        _mcp.call("sage_interrupt")
+        time.sleep(0.5)          # the kernel needs time to become idle again
+        self.assertEqual(_mcp.call("sage_exec", code="t * 2", session="tmo")["result"],
+                         "10")
+
+    def test_list_and_stop(self):
+        _mcp.call("sage_exec", code="s = 1", session="dropme")
+        self.assertIn("dropme", _mcp.call("sage_list")["sessions"])
+        self.assertEqual(_mcp.call("sage_stop", session="dropme"),
+                         {"dropped": "dropme"})
+        self.assertNotIn("dropme", _mcp.call("sage_list")["sessions"])
+        r = _mcp.call("sage_exec", code="s", session="dropme")
+        self.assertTrue(r["error"].startswith("NameError"))
+        self.assertEqual(_mcp.call("sage_stop", session="ghost"),
+                         {"error": "no such session: ghost"})
+
+    def test_gap_crash_guard(self):
+        r = _mcp.call("sage_exec", code="import sys\n"
+                      "for i in range(3): print('Gap crashed', file=sys.stderr)")
+        self.assertIn("GapCrashLoop", r["error"])
 
 
 if __name__ == "__main__":

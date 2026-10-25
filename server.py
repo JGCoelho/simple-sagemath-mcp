@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["fastmcp", "nbformat", "jupyter_client", "ipykernel"]
+# ///
 # Run:      python server.py     (the python of your Sage install, see install.sh)
 # Install:  ./install.sh
 
 import asyncio
 import json
 import os
+import re
 import time
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -43,6 +48,10 @@ class Config:
         return cls(**data)     
 
 CFG = Config.load()
+
+# GAP can crash the kernel again and again. Stop after a few crashes.
+GAP_CRASH_PATTERN = re.compile(r"Gap crashed|Restarting Gap", re.IGNORECASE)
+GAP_CRASH_LIMIT = 3
 
 
 # --- kernel ------------------------------------------------------------------
@@ -96,8 +105,10 @@ def _reset_kernel(state: dict) -> None:
 # Do not use ctx.session_id: with the default protocol it changes on each call.
 
 def _execute_sync(state: dict, code: str, session: str = "default",
-                  filename: str = "<sage_exec>") -> list[dict]:
+                  filename: str = "<sage_exec>", *, timeout: float | None = None
+                  ) -> list[dict]:
     """Run code in one session namespace. Return the outputs in notebook order."""
+    t = timeout or CFG.kernel_read_timeout
     km, kc = state["km"], state["kc"]
     if not km.is_alive():
         _reset_kernel(state)
@@ -133,14 +144,15 @@ else:
     exec(compile(_mcp_tree, {filename!r}, "exec"), _mcp_ns, _mcp_ns)
 """
 
-    deadline = time.monotonic() + CFG.kernel_read_timeout
+    deadline = time.monotonic() + t
     outs: list[dict] = []
+    gap_crashes = 0
     try:
         msg_id = kc.execute(wrapper, allow_stdin=False)
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise TimeoutError(f"sage_exec exceeded {CFG.kernel_read_timeout}s")
+                raise TimeoutError(f"sage_exec exceeded {t}s")
             try:
                 msg = kc.get_iopub_msg(timeout=min(remaining, 5.0))
             except Empty:
@@ -150,22 +162,32 @@ else:
                 continue
             if msg.get("parent_header", {}).get("msg_id") != msg_id:
                 continue
-            t = msg["header"]["msg_type"]
+            mt = msg["header"]["msg_type"]
             c = msg["content"]
-            if t == "stream":
-                outs.append({"output_type": "stream", "name": c.get("name", "stdout"),
+            if mt == "stream":
+                name = c.get("name", "stdout")
+                outs.append({"output_type": "stream", "name": name,
                              "text": c.get("text", "")})
-            elif t in ("execute_result", "display_data"):
+                if name == "stderr":
+                    gap_crashes += len(GAP_CRASH_PATTERN.findall(c.get("text", "")))
+                    if gap_crashes >= GAP_CRASH_LIMIT:
+                        km.interrupt_kernel()
+                        outs.append({"output_type": "error", "ename": "GapCrashLoop",
+                                     "evalue": "GAP crashed repeatedly. The execution "
+                                     "was interrupted to stop a runaway process.",
+                                     "traceback": []})
+                        break
+            elif mt in ("execute_result", "display_data"):
                 md = dict(c.get("metadata") or {})
                 # The wrapper marks the value of the last expression.
-                kind = "execute_result" if md.pop("_mcp_trailing", False) else t
+                kind = "execute_result" if md.pop("_mcp_trailing", False) else mt
                 outs.append({"output_type": kind, "data": c.get("data") or {},
                              "metadata": md})
-            elif t == "error":
+            elif mt == "error":
                 outs.append({"output_type": "error", "ename": c.get("ename"),
                              "evalue": c.get("evalue"),
                              "traceback": c.get("traceback") or []})
-            elif t == "status" and c.get("execution_state") == "idle":
+            elif mt == "status" and c.get("execution_state") == "idle":
                 break
     except TimeoutError:
         # The kernel is alive and busy. Keep the variables for the next call.
@@ -176,6 +198,10 @@ else:
             f"the Sage kernel failed ({type(e).__name__}: {e}). "
             "The kernel restarted. All sessions lost."
         ) from e
+
+    if gap_crashes >= GAP_CRASH_LIMIT:
+        # The kernel may not send the reply after the interrupt. Do not wait.
+        return outs
 
     try:
         drain_deadline = time.monotonic() + CFG.shell_drain_timeout
@@ -189,14 +215,17 @@ else:
     return outs
 
 
-def _summarise(outs: list[dict]) -> tuple[str, str | None, str | None]:
-    """Make a short text view of the outputs: stdout, last value, error."""
-    stdout = "".join(o["text"] for o in outs if o["output_type"] == "stream")
+def _summarise(outs: list[dict]) -> tuple[str, str, str | None, str | None]:
+    """Make a short text view of the outputs: stdout, stderr, last value, error."""
+    def stream(name):
+        return "".join(o["text"] for o in outs
+                       if o["output_type"] == "stream" and o.get("name") == name)
+
     result = next((o["data"]["text/plain"] for o in reversed(outs)
                    if "text/plain" in o.get("data", {})), None)
     error = next((f"{o['ename']}: {o['evalue']}"
                   for o in outs if o["output_type"] == "error"), None)
-    return stdout, result, error
+    return stream("stdout"), stream("stderr"), result, error
 
 
 # --- notebooks ---------------------------------------------------------------
@@ -236,6 +265,7 @@ async def _run_nb(ctx: Context, nb, path: str, session: str,
 
     Stop at the first error.
     """
+    ctx.lifespan_context["sessions"].add(session)
     count = max([c.get("execution_count") or 0 for c in nb.cells] + [0])
     report = []
     for i, cell in enumerate(nb.cells):
@@ -256,8 +286,9 @@ async def _run_nb(ctx: Context, nb, path: str, session: str,
                 o["execution_count"] = count
         cell.outputs = [nbformat.from_dict(o) for o in outs]
         cell.execution_count = count
-        stdout, result, error = _summarise(outs)
-        report.append({"cell": i, "stdout": stdout, "result": result, "error": error})
+        stdout, stderr, result, error = _summarise(outs)
+        report.append({"cell": i, "stdout": stdout, "stderr": stderr,
+                       "result": result, "error": error})
         if error:
             break
     if report:
@@ -270,7 +301,7 @@ async def _run_nb(ctx: Context, nb, path: str, session: str,
 @lifespan
 async def sage_lifespan(server):
     # The kernel starts on the first call. Nothing starts at connect time.
-    state = {"km": None, "kc": None}
+    state = {"km": None, "kc": None, "sessions": set()}
     try:
         yield state
     finally:
@@ -297,14 +328,17 @@ async def _invoke(ctx: Context, fn, *args, **kwargs):
 
 
 @mcp.tool()
-async def sage_exec(ctx: Context, code: str, session: str = "default") -> dict:
+async def sage_exec(ctx: Context, code: str, session: str = "default",
+                    timeout: float | None = None) -> dict:
     """Run Sage code in a persistent kernel. The kernel keeps the variables of the session.
 
-    Use the same session name in each call to keep the same variables.
+    Use the same session name in each call to keep the same variables. Set `timeout`
+    in seconds to stop a slow call. A timeout keeps the variables.
     """
-    outs = await _invoke(ctx, _execute_sync, code, session)
-    stdout, result, error = _summarise(outs)
-    return {"stdout": stdout, "result": result, "error": error}
+    ctx.lifespan_context["sessions"].add(session)
+    outs = await _invoke(ctx, _execute_sync, code, session, timeout=timeout)
+    stdout, stderr, result, error = _summarise(outs)
+    return {"stdout": stdout, "stderr": stderr, "result": result, "error": error}
 
 
 @mcp.tool()
@@ -341,6 +375,26 @@ async def sage_write_notebook(ctx: Context, path: str, cells: list[str],
     # Read the file again. This proves that what is on disk is a valid notebook.
     return {"path": path, "valid": True,
             "cells": await _run_nb(ctx, _load_nb(path), path, session)}
+
+
+@mcp.tool()
+async def sage_list(ctx: Context) -> dict:
+    """List the session names."""
+    return {"sessions": sorted(ctx.lifespan_context["sessions"])}
+
+
+@mcp.tool()
+async def sage_stop(ctx: Context, session: str = "default") -> dict:
+    """Remove a session and its variables from the kernel."""
+    state = ctx.lifespan_context
+    if session not in state["sessions"]:
+        return {"error": f"no such session: {session}"}
+    ns = f"__mcp_sage_ns__{session}"
+    # The code runs in the namespace itself. Use the kernel globals via __main__.
+    code = f"import __main__; __main__.__dict__.pop({ns!r}, None)"
+    await _invoke(ctx, _execute_sync, code)
+    state["sessions"].discard(session)
+    return {"dropped": session}
 
 
 @mcp.tool()
