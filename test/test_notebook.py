@@ -1,5 +1,5 @@
-#!/usr/bin/env -S sage -python
-# Run from the workspace root:  sage -python test/test_notebook.py
+#!/usr/bin/env python3
+# Run from the repo root, with the python of your Sage: python test/test_notebook.py
 
 import json
 import shutil

@@ -1,6 +1,6 @@
-#!/usr/bin/env -S sage -python
-# Run:      sage -python server.py
-# One-time: sage -python -m pip install fastmcp
+#!/usr/bin/env python3
+# Run:      python server.py     (the python of your Sage install, see install.sh)
+# Install:  ./install.sh
 
 import asyncio
 import json
@@ -51,18 +51,19 @@ _kernel_lock = asyncio.Lock()
 
 def _start_kernel() -> tuple[KernelManager, BlockingKernelClient]:
     import sys
-    # The real argv is set below, so the kernelspec name is not important.
-    # "python3" is installed by ipykernel in every conda env.
+    # The kernel must be Sage. SAGE_PYTHON lets the server run on another python.
+    py = os.environ.get("SAGE_PYTHON") or sys.executable
     km = KernelManager(kernel_name="python3")
     km._kernel_spec = KernelSpec(
-        argv=[sys.executable, "-m", "ipykernel_launcher",
+        argv=[py, "-m", "ipykernel_launcher",
               "-f", "{connection_file}"],
         display_name="SageMath (conda)",
         language="sage",
     )
-    # Put the conda env bin first. Sage finds Singular and other programs there.
+    # Put the bin directory of the kernel python first. Sage finds Singular and
+    # other programs there.
     env = dict(os.environ)
-    env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
+    env["PATH"] = os.path.dirname(py) + os.pathsep + env.get("PATH", "")
     km.start_kernel(env=env)
     kc = km.blocking_client()
     try:

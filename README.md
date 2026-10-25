@@ -19,36 +19,51 @@ This server starts one kernel on the first call, keeps it, and gives each
 session name its own namespace. Variables, imports, and loaded data survive
 between calls.
 
-## Quickstart
+## Install
 
-The server needs the Sage environment. It uses that environment as the kernel
-interpreter, so a plain `python3` is not sufficient.
+You need SageMath 10.x. `install.sh` does the rest: it finds the python of
+your Sage, installs `fastmcp` and `nbformat` there, and prints the config block.
 
 ```bash
-# one-time
-sage -python -m pip install fastmcp nbformat
-
-# run it directly (stdio transport)
-sage -python server.py
+git clone https://github.com/JGCoelho/simple-sagemath-mcp.git
+cd simple-sagemath-mcp
+./install.sh
 ```
 
-MCP host config. The server key and the exposure field are specific to pi;
-other hosts only need `command` and `args`:
+Add the block that it prints to the MCP config of your host, then restart the
+host. For pi the file is `~/.pi/agent/mcp.json`. Claude uses `.mcp.json` or
+`~/.claude.json`:
 
 ```json
 {
   "mcpServers": {
-    "experimental": {
-      "command": "/home/you/miniconda3/envs/sageenv/bin/python",
-      "args": ["/home/you/.pi/agent/test-mcp/server.py"],
-      "exposure": "direct"
+    "sage": {
+      "command": "/path/to/sage/env/bin/python",
+      "args": ["/path/to/simple-sagemath-mcp/server.py"]
     }
   }
 }
 ```
 
-Start the host after you change this file. The tool list is read at connect
-time.
+If the script cannot find Sage, give the interpreter yourself:
+
+```bash
+SAGE_PYTHON=/opt/sage/local/bin/python3 ./install.sh
+```
+
+A manual install is three steps:
+
+```bash
+PY=/path/to/sage/env/bin/python          # the python of your Sage
+"$PY" -m pip install fastmcp nbformat   # one time
+"$PY" server.py                         # starts on stdio and waits for input
+```
+
+`SAGE_PYTHON` also lets the server itself run on a different python (for
+example under `pipx` or `uvx`). The server then starts the kernel with the
+python in `SAGE_PYTHON`.
+
+The tool list is read at connect time. Start the host again after a change.
 
 ## Tools
 
@@ -152,9 +167,9 @@ subprocess with a hand-made pipe. That gives clean streams, a real interrupt,
 multi-line input, and the Jupyter notebook output format for free.
 
 - **Kernel start.** One `KernelManager` with an injected `KernelSpec` runs
-  `sys.executable -m ipykernel_launcher`. The `bin` directory of that
-  interpreter goes first in `PATH`, so Sage finds `Singular` and other helper
-  programs.
+  `SAGE_PYTHON` (or `sys.executable`) with `-m ipykernel_launcher`. The `bin`
+  directory of that interpreter goes first in `PATH`, so Sage finds `Singular`
+  and other helper programs.
 - **Lazy start.** Nothing starts at connect time. The kernel starts on the first
   call, under one `asyncio.Lock`. Connect takes about 2 s; the first call pays
   the kernel start.
@@ -195,19 +210,24 @@ with a **sanitized environment**, so these variables often do not arrive. Use
 
 ## Requirements
 
-- SageMath 10.x, with `fastmcp` and `nbformat` installed in that environment
-- `jupyter_client` and `ipykernel`, which are part of the Sage environment
-- Python 3.10 or newer
+- SageMath 10.x. Run `./install.sh`, or set `SAGE_PYTHON` to the python of your
+  Sage install.
+- `fastmcp` and `nbformat`, installed into that same python (`install.sh` does
+  this).
+- `jupyter_client` and `ipykernel`, which are part of the Sage environment.
+- Python 3.10 or newer.
 
 ## Tests
 
-Run from this directory. The tests share one client and one kernel per file, so
-the whole folder takes about 20 s.
+Run from this directory, with the python that has `fastmcp` (`install.sh`
+prints it). The tests share one client and one kernel per file, so the whole
+folder takes about 20 s.
 
 ```bash
-sage -python test/test_config.py      # config only, no kernel
-sage -python test/test_exec.py        # sage_exec, 10 tests
-sage -python test/test_notebook.py    # notebooks, 8 tests
+PY=/path/to/sage/env/bin/python     # the python that install.sh found
+"$PY" test/test_config.py          # config only, no kernel
+"$PY" test/test_exec.py            # sage_exec, 10 tests
+"$PY" test/test_notebook.py        # notebooks, 8 tests
 ```
 
 The files use `unittest`, so `pytest test/` also works.
