@@ -12,10 +12,9 @@ venv/
 *.swp
 *.bak
 
-# development log, kept locally only
-PLAN.md
-
-# local implementation workflow (see .workflow/)
+# local design docs and workflow notes, kept locally only (README is public)
+*.md
+!README.md
 .workflow/
 # notebooks executed while testing the examples
 *.out.ipynb
