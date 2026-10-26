@@ -1516,6 +1516,9 @@ async def sage_exec(
     `timeout` (seconds, default 2400) bounds this call only. On expiry the call
     returns error code `timeout`; the kernel keeps computing and the namespace
     is kept, so call `interrupt` to stop the work or `restart` to discard it.
+    Plots: a Sage `Graphics` object is not an image here (it reprs as a
+    PGF/LaTeX blob), so a picture needs `P.save('p.png')` plus, in a notebook,
+    `display(Image(filename='p.png'))`.
     """
     state = ctx.lifespan_context
     try:
@@ -1569,6 +1572,10 @@ async def sage_nb_run(
     Truncation: the returned inline outputs are cut at the per-call budget, with
     `truncated:true` and the cut cells returned as `outputs:[]`. The file always
     holds the full outputs; read them back with `nb_read`.
+    Plots: a cell ending in a `Graphics` object saves a PGF/LaTeX blob, not an
+    image; to embed a picture, end the cell with `P.save('p.png')` +
+    `display(Image(filename='p.png'))`, and crop with
+    `P.set_axes_range(ymin=…, ymax=…)` where a divergent curve flattens the rest.
     """
     state = ctx.lifespan_context
     async with _nb_lock:
