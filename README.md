@@ -46,8 +46,8 @@ cd simple-sagemath-mcp
 
 If `sage` is not on `PATH`, name it: `SAGE_BIN=/opt/sage/sage ./install.sh`.
 
-_If any of this gives you trouble, hand it over: paste this README to your coding agent and ask it
-to install the server and write the config._ It can run the commands, find the python of your Sage,
+_**If any of this gives you trouble, hand it over: paste this README to your coding agent and ask it
+to install the server and write the config.**_ It can run the commands, find the python of your Sage,
 and check that the host starts the server.
 
 Note: The two pip routes put a `simple-sagemath-mcp` console script next to the `sage` executable; it
