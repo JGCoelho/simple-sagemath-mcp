@@ -583,6 +583,54 @@ class TestNbEdit(NotebookTestCase):
         self.assertTrue(r["saved"])
 
 
+class TestErrorDetail(unittest.TestCase):
+    """`error.details` must be plain text about the user's code, not the server's."""
+
+    # The shape IPython actually produces, with its colours and with the frame
+    # of the generated wrapper (`_mcp_last`, `_mcp_value`, ...).
+    TRACEBACK = [
+        "\u001b[0;31m--------------------------------------------------------------\u001b[0m",
+        "\u001b[0;31mZeroDivisionError\u001b[0m    Traceback (most recent call last)",
+        "Cell \u001b[0;32mIn[3], line 11\u001b[0m\n"
+        "\u001b[1;32m      9\u001b[0m _mcp_last = _mcp_ast.Expression("
+        "_mcp_tree.body.pop().value)\n"
+        "\u001b[0;32m---> 11\u001b[0m _mcp_value = eval(compile(_mcp_last, "
+        "'ipynb:abc', \"eval\"), _mcp_ns, _mcp_ns)",
+        "File \u001b[0;32m/tmp/x.ipynb:abc:2\u001b[0m\n",
+        "File \u001b[0;32m~/sage/rings/integer.pyx:2128\u001b[0m, "
+        "in \u001b[0;36mInteger.__truediv__\u001b[0m\n",
+        "\u001b[0;31mZeroDivisionError\u001b[0m: rational division by zero",
+    ]
+
+    def test_wrapper_frames_and_colours_are_removed(self):
+        text = server._clean_traceback(self.TRACEBACK)
+        self.assertNotIn("_mcp_", text)
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("In[3]", text)
+        # The exception, the user's frame and the library frame stay.
+        self.assertTrue(text.startswith("ZeroDivisionError"))
+        self.assertIn("/tmp/x.ipynb:abc:2", text)
+        self.assertIn("integer.pyx:2128", text)
+        self.assertTrue(text.endswith("ZeroDivisionError: rational division by zero"))
+
+    def test_cell_detail_is_one_prefixed_block(self):
+        outs = [{"output_type": "stream", "name": "stdout", "text": "x\n"},
+                {"output_type": "error", "ename": "ZeroDivisionError",
+                 "evalue": "rational division by zero",
+                 "traceback": self.TRACEBACK}]
+        detail = server._cell_error_detail("abc", outs)
+        self.assertTrue(detail.startswith("abc: ZeroDivisionError"))
+        self.assertNotIn("_mcp_", detail)
+        self.assertNotIn("\x1b", detail)
+
+    def test_falls_back_to_the_exception_line(self):
+        # A traceback that is nothing but wrapper frames must not leave "".
+        outs = [{"output_type": "error", "ename": "ValueError", "evalue": "boom",
+                 "traceback": ["Cell In[2], line 10\n _mcp_ns"]}]
+        self.assertEqual(server._cell_error_detail("c1", outs),
+                         "c1: ValueError: boom")
+
+
 class TestNotebookSchemas(unittest.TestCase):
     """Every notebook schema is closed, requires error, and matches its builder."""
 

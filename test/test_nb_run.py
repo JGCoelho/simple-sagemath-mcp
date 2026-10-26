@@ -108,6 +108,9 @@ class TestNbRun(unittest.TestCase):
         self.assertEqual(r["error"]["code"], "cell_execution_failed")
         self.assertIn("NameError", r["error"]["details"])
         self.assertIn("first", r["error"]["details"])
+        # The detail is the user's traceback, not the generated wrapper's.
+        self.assertNotIn("_mcp_", r["error"]["details"])
+        self.assertNotIn("\x1b", r["error"]["details"])
         self.assertTrue(r["saved"])
         self.assertEqual([c["cell_id"] for c in r["cells"]], ["first"])
 
