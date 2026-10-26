@@ -1669,18 +1669,17 @@ async def sage_nb_write(
             description="Replace an existing file. Default false.")] = False) -> dict:
     """Create a new notebook from cells, validate it, and write it atomically.
 
-    **Document your work with it: a notebook is the artifact another agent — or
-    you after a restart — can read with `nb_read`, rerun with `nb_run`, and pick
-    up from. Put the steps that mattered and the values that matter into cells,
-    so they do not live only in the chat.**
+    A *notebook is a SageMath artifact another agent, or
+    you after a restart, can pick up from* (read with `nb_read`, rerun with
+    `nb_run`). Put the steps that mattered and the values that matter into cells,
+    so they do not live only in the chat.
 
     State: writes the file at `path` at nbformat 4.5, so every cell has an id;
     the ids are returned in `cell_ids` and can go straight into `nb_edit`.
     Metadata is the Sage kernelspec. It never touches the kernel namespace.
-    Never: it does not execute anything (use `nb_run`), never creates parent
-    directories, and never creates or truncates the file on a validation or
-    write failure. Without `overwrite:true`, an existing file returns `exists`
-    and is left byte-identical.
+    Never: it never creates parent directories, and never creates or truncates
+    the file on a validation or write failure. Without `overwrite:true`,
+    an existing file returns `exists` and is left byte-identical.
     """
     async with _nb_lock:
         try:
