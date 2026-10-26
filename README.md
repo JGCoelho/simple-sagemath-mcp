@@ -135,7 +135,10 @@ Runs a notebook as a user would, then returns what it wrote.
    **leave the kernel running and warm** with the notebook's variables.
 
 A notebook with no code cell is not written: `saved:false`, `truncated:false`,
-`cells:[]`. `nb_run` never creates a file.
+`cells:[]`. `nb_run` never creates a file. If the kernel dies mid-run, the
+outputs of the cells that already ran are still written (`saved:true`,
+`kernel_died`); if a cell exceeds the kernel read budget, the call stops with
+`cell_execution_failed` and keeps what that cell had already printed.
 
 The inline outputs are cut at the 20000-character budget by whole outputs: the
 first output that would exceed it clears that cell's and every later cell's
@@ -166,7 +169,9 @@ kernel. Without `cell_ids` it returns all cells in notebook order; with
 fails the whole call with `unknown_cell_id` and the id in `details`.
 
 Each cell is `{cell_id, cell_type, source}`; code cells also carry the full
-`outputs` stored on disk. `nbformat` and `nbformat_minor` are the values **on
+`outputs` stored on disk. A notebook that is not UTF-8, or one whose cell text
+cannot be sent as UTF-8 (a lone surrogate from a JSON `\ud800` escape), is
+`invalid_notebook`: it cannot cross the protocol intact. `nbformat` and `nbformat_minor` are the values **on
 disk**: a 4.4 file reports `4` and `4` even though its cells get in-memory ids
 so they can be addressed.
 
@@ -192,10 +197,17 @@ byte-identical, and `error.details` starts with `op <zero-based index> (<op>):`.
 
 ### `interrupt()`
 
-Sends the kernel's interrupt request. `interrupted` is true only if the kernel
-is alive and a call is running; on an idle kernel it is a no-op returning
-false. The namespace is untouched, so variables survive; the interrupted call
-returns `cell_execution_failed` with `KeyboardInterrupt` in `details`.
+Sends the kernel's interrupt request. `interrupted` is true when the kernel may
+be computing and the request was sent; on an idle kernel with no call in flight
+it is a no-op returning false. The namespace is untouched, so variables
+survive; the interrupted call returns `cell_execution_failed` with
+`KeyboardInterrupt` in `details`.
+
+The server tracks one flag, not the kernel's real state, so there is one case
+where `interrupted` is true for a computation that has already ended: after a
+`timeout`, the abandoned computation may finish on its own, and the flag stays
+true until a later call completes or the kernel is restarted. The interrupt
+itself is harmless in that window.
 
 ### `restart()`
 
@@ -213,7 +225,7 @@ Every tool returns the same envelope. `error` is `null` on success. On failure
 it is an object with `code` (the class), `message` (one sentence), and
 `details` (a traceback, the offending cell id, or the op index; or `null`).
 The three writing tools also return `saved`: true means this call wrote the
-file. No domain failure is ever raised as an exception.
+file (a no-op edit still writes it). No domain failure is ever raised as an exception.
 
 | Code | Meaning | Tools |
 |------|---------|-------|
@@ -221,7 +233,7 @@ file. No domain failure is ever raised as an exception.
 | `cell_execution_failed` | the code raised (includes `KeyboardInterrupt` and a GAP abort) | `exec`, `nb_run` |
 | `timeout` | the per-call budget expired; the kernel may still compute, the namespace is kept | `exec` |
 | `gap_crash_loop` | GAP crashed three times in one call; the call was interrupted | `exec` |
-| `kernel_died` | the kernel died; the namespace was lost and is not restarted automatically | `exec`, `nb_run`, `restart`, `interrupt` |
+| `kernel_died` | the kernel died; the namespace was lost and is not restarted automatically | `exec`, `nb_run`, `restart` |
 | `sage_not_found` | `SAGE_BIN` / `sage` on `PATH` did not resolve to a usable install | `exec`, `nb_run`, `restart` |
 | `not_found` | the notebook file does not exist | `nb_run`, `nb_read`, `nb_edit` |
 | `exists` | the target exists and `overwrite` is false | `nb_write` |

@@ -318,6 +318,64 @@ class TestNbRead(NotebookTestCase):
         self.assertTrue(r["cells"][0]["cell_id"])
         self.assertEqual(digest(p), before)
 
+    def test_legacy_ids_are_stable_across_reads(self):
+        # Regression: random ids per load made `nb_read` -> `nb_edit` fail.
+        p = self.path("legacy44-ids.ipynb")
+        raw_notebook(p, [code_cell("a = 1", "x"), code_cell("a + 1", "y")],
+                     minor=4)
+        data = json.loads(Path(p).read_text())
+        for cell in data["cells"]:
+            del cell["id"]
+        Path(p).write_text(json.dumps(data))
+        first = _mcp.call("nb_read", path=p)
+        second = _mcp.call("nb_read", path=p)
+        ids = [c["cell_id"] for c in first["cells"]]
+        self.assertEqual(ids, [c["cell_id"] for c in second["cells"]])
+        self.assertEqual(len(set(ids)), 2)
+        # The documented chain works: those ids address the same cells.
+        e = _mcp.call("nb_edit", path=p, ops=[
+            {"op": "edit", "cell_id": ids[1], "source": "a + 2"}])
+        self.assertIsNone(e["error"])
+        self.assertTrue(e["saved"])
+        self.assertEqual(digest(p), digest(p))
+        back = _mcp.call("nb_read", path=p, cell_ids=[ids[1]])
+        self.assertEqual(back["cells"][0]["source"], "a + 2")
+
+    def test_40_reports_disk_version(self):
+        # F8: the on-disk minor is 0, not the 4 that `reads` would invent.
+        p = self.path("legacy40.ipynb")
+        raw_notebook(p, [code_cell("1")], minor=0)
+        data = json.loads(Path(p).read_text())
+        del data["cells"][0]["id"]
+        Path(p).write_text(json.dumps(data))
+        r = _mcp.call("nb_read", path=p)
+        self.assertIsNone(r["error"])
+        self.assertEqual((r["nbformat"], r["nbformat_minor"]), (4, 0))
+
+    def test_non_utf8_file_is_invalid_notebook(self):
+        # Regression (REVIEW-1 F5): it used to escape as `internal`.
+        p = self.path("latin1.ipynb")
+        Path(p).write_bytes(b'{"nbformat": 4, "cells": ["caf\xe9"]}')
+        r = _mcp.call("nb_read", path=p)
+        self.assertEqual(r["error"]["code"], "invalid_notebook")
+        self.assertIn("UTF-8", r["error"]["message"])
+
+    def test_lone_surrogate_cell_is_invalid_notebook(self):
+        # A `\ud800` escape is valid JSON and legal nbformat, but it cannot be
+        # encoded in a JSON-RPC response, so the notebook is refused with a
+        # declared code instead of killing the connection (REVIEW-1 F5).
+        p = self.path("surrogate.ipynb")
+        raw_notebook(p, [code_cell("1 # \ud800")])
+        before = digest(p)
+        r = _mcp.call("nb_read", path=p)
+        self.assertEqual(r["error"]["code"], "invalid_notebook")
+        self.assertIn("UTF-8", r["error"]["message"])
+        assert before == digest(p)
+        e = _mcp.call("nb_edit", path=p, ops=[{"op": "remove", "cell_id": "c0"}])
+        self.assertEqual(e["error"]["code"], "invalid_notebook")
+        self.assertEqual(e["applied"], [])
+        self.assertFalse(e["saved"])
+
     def test_outputs_only_on_code_cells(self):
         p = self.path("outputs.ipynb")
         result = {"output_type": "execute_result", "execution_count": 7,
@@ -475,6 +533,24 @@ class TestNbEdit(NotebookTestCase):
         self.assertIn("bad", r["error"]["details"])
         self.assertEqual(r["applied"], [])
         self.assertEqual(digest(p), before)
+
+    def test_preserves_mode_and_writes_through_a_symlink(self):
+        import os
+        p, ids = self._write("mode.ipynb")
+        os.chmod(p, 0o644)
+        e = _mcp.call("nb_edit", path=p, ops=[
+            {"op": "edit", "cell_id": ids[0], "source": "a = 2"}])
+        self.assertIsNone(e["error"])
+        self.assertEqual(os.stat(p).st_mode & 0o777, 0o644)
+        link = self.dir / "link.ipynb"
+        link.symlink_to(p)
+        e = _mcp.call("nb_edit", path=str(link), ops=[
+            {"op": "edit", "cell_id": ids[0], "source": "a = 3"}])
+        self.assertIsNone(e["error"])
+        self.assertTrue(link.is_symlink())
+        written = json.loads(Path(p).read_text())["cells"][0]["source"]
+        self.assertEqual("".join(written) if isinstance(written, list) else written,
+                         "a = 3")
 
     def test_edit_that_introduces_syntax_error(self):
         p, ids = self._write("introduced.ipynb")

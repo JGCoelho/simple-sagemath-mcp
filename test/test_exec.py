@@ -106,6 +106,16 @@ class TestExec(unittest.TestCase):
         self.assertLessEqual(len(r["stdout"]),
                              server.MAX_INLINE_CHARS + MARKER_SLACK)
 
+    def test_display_is_not_the_result(self):
+        # Regression: a `display(...)` in statement-only code was reported as
+        # `result`, although only a trailing expression produces one.
+        r = _mcp.call("exec", code="x = 1\ndisplay(x)")
+        self.assertIsNone(r["error"])
+        self.assertEqual(r["result"], "")
+        r = _mcp.call("exec", code="display(2)\n3")
+        self.assertIsNone(r["error"])
+        self.assertEqual(r["result"], "3")
+
     def test_no_session_param(self):
         # There is exactly one namespace: `session` is not part of the input.
         with self.assertRaises(Exception):

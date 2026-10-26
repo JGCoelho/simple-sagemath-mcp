@@ -130,6 +130,13 @@ def resolve_kernel_python() -> tuple[str, str]:
 
 _kernel_lock = asyncio.Lock()
 
+# Serializes notebook file mutations across tool calls. `nb_run` holds it
+# for the whole run, so a concurrent `nb_edit`/`nb_write` cannot land
+# between its load and its write (that was a silent lost update). Lock
+# order is always notebook lock, then kernel lock; nothing takes them the
+# other way, so the two cannot deadlock.
+_nb_lock = asyncio.Lock()
+
 
 def _stop_kernel(state: dict) -> None:
     """Stop the channels and the kernel, then forget them.
@@ -176,13 +183,30 @@ def _start_kernel(state: dict) -> None:
     # Seed the namespace now, not on the first user call. A SIGINT sent while the
     # seed is importing sage.all is deferred by the import machinery, so a runaway
     # first call would ignore `interrupt` and cost SHUTDOWN_TIMEOUT to restart.
-    _seed_namespace(state)
+    try:
+        _seed_namespace(state)
+    except BaseException:
+        # A kernel that cannot import Sage is not usable. Do not leave it running.
+        _stop_kernel(state)
+        raise
 
 
 def _ensure_kernel(state: dict) -> None:
-    """Start a kernel if there is none. Keeps a live kernel as it is."""
+    """Start a kernel if there is none. Keeps a live kernel as it is.
+
+    A start failure is reported as `KernelDied` (no ready kernel exists), the
+    same way `_restart_locked` reports it. `SageNotFound` keeps its own class,
+    because it is an install problem, not a dead kernel.
+    """
     if state["km"] is None:
-        _start_kernel(state)
+        try:
+            _start_kernel(state)
+        except SageNotFound:
+            raise
+        except Exception as e:
+            _stop_kernel(state)
+            raise KernelDied(
+                f"the kernel did not start ({type(e).__name__}: {e})") from e
 
 
 def _restart_locked(state: dict) -> None:
@@ -228,7 +252,15 @@ async def _restart(state: dict) -> None:
                 km.shutdown_kernel(now=True)
             except Exception:
                 pass
-        await _kernel_lock.acquire()
+        try:
+            await asyncio.wait_for(_kernel_lock.acquire(), SHUTDOWN_TIMEOUT)
+        except asyncio.TimeoutError:
+            # The in-flight call is stuck outside the kernel (draining, or
+            # preparing code). Do not touch the kernel from here: the call may
+            # still be using its channels, and clearing the state under it is
+            # how kernels get leaked. Report and let the caller retry.
+            raise KernelDied(
+                "a running call is still using the kernel; try again") from None
     try:
         await asyncio.to_thread(_restart_locked, state)
     finally:
@@ -341,6 +373,10 @@ def _prepare(source: str) -> str:
         if e.lineno is not None:
             detail = f"{detail} (line {e.lineno})"
         raise SourceError(detail) from None
+    except UnicodeError as e:
+        # A lone surrogate can come out of a JSON \uD800 escape and is not valid
+        # source. It is a property of the source, so `invalid_source` is right.
+        raise SourceError(f"the source is not valid Unicode ({e})") from None
     return prepared
 
 
@@ -388,9 +424,24 @@ def _seed_namespace(state: dict) -> None:
     Done at kernel start, so no user call pays the import and no user call can be
     during it (SIGINT is deferred inside the import, which would make `interrupt`
     a no-op). `prepared=""` skips the server-side preparse, so this module still
-    imports no Sage. Never starts a kernel.
+    imports no Sage. Raises `SageNotFound` when the kernel cannot import Sage (a
+    broken install or a wrong python), and `KernelDied` when the seed itself
+    fails or is interrupted: a kernel that cannot seed is not a usable kernel, so
+    the caller must stop it. Never starts a kernel and never writes a file.
     """
-    _run_source(state, "", "<seed>", prepared="")
+    try:
+        outs = _run_source(state, "", "<seed>", prepared="")
+    except KeyboardInterrupt:
+        raise KernelDied("the namespace seed was interrupted") from None
+    detail = _summarise(outs)[3]
+    if detail is not None:
+        text = "".join(
+            line for out in outs if out.get("output_type") == "error"
+            for line in (out.get("traceback") or []))
+        reason = text.strip().splitlines()[-1] if text.strip() else detail
+        raise SageNotFound(
+            "The kernel python cannot import SageMath, so the kernel has no Sage. "
+            f"Check SAGE_BIN. ({reason})")
 
 
 def _drain_shell(kc: BlockingKernelClient, msg_id: str) -> None:
@@ -498,10 +549,12 @@ def _run_source(state: dict, source: str, filename: str, *,
                              "traceback": content.get("traceback") or []})
             elif mtype == "status" and content.get("execution_state") == "idle":
                 break
-    except ExecTimeout:
+    except ExecTimeout as e:
         # The kernel is still computing. Keep busy set, so `interrupt` can reach
-        # it; the next successful call clears it again.
+        # it (the flag means "may be computing"; it clears on the next completed
+        # call or a restart). Keep the partial outputs for a notebook caller.
         timed_out = True
+        e.outputs = outs
         raise
     finally:
         state["busy"] = timed_out
@@ -515,16 +568,19 @@ def _run_source(state: dict, source: str, filename: str, *,
 def _summarise(outs: list[dict]) -> tuple[str, str, str | None, str | None]:
     """Pure: make the short text view of outputs.
 
-    Return `(stdout, stderr, last text/plain value or None, "Ename: evalue" or
-    None)`. Reads the raw text/plain of the last result, so the caller decides
-    on truncation.
+    Return `(stdout, stderr, last trailing value or None, "Ename: evalue" or
+    None)`. The trailing value is the `text/plain` of an `execute_result`, which
+    only the wrapper's trailing-expression display produces; a `display(...)` in
+    user code is a `display_data` and is never reported as the result. So a
+    statement-only source has no result, even when it displays something. Pure.
     """
     def stream(name):
         return "".join(o["text"] for o in outs
                        if o["output_type"] == "stream" and o.get("name") == name)
 
     result = next((o["data"]["text/plain"] for o in reversed(outs)
-                   if "text/plain" in o.get("data", {})), None)
+                   if o.get("output_type") == "execute_result"
+                   and "text/plain" in o.get("data", {})), None)
     error = next((f"{o['ename']}: {o['evalue']}"
                   for o in outs if o["output_type"] == "error"), None)
     return stream("stdout"), stream("stderr"), result, error
@@ -651,20 +707,58 @@ def _check_ids(nb) -> None:
         seen.add(cid)
 
 
+def _legacy_id(index: int, seen: set[str]) -> str:
+    """Return a deterministic id for the id-less cell at `index`, unused in `seen`.
+
+    Deterministic on purpose: a pre-4.5 notebook is upgraded in memory on every
+    load, so random ids would make a `nb_read` → `nb_edit` chain fail with
+    `unknown_cell_id`. Pure.
+    """
+    candidate = f"cell-{index}"
+    n = 2
+    while candidate in seen:
+        candidate = f"cell-{index}-{n}"
+        n += 1
+    return candidate
+
+
 def _upgrade_ids(nb) -> None:
     """Upgrade a pre-4.5 notebook in memory: set 4.5 and mint missing ids.
 
-    The file is not touched. Ids are seeded explicitly rather than through
-    `normalize`, so nothing else in the notebook is rewritten. Never writes.
+    The file is not touched. Ids are seeded explicitly (deterministically, see
+    `_legacy_id`) rather than through `normalize`, so nothing else in the
+    notebook is rewritten and two loads of the same file give the same ids.
+    Never writes.
     """
     seen = {c.get("id") for c in nb.cells if isinstance(c.get("id"), str)}
     nb.nbformat_minor = NOTEBOOK_MINOR
-    for cell in nb.cells:
+    for index, cell in enumerate(nb.cells):
         cid = cell.get("id")
         if not isinstance(cid, str) or not cid:
-            cid = _fresh_id(seen)
+            cid = _legacy_id(index, seen)
             cell["id"] = cid
         seen.add(cid)
+
+
+def _check_text(nb) -> None:
+    """Reject a notebook whose cells cannot be sent as UTF-8 text. Pure.
+
+    A JSON `\\ud800` escape is legal JSON and legal nbformat, but a lone
+    surrogate cannot be encoded in the JSON-RPC response, so returning such a
+    cell would break the connection. Refusing the notebook with a declared code
+    is the only safe answer. Never changes the notebook.
+    """
+    for index, cell in enumerate(nb.cells):
+        source = cell.get("source") or ""
+        if isinstance(source, list):
+            source = "".join(source)
+        try:
+            source.encode("utf-8")
+        except UnicodeEncodeError as e:
+            raise NotebookError(
+                "invalid_notebook",
+                "A cell contains text that cannot be sent as UTF-8.",
+                f"cell {index} ({cell.get('id')}): {e}") from None
 
 
 def _load_nb(path: str) -> tuple[Any, int, int]:
@@ -672,21 +766,28 @@ def _load_nb(path: str) -> tuple[Any, int, int]:
 
     Returns `(nb, on_disk_nbformat, on_disk_nbformat_minor)`: the notebook is
     upgraded in memory to 4.5 with unique cell ids, while the two integers are
-    the values actually stored on disk. Raises `NotebookError` with `not_found`
-    when the file is absent and `invalid_notebook` when it is not JSON, is not
-    schema-valid, or has missing/duplicate cell ids. Reads only; never writes,
-    never executes, and never checks for magics or syntax (that is
-    `_validate_cells`).
+    the values actually stored on disk (3/0 and 4/0 for a v3/4.0 file, not the
+    version `nbformat.reads` converts to). Raises `NotebookError` with
+    `not_found` when the file is absent or unreadable and `invalid_notebook`
+    when it is not UTF-8, not JSON, is not schema-valid, or has
+    missing/duplicate cell ids. Reads only; never writes, never executes, and
+    never checks for magics or syntax (that is `_validate_cells`).
     """
     p = Path(path)
     try:
-        text = p.read_text(encoding="utf-8")
+        data = p.read_bytes()
     except FileNotFoundError:
         raise NotebookError(
             "not_found", "The notebook file does not exist.", str(path)) from None
     except OSError as e:
         raise NotebookError(
             "not_found", "The notebook file cannot be read.",
+            f"{type(e).__name__}: {e}") from None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise NotebookError(
+            "invalid_notebook", "The notebook file is not UTF-8 text.",
             f"{type(e).__name__}: {e}") from None
     try:
         raw = json.loads(text)
@@ -698,10 +799,14 @@ def _load_nb(path: str) -> tuple[Any, int, int]:
         raise NotebookError(
             "invalid_notebook", "The file is not a notebook object.",
             type(raw).__name__)
-    minor = raw.get("nbformat_minor")
-    if not isinstance(minor, int):
-        minor = 4
-    if minor >= NOTEBOOK_MINOR:
+    disk_format = raw.get("nbformat")
+    disk_minor = raw.get("nbformat_minor")
+    if not isinstance(disk_format, int) or not isinstance(disk_minor, int):
+        raise NotebookError(
+            "invalid_notebook",
+            "The notebook does not declare its nbformat version.",
+            f"nbformat={disk_format!r}, nbformat_minor={disk_minor!r}")
+    if disk_minor >= NOTEBOOK_MINOR:
         _check_raw_ids(raw)
     try:
         nb = nbformat.reads(text, as_version=4)
@@ -710,11 +815,10 @@ def _load_nb(path: str) -> tuple[Any, int, int]:
         raise NotebookError(
             "invalid_notebook", "The notebook is not nbformat-valid.",
             f"{type(e).__name__}: {e}") from None
-    disk_format = int(nb.get("nbformat") or NOTEBOOK_NBFORMAT)
-    disk_minor = int(nb.get("nbformat_minor") or 4)
     if disk_minor < NOTEBOOK_MINOR:
         _upgrade_ids(nb)
     _check_ids(nb)
+    _check_text(nb)
     return nb, disk_format, disk_minor
 
 
@@ -753,18 +857,26 @@ def _validate_cells(nb) -> None:
 def _save_nb(nb, path: str) -> None:
     """Write the notebook at nbformat 4.5 with an atomic replace.
 
-    The parent directory must already exist (it is never created). The new
-    bytes go to a `NamedTemporaryFile` in that same directory, are flushed and
-    fsynced, and then `os.replace`d over the target. Any failure unlinks the
-    temp file and raises `write_failed`, leaving the target untouched. The only
-    function in this module that writes a notebook file; never executes.
+    The parent directory must already exist (it is never created). A symlink is
+    resolved first, so the real notebook is written and the link survives. The
+    new bytes go to a `NamedTemporaryFile` in that same directory, are flushed
+    and fsynced, get the mode of the file they replace (0600 on a fresh temp
+    would silently restrict a 0644 notebook), and are then `os.replace`d over
+    the target. Any failure unlinks the temp file and raises `write_failed`,
+    leaving the target untouched. The only function in this module that writes a
+    notebook file; never executes.
     """
     p = Path(path)
-    parent = p.parent
+    target = p.resolve() if p.is_symlink() else p
+    parent = target.parent
     if not parent.is_dir():
         raise NotebookError(
             "write_failed", "The notebook's directory does not exist.",
             str(parent))
+    try:
+        mode = target.stat().st_mode & 0o777
+    except OSError:
+        mode = 0o644
     nb.nbformat = NOTEBOOK_NBFORMAT
     nb.nbformat_minor = NOTEBOOK_MINOR
     tmp_name = None
@@ -776,7 +888,8 @@ def _save_nb(nb, path: str) -> None:
             nbformat.write(nb, f)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_name, p)
+        os.chmod(tmp_name, mode)
+        os.replace(tmp_name, target)
         tmp_name = None
     except Exception as e:
         if tmp_name is not None:
@@ -1026,12 +1139,24 @@ def _run_nb_locked(state: dict, nb, path: str) -> tuple[list[dict], bool, bool, 
                 f"{cell_id}: {e.stderr or 'GAP crashed repeatedly'}")
             break
         except ExecTimeout as e:
+            # The kernel keeps computing; keep whatever the cell already printed
+            # and say plainly that the budget, not the code, ended the cell.
+            outs = getattr(e, "outputs", []) or []
             cell.execution_count = count
-            cell.outputs = []
+            cell.outputs = _normalise_outputs(outs, count)
             executed.append(cell)
             failure = NotebookError(
-                "cell_execution_failed", "A cell exceeded the kernel read budget.",
+                "cell_execution_failed",
+                "A cell exceeded the kernel read budget; partial outputs are kept.",
                 f"{cell_id}: {e}")
+            break
+        except KernelDied as e:
+            # The cells that already ran are still worth keeping: the kernel is
+            # gone either way, so do not throw their outputs away.
+            failure = NotebookError(
+                "kernel_died", "The kernel died during the run.",
+                f"{cell_id}: {e}. Outputs of the cells that ran are kept; the "
+                "rest of the notebook did not run.")
             break
         cell.execution_count = count
         cell.outputs = _normalise_outputs(outs, count)
@@ -1046,7 +1171,6 @@ def _run_nb_locked(state: dict, nb, path: str) -> tuple[list[dict], bool, bool, 
     _save_nb(nb, path)
     inline, truncated = _inline_cells(executed, MAX_INLINE_CHARS)
     return inline, truncated, True, failure
-
 
 def _inline_cells(cells: list, budget: int) -> tuple[list[dict], bool]:
     """Copy executed cells and cut their outputs to one inline budget. Pure.
@@ -1143,10 +1267,13 @@ OUTPUT_SCHEMA_INTERRUPT = {
     "properties": {
         "interrupted": {
             "type": "boolean",
-            "description": ("True if a computation was running and has been "
-                            "interrupted; false if the kernel was idle or absent."),
+            "description": ("True if the kernel may be computing and the interrupt "
+                            "request was sent; false if no kernel exists or none is "
+                            "computing. After a `timeout`, the abandoned computation "
+                            "is still running, so this stays true until a later call "
+                            "completes or the kernel is restarted."),
         },
-        "error": _error_schema(["kernel_died", "internal"]),
+        "error": _error_schema(["internal"]),
     },
     "required": ["interrupted", "error"],
     "additionalProperties": False,
@@ -1444,40 +1571,41 @@ async def sage_nb_run(
     holds the full outputs; read them back with `nb_read`.
     """
     state = ctx.lifespan_context
-    try:
-        nb, _, _ = _load_nb(path)
-        _validate_cells(nb)
-    except NotebookError as e:
-        return _nb_run_out(error=_err(e.code, e.message, e.details))
-    except SageNotFound as e:
-        return _nb_run_out(error=_err("sage_not_found", str(e)))
-    except Exception as e:
-        return _nb_run_out(error=_err(
-            "internal", "Unexpected failure inside the server.",
-            f"{type(e).__name__}: {e}"))
-    try:
-        cells, truncated, saved, failure = await _locked(
-            ctx, _run_nb_locked, state, nb, path)
-    except SageNotFound as e:
-        return _nb_run_out(error=_err("sage_not_found", str(e)))
-    except SourceError as e:
-        return _nb_run_out(error=_err(
-            "invalid_source", "A code cell did not preparse.", e))
-    except KernelDied:
-        return _nb_run_out(error=_err(
-            "kernel_died", "The Sage kernel died during the run.",
-            "the namespace was lost; a new kernel starts on the next call"))
-    except NotebookError as e:
-        return _nb_run_out(error=_err(e.code, e.message, e.details))
-    except Exception as e:
-        return _nb_run_out(error=_err(
-            "internal", "Unexpected failure inside the server.",
-            f"{type(e).__name__}: {e}"))
-    error = None
-    if failure is not None:
-        error = _err(failure.code, failure.message, failure.details)
-    return _nb_run_out(cells=cells, truncated=truncated, saved=saved,
-                       error=error)
+    async with _nb_lock:
+        try:
+            nb, _, _ = _load_nb(path)
+            _validate_cells(nb)
+        except NotebookError as e:
+            return _nb_run_out(error=_err(e.code, e.message, e.details))
+        except SageNotFound as e:
+            return _nb_run_out(error=_err("sage_not_found", str(e)))
+        except Exception as e:
+            return _nb_run_out(error=_err(
+                "internal", "Unexpected failure inside the server.",
+                f"{type(e).__name__}: {e}"))
+        try:
+            cells, truncated, saved, failure = await _locked(
+                ctx, _run_nb_locked, state, nb, path)
+        except SageNotFound as e:
+            return _nb_run_out(error=_err("sage_not_found", str(e)))
+        except SourceError as e:
+            return _nb_run_out(error=_err(
+                "invalid_source", "A code cell did not preparse.", e))
+        except KernelDied:
+            return _nb_run_out(error=_err(
+                "kernel_died", "The Sage kernel died during the run.",
+                "the namespace was lost; a new kernel starts on the next call"))
+        except NotebookError as e:
+            return _nb_run_out(error=_err(e.code, e.message, e.details))
+        except Exception as e:
+            return _nb_run_out(error=_err(
+                "internal", "Unexpected failure inside the server.",
+                f"{type(e).__name__}: {e}"))
+        error = None
+        if failure is not None:
+            error = _err(failure.code, failure.message, failure.details)
+        return _nb_run_out(cells=cells, truncated=truncated, saved=saved,
+                           error=error)
 
 
 @mcp.tool(name="nb_write", output_schema=OUTPUT_SCHEMA_NB_WRITE)
@@ -1500,54 +1628,55 @@ async def sage_nb_write(
     write failure. Without `overwrite:true`, an existing file returns `exists`
     and is left byte-identical.
     """
-    try:
-        if Path(path).exists() and not overwrite:
+    async with _nb_lock:
+        try:
+            if Path(path).exists() and not overwrite:
+                return _nb_write_out(error=_err(
+                    "exists", "The notebook already exists; pass overwrite to "
+                    "replace it.", str(path)))
+            built = []
+            for index, spec in enumerate(cells):
+                if not isinstance(spec, dict):
+                    raise NotebookError(
+                        "invalid_notebook", "Each cell must be an object.",
+                        f"cell {index}: {type(spec).__name__}")
+                extra = set(spec) - {"cell_type", "source"}
+                if extra:
+                    raise NotebookError(
+                        "invalid_notebook", "A cell has an unexpected field.",
+                        f"cell {index}: {', '.join(sorted(extra))}")
+                cell_type, source = spec.get("cell_type"), spec.get("source")
+                if not isinstance(source, str):
+                    raise NotebookError(
+                        "invalid_notebook", "A cell source must be a string.",
+                        f"cell {index}: {type(source).__name__}")
+                if cell_type not in ("code", "markdown", "raw"):
+                    raise NotebookError(
+                        "invalid_notebook", "A cell type is unknown.",
+                        f"cell {index}: {cell_type!r}")
+                built.append(_new_cell(cell_type, source))
+            nb = nbformat.v4.new_notebook(
+                metadata=copy.deepcopy(KERNEL_META), cells=built)
+            seen: set[str] = set()
+            for cell in nb.cells:
+                cid = cell.get("id")
+                if not isinstance(cid, str) or not cid or cid in seen:
+                    cell["id"] = _fresh_id(seen)
+                seen.add(cell["id"])
+            nbformat.validate(nb)
+            _validate_cells(nb)
+            _save_nb(nb, path)
+            return _nb_write_out(cell_ids=[cell["id"] for cell in nb.cells],
+                                 saved=True)
+        except NotebookError as e:
+            return _nb_write_out(error=_err(e.code, e.message, e.details))
+        except SageNotFound as e:
             return _nb_write_out(error=_err(
-                "exists", "The notebook already exists; pass overwrite to "
-                "replace it.", str(path)))
-        built = []
-        for index, spec in enumerate(cells):
-            if not isinstance(spec, dict):
-                raise NotebookError(
-                    "invalid_notebook", "Each cell must be an object.",
-                    f"cell {index}: {type(spec).__name__}")
-            extra = set(spec) - {"cell_type", "source"}
-            if extra:
-                raise NotebookError(
-                    "invalid_notebook", "A cell has an unexpected field.",
-                    f"cell {index}: {', '.join(sorted(extra))}")
-            cell_type, source = spec.get("cell_type"), spec.get("source")
-            if not isinstance(source, str):
-                raise NotebookError(
-                    "invalid_notebook", "A cell source must be a string.",
-                    f"cell {index}: {type(source).__name__}")
-            if cell_type not in ("code", "markdown", "raw"):
-                raise NotebookError(
-                    "invalid_notebook", "A cell type is unknown.",
-                    f"cell {index}: {cell_type!r}")
-            built.append(_new_cell(cell_type, source))
-        nb = nbformat.v4.new_notebook(
-            metadata=copy.deepcopy(KERNEL_META), cells=built)
-        seen: set[str] = set()
-        for cell in nb.cells:
-            cid = cell.get("id")
-            if not isinstance(cid, str) or not cid or cid in seen:
-                cell["id"] = _fresh_id(seen)
-            seen.add(cell["id"])
-        nbformat.validate(nb)
-        _validate_cells(nb)
-        _save_nb(nb, path)
-        return _nb_write_out(cell_ids=[cell["id"] for cell in nb.cells],
-                             saved=True)
-    except NotebookError as e:
-        return _nb_write_out(error=_err(e.code, e.message, e.details))
-    except SageNotFound as e:
-        return _nb_write_out(error=_err(
-            "internal", "Sage is needed to validate code cells.", str(e)))
-    except Exception as e:
-        return _nb_write_out(error=_err(
-            "internal", "Unexpected failure inside the server.",
-            f"{type(e).__name__}: {e}"))
+                "internal", "Sage is needed to validate code cells.", str(e)))
+        except Exception as e:
+            return _nb_write_out(error=_err(
+                "internal", "Unexpected failure inside the server.",
+                f"{type(e).__name__}: {e}"))
 
 
 @mcp.tool(name="nb_read", output_schema=OUTPUT_SCHEMA_NB_READ)
@@ -1605,25 +1734,32 @@ async def sage_nb_edit(
     error's `details` starts with `op <zero-based index> (<op>):` for an op that
     failed.
     """
-    try:
-        nb, _, _ = _load_nb(path)
-        applied = _apply_ops(nb, ops)
-        nbformat.validate(nb)
+    async with _nb_lock:
         try:
-            _validate_cells(nb)
+            nb, _, _ = _load_nb(path)
+            applied = _apply_ops(nb, ops)
+            try:
+                nbformat.validate(nb)
+            except Exception as e:
+                raise NotebookError(
+                    "invalid_notebook",
+                    "The edited notebook is not nbformat-valid.",
+                    f"{type(e).__name__}: {e}") from None
+            try:
+                _validate_cells(nb)
+            except NotebookError as e:
+                raise _prefix_validation_error(e, applied) from None
+            _save_nb(nb, path)
+            return _nb_edit_out(applied=applied, saved=True)
         except NotebookError as e:
-            raise _prefix_validation_error(e, applied) from None
-        _save_nb(nb, path)
-        return _nb_edit_out(applied=applied, saved=True)
-    except NotebookError as e:
-        return _nb_edit_out(error=_err(e.code, e.message, e.details))
-    except SageNotFound as e:
-        return _nb_edit_out(error=_err(
-            "internal", "Sage is needed to validate code cells.", str(e)))
-    except Exception as e:
-        return _nb_edit_out(error=_err(
-            "internal", "Unexpected failure inside the server.",
-            f"{type(e).__name__}: {e}"))
+            return _nb_edit_out(error=_err(e.code, e.message, e.details))
+        except SageNotFound as e:
+            return _nb_edit_out(error=_err(
+                "internal", "Sage is needed to validate code cells.", str(e)))
+        except Exception as e:
+            return _nb_edit_out(error=_err(
+                "internal", "Unexpected failure inside the server.",
+                f"{type(e).__name__}: {e}"))
 
 
 @mcp.tool(name="interrupt", output_schema=OUTPUT_SCHEMA_INTERRUPT)

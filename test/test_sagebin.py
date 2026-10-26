@@ -101,6 +101,30 @@ class TestResolve(unittest.TestCase):
         old = os.environ.get("PATH", "")
         self.assertEqual(env["PATH"], "/opt/sage/bin" + os.pathsep + old)
 
+    def test_seed_failure_is_sage_not_found(self):
+        # Regression: a kernel that cannot import Sage was accepted as ready.
+        outputs = [{"output_type": "error", "ename": "ImportError",
+                    "evalue": "no sage.all",
+                    "traceback": ["Traceback", "ImportError: no sage.all"]}]
+        state = {"km": None, "kc": None, "busy": False}
+        with mock.patch.object(server, "_run_source", return_value=outputs):
+            with self.assertRaises(server.SageNotFound) as caught:
+                server._seed_namespace(state)
+        self.assertIn("no sage.all", str(caught.exception))
+
+    def test_seed_success_is_silent(self):
+        state = {"km": None, "kc": None, "busy": False}
+        with mock.patch.object(server, "_run_source", return_value=[]):
+            server._seed_namespace(state)          # must not raise
+
+    def test_start_failure_is_kernel_died(self):
+        # Regression: a first-call start failure used to surface as `internal`.
+        state = {"km": None, "kc": None, "busy": False}
+        with mock.patch.object(server, "_start_kernel",
+                               side_effect=RuntimeError("no ipykernel")):
+            with self.assertRaises(server.KernelDied):
+                server._ensure_kernel(state)
+
     def test_import_starts_nothing(self):
         # Importing the server must not import Sage: `_prepare` imports it lazily.
         self.assertFalse(SAGE_LOADED_ON_IMPORT)

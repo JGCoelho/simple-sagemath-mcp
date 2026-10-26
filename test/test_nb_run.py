@@ -172,6 +172,43 @@ class TestNbRun(unittest.TestCase):
         self.assertEqual(r["cells"], [])
         self.assertEqual(Path(p).read_bytes(), before)
 
+class TestConcurrentEdit(unittest.TestCase):
+    """A completed `nb_edit` must never be reverted by a running `nb_run`."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._dir = tempfile.TemporaryDirectory()
+        cls.dir = Path(cls._dir.name)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._dir.cleanup()
+
+    def test_edit_during_run_is_not_lost(self):
+        # Regression (REVIEW-1 F1): nb_run loaded before taking any lock and
+        # wrote its stale copy afterwards, silently dropping an edit that had
+        # already returned saved:true.
+        import time
+        p = str(self.dir / "concurrent.ipynb")
+        w = _mcp.call("nb_write", path=p, cells=[
+            {"cell_type": "code", "source": "import time\ntime.sleep(2)"},
+            {"cell_type": "code", "source": "x = 1"}])
+        self.assertIsNone(w["error"])
+        target = w["cell_ids"][1]
+        run = _mcp.call_async("nb_run", path=p)
+        time.sleep(0.8)                      # let the run reach the slow cell
+        edit = _mcp.call("nb_edit", path=p, ops=[
+            {"op": "edit", "cell_id": target, "source": "x = 999"}])
+        self.assertIsNone(edit["error"])
+        self.assertTrue(edit["saved"])
+        result = _mcp.unwrap(run.result(180))
+        self.assertIsNone(result["error"])
+        # The edit came after the run's load, so the run must not win.
+        cells = _mcp.call("nb_read", path=p)["cells"]
+        by_id = {c["cell_id"]: c for c in cells}
+        self.assertEqual(by_id[target]["source"], "x = 999")
+
+
 class TestNbRunSchema(unittest.TestCase):
     """The declared output schema and the builder agree with the return value."""
 

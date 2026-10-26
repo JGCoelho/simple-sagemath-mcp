@@ -51,7 +51,9 @@ find_python() {
             return
         fi
     done
-    PATH="$bindir:$PATH" "$1" -c 'import sys; print(sys.executable)'
+    # `sage -c` may print warnings first: keep the last non-empty line only.
+    PATH="$bindir:$PATH" "$1" -c 'import sys; print(sys.executable)' \
+        | awk 'NF { line = $0 } END { print line }'
 }
 
 if ! SAGE=$(find_sage); then
@@ -60,7 +62,9 @@ if ! SAGE=$(find_sage); then
     echo "  SAGE_BIN=/path/to/sage $0"
     exit 1
 fi
-SAGE=$(cd "$(dirname "$SAGE")" && pwd)/$(basename "$SAGE")
+# Follow symlinks exactly as the server does (`os.path.realpath`), so the
+# sibling python we pick is the one the server will pick.
+SAGE=$(realpath "$SAGE" 2>/dev/null || readlink -f "$SAGE" 2>/dev/null || echo "$SAGE")
 echo "Sage: $SAGE"
 
 if ! PY=$(find_python "$SAGE"); then
