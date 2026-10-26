@@ -19,14 +19,20 @@ user's permissions.
 import argparse
 import ast
 import asyncio
+import copy
+import json
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
+import uuid
+from pathlib import Path
 from queue import Empty
 from typing import Annotated, Any, Callable
 
+import nbformat
 from fastmcp import FastMCP, Context
 from fastmcp.server.lifespan import lifespan
 from jupyter_client import KernelManager
@@ -573,6 +579,497 @@ def _exec_locked(state: dict, code: str, timeout: float | None) -> dict:
                           "The source raised an exception.", detail)}
 
 
+# --- notebook I/O ------------------------------------------------------------
+
+# One file is the only source of truth: every read comes from disk and every
+# write replaces it atomically. Notebooks below nbformat 4.5 are upgraded in
+# memory (cell ids are minted) so ops can address every cell, but the upgrade
+# only reaches the disk file when a writing tool runs.
+
+
+class NotebookError(Exception):
+    """A notebook failure with the SPEC §9.2 `code`, message, and details."""
+
+    def __init__(self, code: str, message: str, details: object = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = None if details is None else str(details)
+
+
+def _fresh_id(seen: set[str]) -> str:
+    """Return a cell id that is not in `seen`. Pure apart from reading `seen`."""
+    while True:
+        cid = uuid.uuid4().hex[:8]
+        if cid not in seen:
+            return cid
+
+
+def _check_raw_ids(raw: dict) -> None:
+    """Reject a 4.5+ file whose cells lack a unique, non-empty `id`. Pure.
+
+    nbformat.reads silently repairs a missing or duplicate id, which would hide
+    the defect this check exists for, so the raw JSON is inspected first.
+    """
+    cells = raw.get("cells")
+    if not isinstance(cells, list):
+        return                       # nbformat.validate reports the real problem
+    seen: set[str] = set()
+    for cell in cells:
+        if not isinstance(cell, dict):
+            continue
+        cid = cell.get("id")
+        if not isinstance(cid, str) or not cid:
+            raise NotebookError(
+                "invalid_notebook", "A cell is missing its id.", cid)
+        if cid in seen:
+            raise NotebookError(
+                "invalid_notebook", "Two cells share the same id.", cid)
+        seen.add(cid)
+
+
+def _check_ids(nb) -> None:
+    """Require every cell to have a present, unique id in the in-memory notebook.
+
+    Addressing is by id, so this is load-bearing. Raises `invalid_notebook` and
+    names the offending id. Never changes the notebook.
+    """
+    seen: set[str] = set()
+    for cell in nb.cells:
+        cid = cell.get("id")
+        if not isinstance(cid, str) or not cid:
+            raise NotebookError(
+                "invalid_notebook", "A cell is missing its id.", cid)
+        if cid in seen:
+            raise NotebookError(
+                "invalid_notebook", "Two cells share the same id.", cid)
+        seen.add(cid)
+
+
+def _upgrade_ids(nb) -> None:
+    """Upgrade a pre-4.5 notebook in memory: set 4.5 and mint missing ids.
+
+    The file is not touched. Ids are seeded explicitly rather than through
+    `normalize`, so nothing else in the notebook is rewritten. Never writes.
+    """
+    seen = {c.get("id") for c in nb.cells if isinstance(c.get("id"), str)}
+    nb.nbformat_minor = NOTEBOOK_MINOR
+    for cell in nb.cells:
+        cid = cell.get("id")
+        if not isinstance(cid, str) or not cid:
+            cid = _fresh_id(seen)
+            cell["id"] = cid
+        seen.add(cid)
+
+
+def _load_nb(path: str) -> tuple[Any, int, int]:
+    """Load, parse, and validate the notebook at `path`.
+
+    Returns `(nb, on_disk_nbformat, on_disk_nbformat_minor)`: the notebook is
+    upgraded in memory to 4.5 with unique cell ids, while the two integers are
+    the values actually stored on disk. Raises `NotebookError` with `not_found`
+    when the file is absent and `invalid_notebook` when it is not JSON, is not
+    schema-valid, or has missing/duplicate cell ids. Reads only; never writes,
+    never executes, and never checks for magics or syntax (that is
+    `_validate_cells`).
+    """
+    p = Path(path)
+    try:
+        text = p.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise NotebookError(
+            "not_found", "The notebook file does not exist.", str(path)) from None
+    except OSError as e:
+        raise NotebookError(
+            "not_found", "The notebook file cannot be read.",
+            f"{type(e).__name__}: {e}") from None
+    try:
+        raw = json.loads(text)
+    except (json.JSONDecodeError, TypeError) as e:
+        raise NotebookError(
+            "invalid_notebook", "The file is not valid JSON.",
+            f"{type(e).__name__}: {e}") from None
+    if not isinstance(raw, dict):
+        raise NotebookError(
+            "invalid_notebook", "The file is not a notebook object.",
+            type(raw).__name__)
+    minor = raw.get("nbformat_minor")
+    if not isinstance(minor, int):
+        minor = 4
+    if minor >= NOTEBOOK_MINOR:
+        _check_raw_ids(raw)
+    try:
+        nb = nbformat.reads(text, as_version=4)
+        nbformat.validate(nb)
+    except Exception as e:
+        raise NotebookError(
+            "invalid_notebook", "The notebook is not nbformat-valid.",
+            f"{type(e).__name__}: {e}") from None
+    disk_format = int(nb.get("nbformat") or NOTEBOOK_NBFORMAT)
+    disk_minor = int(nb.get("nbformat_minor") or 4)
+    if disk_minor < NOTEBOOK_MINOR:
+        _upgrade_ids(nb)
+    _check_ids(nb)
+    return nb, disk_format, disk_minor
+
+
+def _validate_cells(nb) -> None:
+    """Statically validate every code cell: no magics, and it must prepare.
+
+    Walks the cells in order. A `%`/`!` as the first non-space character of any
+    line raises `unsupported_magic`; a source that does not preparse/compile
+    raises `invalid_source`. `details` is `"<cell_id>: <offending line/reason>"`.
+    Markdown and raw cells are never validated as code. Never writes, never
+    executes, and never restarts a kernel.
+    """
+    for cell in nb.cells:
+        if cell.get("cell_type") != "code":
+            continue
+        cid = cell.get("id") or ""
+        source = cell.get("source") or ""
+        if isinstance(source, list):
+            source = "".join(source)
+        for line in source.splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith("%") or stripped.startswith("!"):
+                raise NotebookError(
+                    "unsupported_magic",
+                    "A code cell contains an IPython magic or shell escape.",
+                    f"{cid}: {stripped}")
+        try:
+            _prepare(source)
+        except SourceError as e:
+            raise NotebookError(
+                "invalid_source",
+                "A code cell does not preparse into valid Sage code.",
+                f"{cid}: {e}") from None
+
+
+def _save_nb(nb, path: str) -> None:
+    """Write the notebook at nbformat 4.5 with an atomic replace.
+
+    The parent directory must already exist (it is never created). The new
+    bytes go to a `NamedTemporaryFile` in that same directory, are flushed and
+    fsynced, and then `os.replace`d over the target. Any failure unlinks the
+    temp file and raises `write_failed`, leaving the target untouched. The only
+    function in this module that writes a notebook file; never executes.
+    """
+    p = Path(path)
+    parent = p.parent
+    if not parent.is_dir():
+        raise NotebookError(
+            "write_failed", "The notebook's directory does not exist.",
+            str(parent))
+    nb.nbformat = NOTEBOOK_NBFORMAT
+    nb.nbformat_minor = NOTEBOOK_MINOR
+    tmp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                dir=parent, suffix=".tmp", delete=False,
+                mode="w", encoding="utf-8") as f:
+            tmp_name = f.name
+            nbformat.write(nb, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, p)
+        tmp_name = None
+    except Exception as e:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+        raise NotebookError(
+            "write_failed", "The notebook could not be written atomically.",
+            f"{type(e).__name__}: {e}") from None
+
+
+def _new_cell(cell_type: str, source: str):
+    """Build one nbformat cell of `cell_type` with `source`. Pure.
+
+    Raises `invalid_notebook` for an unknown cell type. The returned cell has an
+    id from nbformat when the schema wants one; callers ensure uniqueness.
+    """
+    if cell_type == "code":
+        return nbformat.v4.new_code_cell(source)
+    if cell_type == "markdown":
+        return nbformat.v4.new_markdown_cell(source)
+    if cell_type == "raw":
+        return nbformat.v4.new_raw_cell(source)
+    raise NotebookError(
+        "invalid_notebook", "Unknown cell type.", repr(cell_type))
+
+
+def _nb_read_cells(nb, cell_ids: list[str] | None) -> list[dict]:
+    """Select cells by id and shape them for `nb_read`. Pure.
+
+    With `cell_ids`, cells come back in the order given; otherwise in notebook
+    order. Each item is `{cell_id, cell_type, source}` plus `outputs` (full, from
+    disk) only on code cells. An id that is not present raises `unknown_cell_id`
+    with the id as details. Never writes and never executes.
+    """
+    by_id = {cell.get("id"): cell for cell in nb.cells}
+    if cell_ids is None:
+        selected = list(nb.cells)
+    else:
+        selected = []
+        for cid in cell_ids:
+            cell = by_id.get(cid)
+            if cell is None:
+                raise NotebookError(
+                    "unknown_cell_id",
+                    "The notebook has no cell with that id.", cid)
+            selected.append(cell)
+    result = []
+    for cell in selected:
+        source = cell.get("source") or ""
+        if isinstance(source, list):
+            source = "".join(source)
+        item = {"cell_id": cell.get("id"),
+                "cell_type": cell.get("cell_type"),
+                "source": source}
+        if cell.get("cell_type") == "code":
+            item["outputs"] = copy.deepcopy(list(cell.get("outputs") or []))
+        result.append(item)
+    return result
+
+
+_OP_KEYS = {
+    "edit": {"op", "cell_id", "source"},
+    "add": {"op", "cell_type", "source", "after"},
+    "remove": {"op", "cell_id"},
+}
+
+
+def _op_fail(index: int, name: object, code: str, message: str,
+             reason: object = None) -> NotebookError:
+    """Build a `nb_edit` failure whose details name the zero-based op. Pure."""
+    label = name if isinstance(name, str) and name else "?"
+    details = f"op {index} ({label}):"
+    if reason is not None:
+        details += f" {reason}"
+    return NotebookError(code, message, details)
+
+
+def _find_cell(nb, cell_id: str):
+    """Return the index of `cell_id`, or None. Pure."""
+    for index, cell in enumerate(nb.cells):
+        if cell.get("id") == cell_id:
+            return index
+    return None
+
+
+def _apply_ops(nb, ops: list) -> list[dict]:
+    """Apply `edit`/`add`/`remove` ops to the in-memory notebook. Returns applied.
+
+    Every op is shape-checked here (the caller's input is not trusted), so a
+    malformed op raises `invalid_op` and never reaches nbformat. An unknown id
+    raises `unknown_cell_id`; both carry `details = "op <i> (<op>): <reason>"`.
+    Mutates `nb` only; the caller writes it once if the whole result validates.
+    Never writes a file, never executes, and never creates a notebook.
+    """
+    applied: list[dict] = []
+    for index, op in enumerate(ops):
+        if not isinstance(op, dict):
+            raise _op_fail(index, None, "invalid_op",
+                           "Each op must be an object.",
+                           type(op).__name__)
+        name = op.get("op")
+        if name not in _OP_KEYS:
+            raise _op_fail(index, name, "invalid_op",
+                           "Unknown or missing op name.", repr(name))
+        extra = set(op) - _OP_KEYS[name]
+        if extra:
+            raise _op_fail(index, name, "invalid_op",
+                           "An op has an unexpected field.",
+                           ", ".join(sorted(extra)))
+        source = op.get("source")
+        if name in ("edit", "add") and not isinstance(source, str):
+            raise _op_fail(index, name, "invalid_op",
+                           "`source` must be a string.", type(source).__name__)
+        cell_id = op.get("cell_id")
+        if name in ("edit", "remove") and not isinstance(cell_id, str):
+            raise _op_fail(index, name, "invalid_op",
+                           "`cell_id` must be a string.", type(cell_id).__name__)
+        if name == "edit":
+            pos = _find_cell(nb, cell_id)
+            if pos is None:
+                raise _op_fail(index, name, "unknown_cell_id",
+                               "The notebook has no cell with that id.", cell_id)
+            nb.cells[pos]["source"] = source
+            applied.append({"op": "edit", "cell_id": cell_id})
+        elif name == "remove":
+            pos = _find_cell(nb, cell_id)
+            if pos is None:
+                raise _op_fail(index, name, "unknown_cell_id",
+                               "The notebook has no cell with that id.", cell_id)
+            del nb.cells[pos]
+            applied.append({"op": "remove", "cell_id": cell_id})
+        else:  # add
+            cell_type = op.get("cell_type", "code")
+            if cell_type not in ("code", "markdown", "raw"):
+                raise _op_fail(index, name, "invalid_op",
+                               "Unknown cell type.", repr(cell_type))
+            after = op.get("after")
+            if "after" in op and not isinstance(after, str):
+                raise _op_fail(index, name, "invalid_op",
+                               "`after` must be a cell id string.",
+                               type(after).__name__)
+            if after is not None:
+                pos = _find_cell(nb, after)
+                if pos is None:
+                    raise _op_fail(index, name, "unknown_cell_id",
+                                   "The notebook has no cell with that id.",
+                                   after)
+                pos += 1
+            else:
+                pos = len(nb.cells)
+            new = _new_cell(cell_type, source)
+            seen = {c.get("id") for c in nb.cells}
+            if not new.get("id") or new.get("id") in seen:
+                new["id"] = _fresh_id(seen)
+            nb.cells.insert(pos, new)
+            applied.append({"op": "add", "cell_id": new["id"]})
+    return applied
+
+
+def _prefix_validation_error(e: NotebookError, applied: list[dict]) -> NotebookError:
+    """Name the op that produced a post-ops validation failure.
+
+    `_apply_ops` already prefixes its own failures. A failure of the whole
+    result is attributed to the last op that touched the offending cell (or to
+    the last applied op when the cell predates the call), so every op-phase
+    failure keeps the `"op <i> (<op>): <reason>"` shape. Pure.
+    """
+    if not applied or (e.details and e.details.startswith("op ")):
+        return e
+    cell_id = (e.details or "").split(":", 1)[0]
+    index = len(applied) - 1
+    for i in range(len(applied) - 1, -1, -1):
+        if applied[i].get("cell_id") == cell_id:
+            index = i
+            break
+    return NotebookError(
+        e.code, e.message,
+        f"op {index} ({applied[index]['op']}): {e.details or e.message}")
+
+
+# --- notebook execution ------------------------------------------------------
+
+
+def _normalise_outputs(outs: list[dict], execution_count: int) -> list:
+    """Give collector outputs the fields nbformat requires, as NotebookNodes.
+
+    `execute_result` needs an `execution_count`; the collector does not know it.
+    Everything else is already nbformat-shaped. Pure; never touches the wire
+    outputs the caller keeps for the inline view.
+    """
+    result = []
+    for out in outs:
+        item = copy.deepcopy(out)
+        if item.get("output_type") == "execute_result":
+            item.setdefault("execution_count", execution_count)
+        result.append(nbformat.from_dict(item))
+    return result
+
+
+def _cell_error_detail(cell_id: str, outs: list[dict]) -> str:
+    """Build `"<cell_id>: <traceback or Ename: evalue>"`. Pure."""
+    for out in outs:
+        if out.get("output_type") == "error":
+            traceback = out.get("traceback") or []
+            text = ("\n".join(str(line) for line in traceback)
+                    if traceback else f"{out.get('ename')}: {out.get('evalue')}")
+            return f"{cell_id}: {text}"
+    return f"{cell_id}: the cell raised an exception"
+
+
+def _run_nb_locked(state: dict, nb, path: str) -> tuple[list[dict], bool, bool, object]:
+    """Restart and run every code cell of `nb`, then write the outputs once.
+
+    Lock held. Returns `(inline_cells, truncated, saved, failure)` where
+    `failure` is a `NotebookError` or None. `_restart_locked` runs first, so the
+    namespace from prior calls is gone. Cells run in order; the first one that
+    raises (or whose outputs carry an error) stops the run, and the notebook is
+    written with outputs/execution_count up to and including it. Later cells
+    keep what was on disk. The file receives the full outputs; the returned
+    cells are deep copies cut to one MAX_INLINE_CHARS budget. A notebook with no
+    code cell is not written. The kernel is left running and warm.
+    """
+    _restart_locked(state)
+    code_cells = [c for c in nb.cells if c.get("cell_type") == "code"]
+    if not code_cells:
+        return [], False, False, None
+    existing = [c.get("execution_count") for c in code_cells
+                if isinstance(c.get("execution_count"), int)]
+    count = (max(existing) if existing else 0) + 1
+    executed: list = []
+    failure = None
+    for cell in code_cells:
+        cell_id = cell.get("id") or ""
+        outs: list[dict] = []
+        try:
+            outs = _run_source(state, cell.get("source") or "",
+                               f"{path}:{cell_id}")
+        except GapCrashLoop as e:
+            outs = e.outputs
+            cell.execution_count = count
+            cell.outputs = _normalise_outputs(outs, count)
+            executed.append(cell)
+            failure = NotebookError(
+                "cell_execution_failed", "A cell's GAP process crashed repeatedly.",
+                f"{cell_id}: {e.stderr or 'GAP crashed repeatedly'}")
+            break
+        except ExecTimeout as e:
+            cell.execution_count = count
+            cell.outputs = []
+            executed.append(cell)
+            failure = NotebookError(
+                "cell_execution_failed", "A cell exceeded the kernel read budget.",
+                f"{cell_id}: {e}")
+            break
+        cell.execution_count = count
+        cell.outputs = _normalise_outputs(outs, count)
+        executed.append(cell)
+        detail = _summarise(outs)[3]
+        if detail is not None:
+            failure = NotebookError(
+                "cell_execution_failed", "A notebook cell raised an exception.",
+                _cell_error_detail(cell_id, outs))
+            break
+        count += 1
+    _save_nb(nb, path)
+    inline, truncated = _inline_cells(executed, MAX_INLINE_CHARS)
+    return inline, truncated, True, failure
+
+
+def _inline_cells(cells: list, budget: int) -> tuple[list[dict], bool]:
+    """Copy executed cells and cut their outputs to one inline budget. Pure.
+
+    Outputs are added whole in cell order; the first output that would exceed
+    `budget` clears that cell's outputs and every later cell's outputs, and sets
+    `truncated`. Operates on deep copies, so the caller's (on-disk) outputs are
+    never touched. Never writes.
+    """
+    result: list[dict] = []
+    used = 0
+    cut = False
+    for cell in cells:
+        outputs: list = []
+        if not cut:
+            outputs = copy.deepcopy(list(cell.get("outputs") or []))
+            size = sum(len(json.dumps(out)) for out in outputs)
+            if used + size > budget:
+                cut = True
+                outputs = []
+            else:
+                used += size
+        result.append({"cell_id": cell.get("id") or "",
+                       "cell_type": cell.get("cell_type") or "code",
+                       "outputs": outputs})
+    return result, cut
+
+
 # --- error envelope and schemas ----------------------------------------------
 
 def _err(code: str, message: str, details: object = None) -> dict:
@@ -665,11 +1162,174 @@ OUTPUT_SCHEMA_RESTART = {
 }
 
 
+OUTPUT_SCHEMA_NB_RUN = {
+    "type": "object",
+    "properties": {
+        "cells": {
+            "type": "array",
+            "description": ("Code cells in execution order, with their inline "
+                            "outputs. Non-code cells are omitted."),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "cell_id": {"type": "string"},
+                    "cell_type": {"type": "string",
+                                  "enum": ["code", "markdown", "raw"]},
+                    "outputs": {"type": "array", "items": {"type": "object"}},
+                },
+                "required": ["cell_id", "cell_type", "outputs"],
+                "additionalProperties": False,
+            },
+        },
+        "truncated": {
+            "type": "boolean",
+            "description": ("True if the inline outputs exceeded the per-call "
+                            "budget and were cut. On-disk outputs are complete; "
+                            "use `nb_read` to recover them."),
+        },
+        "saved": {
+            "type": "boolean",
+            "description": ("True if the notebook file was written by this call. "
+                            "False when nothing ran, validation failed, or the "
+                            "write failed."),
+        },
+        "error": _error_schema(["invalid_source", "cell_execution_failed",
+                                "kernel_died", "sage_not_found", "not_found",
+                                "invalid_notebook", "unsupported_magic",
+                                "write_failed", "internal"]),
+    },
+    "required": ["cells", "truncated", "saved", "error"],
+    "additionalProperties": False,
+}
+
+OUTPUT_SCHEMA_NB_WRITE = {
+    "type": "object",
+    "properties": {
+        "cell_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Cell IDs assigned to the written cells, in order.",
+        },
+        "saved": {
+            "type": "boolean",
+            "description": "True iff the notebook file was written by this call.",
+        },
+        "error": _error_schema(["invalid_source", "exists", "invalid_notebook",
+                                "unsupported_magic", "write_failed", "internal"]),
+    },
+    "required": ["cell_ids", "saved", "error"],
+    "additionalProperties": False,
+}
+
+OUTPUT_SCHEMA_NB_READ = {
+    "type": "object",
+    "properties": {
+        "nbformat": {
+            "type": ["integer", "null"],
+            "description": ("The major nbformat version stored on disk; null on "
+                            "failure."),
+        },
+        "nbformat_minor": {
+            "type": ["integer", "null"],
+            "description": ("The minor nbformat version stored on disk (4 for a "
+                            "file upgraded in memory); null on failure."),
+        },
+        "cells": {
+            "type": "array",
+            "description": ("The selected cells, in the requested order (or "
+                            "notebook order). Empty on failure."),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "cell_id": {"type": "string"},
+                    "cell_type": {"type": "string",
+                                  "enum": ["code", "markdown", "raw"]},
+                    "source": {"type": "string"},
+                    "outputs": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                        "description": ("Only on code cells: the full nbformat "
+                                        "outputs stored on disk."),
+                    },
+                },
+                "required": ["cell_id", "cell_type", "source"],
+                "additionalProperties": False,
+            },
+        },
+        "error": _error_schema(["not_found", "invalid_notebook",
+                                "unknown_cell_id", "internal"]),
+    },
+    "required": ["nbformat", "nbformat_minor", "cells", "error"],
+    "additionalProperties": False,
+}
+
+OUTPUT_SCHEMA_NB_EDIT = {
+    "type": "object",
+    "properties": {
+        "applied": {
+            "type": "array",
+            "description": ("One entry per op that was applied, in order. Empty if "
+                            "the call failed (nothing was written)."),
+            "items": {
+                "type": "object",
+                "properties": {
+                    "op": {"type": "string",
+                           "enum": ["edit", "add", "remove"]},
+                    "cell_id": {"type": "string"},
+                },
+                "required": ["op", "cell_id"],
+                "additionalProperties": False,
+            },
+        },
+        "saved": {
+            "type": "boolean",
+            "description": "True iff the notebook file was written by this call.",
+        },
+        "error": _error_schema(["invalid_source", "not_found",
+                                "invalid_notebook", "unsupported_magic",
+                                "unknown_cell_id", "invalid_op",
+                                "write_failed", "internal"]),
+    },
+    "required": ["applied", "saved", "error"],
+    "additionalProperties": False,
+}
+
+
 def _exec_out(*, result: str = "", stdout: str = "", stderr: str = "",
               truncated: bool = False, error: dict | None = None) -> dict:
     """The only constructor of an `exec` result. Keys match OUTPUT_SCHEMA_EXEC."""
     return {"result": result, "stdout": stdout, "stderr": stderr,
             "truncated": truncated, "error": error}
+
+
+def _nb_run_out(*, cells: list | None = None, truncated: bool = False,
+                saved: bool = False, error: dict | None = None) -> dict:
+    """The only constructor of an `nb_run` result."""
+    return {"cells": [] if cells is None else cells, "truncated": truncated,
+            "saved": saved, "error": error}
+
+
+def _nb_write_out(*, cell_ids: list | None = None, saved: bool = False,
+                  error: dict | None = None) -> dict:
+    """The only constructor of an `nb_write` result."""
+    return {"cell_ids": [] if cell_ids is None else cell_ids,
+            "saved": saved, "error": error}
+
+
+def _nb_read_out(*, nbformat: int | None = None,
+                 nbformat_minor: int | None = None,
+                 cells: list | None = None,
+                 error: dict | None = None) -> dict:
+    """The only constructor of an `nb_read` result."""
+    return {"nbformat": nbformat, "nbformat_minor": nbformat_minor,
+            "cells": [] if cells is None else cells, "error": error}
+
+
+def _nb_edit_out(*, applied: list | None = None, saved: bool = False,
+                 error: dict | None = None) -> dict:
+    """The only constructor of an `nb_edit` result."""
+    return {"applied": [] if applied is None else applied,
+            "saved": saved, "error": error}
 
 
 def _interrupt_out(*, interrupted: bool = False,
@@ -753,6 +1413,212 @@ async def sage_exec(
             "internal", "Unexpected failure inside the server.",
             f"{type(e).__name__}: {e}"))
     return _exec_out(**shaped)
+
+
+@mcp.tool(name="nb_run", output_schema=OUTPUT_SCHEMA_NB_RUN)
+async def sage_nb_run(
+        ctx: Context,
+        path: Annotated[str, Field(
+            description="Filesystem path to the .ipynb notebook to run.")]) -> dict:
+    """Run every code cell of a notebook in a fresh kernel and write its outputs.
+
+    State: the kernel is restarted first, so every variable from prior `exec` or
+    `nb_run` calls is discarded; afterwards it stays alive and warm with the
+    notebook's variables up to and including the last executed cell. The
+    notebook file at `path` is rewritten in place with the outputs and
+    execution_counts.
+    Never: it does not create a file (a missing path is `not_found`), does not
+    start a second kernel, and does not raise for a domain failure. Load and
+    static validation happen *before* the restart, so a notebook with a bad
+    schema, a duplicate id, a magic, or a syntax error leaves both the file and
+    the running namespace untouched. Execution stops at the first cell that
+    raises; cells up to and including it are written and later cells keep what
+    was already on disk.
+    Truncation: the returned inline outputs are cut at the per-call budget, with
+    `truncated:true` and the cut cells returned as `outputs:[]`. The file always
+    holds the full outputs; read them back with `nb_read`.
+    """
+    state = ctx.lifespan_context
+    try:
+        nb, _, _ = _load_nb(path)
+        _validate_cells(nb)
+    except NotebookError as e:
+        return _nb_run_out(error=_err(e.code, e.message, e.details))
+    except SageNotFound as e:
+        return _nb_run_out(error=_err("sage_not_found", str(e)))
+    except Exception as e:
+        return _nb_run_out(error=_err(
+            "internal", "Unexpected failure inside the server.",
+            f"{type(e).__name__}: {e}"))
+    try:
+        cells, truncated, saved, failure = await _locked(
+            ctx, _run_nb_locked, state, nb, path)
+    except SageNotFound as e:
+        return _nb_run_out(error=_err("sage_not_found", str(e)))
+    except SourceError as e:
+        return _nb_run_out(error=_err(
+            "invalid_source", "A code cell did not preparse.", e))
+    except KernelDied:
+        return _nb_run_out(error=_err(
+            "kernel_died", "The Sage kernel died during the run.",
+            "the namespace was lost; a new kernel starts on the next call"))
+    except NotebookError as e:
+        return _nb_run_out(error=_err(e.code, e.message, e.details))
+    except Exception as e:
+        return _nb_run_out(error=_err(
+            "internal", "Unexpected failure inside the server.",
+            f"{type(e).__name__}: {e}"))
+    error = None
+    if failure is not None:
+        error = _err(failure.code, failure.message, failure.details)
+    return _nb_run_out(cells=cells, truncated=truncated, saved=saved,
+                       error=error)
+
+
+@mcp.tool(name="nb_write", output_schema=OUTPUT_SCHEMA_NB_WRITE)
+async def sage_nb_write(
+        ctx: Context,
+        path: Annotated[str, Field(
+            description="Filesystem path to the .ipynb to create.")],
+        cells: Annotated[list[dict[str, Any]], Field(
+            description="Cells in order, each {cell_type: code|markdown|raw, "
+                        "source: str}. Validated here, never trusted.")],
+        overwrite: Annotated[bool, Field(
+            description="Replace an existing file. Default false.")] = False) -> dict:
+    """Create a new notebook from cells, validate it, and write it atomically.
+
+    State: writes the file at `path` at nbformat 4.5, so every cell has an id;
+    the ids are returned in `cell_ids` and can go straight into `nb_edit`.
+    Metadata is the Sage kernelspec. It never touches the kernel namespace.
+    Never: it does not execute anything (use `nb_run`), never creates parent
+    directories, and never creates or truncates the file on a validation or
+    write failure. Without `overwrite:true`, an existing file returns `exists`
+    and is left byte-identical.
+    """
+    try:
+        if Path(path).exists() and not overwrite:
+            return _nb_write_out(error=_err(
+                "exists", "The notebook already exists; pass overwrite to "
+                "replace it.", str(path)))
+        built = []
+        for index, spec in enumerate(cells):
+            if not isinstance(spec, dict):
+                raise NotebookError(
+                    "invalid_notebook", "Each cell must be an object.",
+                    f"cell {index}: {type(spec).__name__}")
+            extra = set(spec) - {"cell_type", "source"}
+            if extra:
+                raise NotebookError(
+                    "invalid_notebook", "A cell has an unexpected field.",
+                    f"cell {index}: {', '.join(sorted(extra))}")
+            cell_type, source = spec.get("cell_type"), spec.get("source")
+            if not isinstance(source, str):
+                raise NotebookError(
+                    "invalid_notebook", "A cell source must be a string.",
+                    f"cell {index}: {type(source).__name__}")
+            if cell_type not in ("code", "markdown", "raw"):
+                raise NotebookError(
+                    "invalid_notebook", "A cell type is unknown.",
+                    f"cell {index}: {cell_type!r}")
+            built.append(_new_cell(cell_type, source))
+        nb = nbformat.v4.new_notebook(
+            metadata=copy.deepcopy(KERNEL_META), cells=built)
+        seen: set[str] = set()
+        for cell in nb.cells:
+            cid = cell.get("id")
+            if not isinstance(cid, str) or not cid or cid in seen:
+                cell["id"] = _fresh_id(seen)
+            seen.add(cell["id"])
+        nbformat.validate(nb)
+        _validate_cells(nb)
+        _save_nb(nb, path)
+        return _nb_write_out(cell_ids=[cell["id"] for cell in nb.cells],
+                             saved=True)
+    except NotebookError as e:
+        return _nb_write_out(error=_err(e.code, e.message, e.details))
+    except SageNotFound as e:
+        return _nb_write_out(error=_err(
+            "internal", "Sage is needed to validate code cells.", str(e)))
+    except Exception as e:
+        return _nb_write_out(error=_err(
+            "internal", "Unexpected failure inside the server.",
+            f"{type(e).__name__}: {e}"))
+
+
+@mcp.tool(name="nb_read", output_schema=OUTPUT_SCHEMA_NB_READ)
+async def sage_nb_read(
+        ctx: Context,
+        path: Annotated[str, Field(description="Filesystem path to the .ipynb.")],
+        cell_ids: Annotated[list[str] | None, Field(
+            description="Optional. Return only these cells, in the order given "
+                        "here. Unknown ids fail the whole call.")] = None) -> dict:
+    """Read and validate a notebook from disk and return its cells.
+
+    State: reads only. No in-memory notebook state is consulted, so every call
+    reflects the file; a notebook below nbformat 4.5 is upgraded in memory (ids
+    are minted) but the file is left byte-identical and `nbformat`/
+    `nbformat_minor` report the on-disk values.
+    Never: it does not write, execute, or restart a kernel. An unknown id in
+    `cell_ids` returns `unknown_cell_id` with the id in `details`, `cells:[]`,
+    and both version fields null.
+    Output: code cells carry their full on-disk `outputs`; use this to recover
+    the outputs that an `nb_run` inline view truncated.
+    """
+    try:
+        nb, disk_format, disk_minor = _load_nb(path)
+        return _nb_read_out(nbformat=disk_format,
+                            nbformat_minor=disk_minor,
+                            cells=_nb_read_cells(nb, cell_ids))
+    except NotebookError as e:
+        return _nb_read_out(error=_err(e.code, e.message, e.details))
+    except Exception as e:
+        return _nb_read_out(error=_err(
+            "internal", "Unexpected failure inside the server.",
+            f"{type(e).__name__}: {e}"))
+
+
+@mcp.tool(name="nb_edit", output_schema=OUTPUT_SCHEMA_NB_EDIT)
+async def sage_nb_edit(
+        ctx: Context,
+        path: Annotated[str, Field(description="Filesystem path to the .ipynb.")],
+        ops: Annotated[list[dict[str, Any]], Field(
+            min_length=1,
+            description="Operations in order, each one of {op:edit, cell_id, "
+                        "source}, {op:add, source, cell_type?, after?}, or "
+                        "{op:remove, cell_id}. Validated here, never trusted.")]
+        ) -> dict:
+    """Apply edit/add/remove cell ops to an existing notebook atomically.
+
+    State: the ops are applied in memory and the whole result is re-validated;
+    only then is the file rewritten once. Cells are addressed by `cell_id`
+    (call `nb_read` first); an `add` without `cell_type` defaults to `code` and
+    its new id is returned in `applied`.
+    Never: it does not create a file (a missing path is `not_found`), does not
+    execute the notebook, and never writes on failure: if any op is malformed
+    (`invalid_op`), names an unknown id (`unknown_cell_id`), or the result has a
+    magic/syntax error, `applied` is empty and the file is byte-identical. The
+    error's `details` starts with `op <zero-based index> (<op>):` for an op that
+    failed.
+    """
+    try:
+        nb, _, _ = _load_nb(path)
+        applied = _apply_ops(nb, ops)
+        nbformat.validate(nb)
+        try:
+            _validate_cells(nb)
+        except NotebookError as e:
+            raise _prefix_validation_error(e, applied) from None
+        _save_nb(nb, path)
+        return _nb_edit_out(applied=applied, saved=True)
+    except NotebookError as e:
+        return _nb_edit_out(error=_err(e.code, e.message, e.details))
+    except SageNotFound as e:
+        return _nb_edit_out(error=_err(
+            "internal", "Sage is needed to validate code cells.", str(e)))
+    except Exception as e:
+        return _nb_edit_out(error=_err(
+            "internal", "Unexpected failure inside the server.",
+            f"{type(e).__name__}: {e}"))
 
 
 @mcp.tool(name="interrupt", output_schema=OUTPUT_SCHEMA_INTERRUPT)
