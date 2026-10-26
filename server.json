@@ -1,6 +1,0 @@
-{
-  "kernel_read_timeout": 2400.0,
-  "heartbeat_interval": 15.0,
-  "shell_drain_timeout": 30.0,
-  "kernel_ready_timeout": 60.0
-}
