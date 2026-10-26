@@ -3,8 +3,11 @@
 # requires-python = ">=3.10"
 # dependencies = ["fastmcp", "nbformat", "jupyter_client", "ipykernel"]
 # ///
-# Run:      python server.py     (the python of your Sage install, see install.sh)
-# Install:  ./install.sh
+# Run:      python server.py     (the python of your Sage install)
+# Install:  sage -pip install .  (or, from git: sage -pip install
+#           git+https://github.com/JGCoelho/simple-sagemath-mcp)
+# Or:       ./install.sh         (no pip: checks the python, installs what is
+#                                missing, and prints the config block)
 
 """A stateful SageMath MCP server: one kernel, one namespace, seven tools.
 

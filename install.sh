@@ -78,10 +78,13 @@ if ! works "$PY" 'import sage.all'; then
     exit 1
 fi
 
-# The server needs fastmcp and nbformat. ipykernel and jupyter_client come with Sage.
+# The server needs fastmcp and nbformat. ipykernel and jupyter_client come with
+# Sage. The pins are the ones in pyproject.toml: fastmcp 5 may change the strict
+# output_schema validation that the error envelope depends on, so do not float it.
 if ! works "$PY" 'import fastmcp, nbformat'; then
     echo "Installing fastmcp and nbformat ..."
-    "$PY" -m pip install --quiet --disable-pip-version-check fastmcp nbformat
+    "$PY" -m pip install --quiet --disable-pip-version-check \
+        "fastmcp>=4.1,<5" "nbformat>=5.10"
 fi
 
 for mod in fastmcp nbformat jupyter_client ipykernel sage.all; do

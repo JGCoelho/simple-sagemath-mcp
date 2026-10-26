@@ -17,7 +17,7 @@ install` into an unrelated venv cannot be used, because they build an environmen
 where the Sage import fails.
 
 ## Install
-Three routes, from fewest lines to most. They all end with a config block for your host.
+Four routes, from fewest lines to most. They all end with a config block for your host.
 
 **One line** — install from git with Sage's pip (works today):
 
@@ -33,15 +33,29 @@ cd simple-sagemath-mcp
 sage -pip install .          # later: sage -pip install --upgrade .
 ```
 
+**Four lines, no pip** — let the script in this repo do the checks: it finds Sage, installs the
+dependencies it is missing, and prints the block ready to paste. It installs no package and changes
+no config file.
+
+```bash
+sage --version
+git clone https://github.com/JGCoelho/simple-sagemath-mcp.git
+cd simple-sagemath-mcp
+./install.sh
+```
+
+If `sage` is not on `PATH`, name it: `SAGE_BIN=/opt/sage/sage ./install.sh`.
+
 **No install at all** — copy `server.py` to the machine and write the config by hand: `command` is
 the python of your Sage and `args` is `["/path/to/server.py"]`, plus `"--directory",
 "/path/to/your/work"` if you want one. The server needs only `fastmcp`, `nbformat`,
 `jupyter_client`, `ipykernel`, and Sage's python.
 
-Both routes put a `simple-sagemath-mcp` console script next to the `sage` executable; it calls
-`server:main`. On an externally managed (Debian/Ubuntu, PEP 668) `sagemath`, use `sage -pip install
---user .`, which puts the script in `~/.local/bin` instead. The PyPI name is reserved but not
-published: `sage -pip install simple-sagemath-mcp` is future work, not a current command.
+The two pip routes put a `simple-sagemath-mcp` console script next to the `sage` executable; it
+calls `server:main`. On an externally managed (Debian/Ubuntu, PEP 668) `sagemath`, use `sage -pip
+install --user .`, which puts the script in `~/.local/bin` instead. The other two routes need no
+package at all: the config names the python of your Sage and `server.py`. The PyPI name is reserved
+but not published: `sage -pip install simple-sagemath-mcp` is future work, not a current command.
 
 If any of this gives you trouble, hand it over: paste this README to your coding agent and ask it
 to install the server and write the config. It can run the commands, find the python of your Sage,
