@@ -15,6 +15,7 @@ venv/
 # local design docs and workflow notes, kept locally only (README is public)
 *.md
 !README.md
+!SPEC.md
 .workflow/
 # notebooks executed while testing the examples
 *.out.ipynb
