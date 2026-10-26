@@ -17,7 +17,7 @@ install` into an unrelated venv cannot be used, because they build an environmen
 where the Sage import fails.
 
 ## Install
-Four routes, from fewest lines to most. They all end with a config block for your host.
+Three routes, from fewest lines to most. They all end with a config block for your host.
 
 **One line** — install from git with Sage's pip (works today):
 
@@ -33,27 +33,19 @@ cd simple-sagemath-mcp
 sage -pip install .          # later: sage -pip install --upgrade .
 ```
 
-**Four lines** — let the installer find Sage, install missing dependencies, and print the config
-block ready to paste (it changes no config file):
-
-```bash
-sage --version
-git clone https://github.com/JGCoelho/simple-sagemath-mcp.git
-cd simple-sagemath-mcp
-./install.sh
-```
-
-If `sage` is not on `PATH`, name it: `SAGE_BIN=/opt/sage/sage ./install.sh`.
-
 **No install at all** — copy `server.py` to the machine and write the config by hand: `command` is
 the python of your Sage and `args` is `["/path/to/server.py"]`, plus `"--directory",
 "/path/to/your/work"` if you want one. The server needs only `fastmcp`, `nbformat`,
 `jupyter_client`, `ipykernel`, and Sage's python.
 
-The first two routes put a `simple-sagemath-mcp` console script next to the `sage` executable; it
-calls `server:main`. On an externally managed (Debian/Ubuntu, PEP 668) `sagemath`, use `sage -pip
-install --user .`, which puts the script in `~/.local/bin` instead. The PyPI name is reserved but not published: `sage -pip install
-simple-sagemath-mcp` is future work, not a current command.
+Both routes put a `simple-sagemath-mcp` console script next to the `sage` executable; it calls
+`server:main`. On an externally managed (Debian/Ubuntu, PEP 668) `sagemath`, use `sage -pip install
+--user .`, which puts the script in `~/.local/bin` instead. The PyPI name is reserved but not
+published: `sage -pip install simple-sagemath-mcp` is future work, not a current command.
+
+If any of this gives you trouble, hand it over: paste this README to your coding agent and ask it
+to install the server and write the config. It can run the commands, find the python of your Sage,
+and check that the host starts the server.
 
 ## Configure your host
 Point the host at the **absolute path** of the console script, because many hosts run MCP servers
@@ -78,15 +70,6 @@ the agent's code points at your work.
 ## Other hosts
 The command is the same; only the file and the top-level key differ.
 
-**Claude Desktop / Cursor** (`claude_desktop_config.json` or `.cursor/mcp.json`, key `mcpServers`) —
-the JSON block above. **Gemini CLI** (`~/.gemini/settings.json`, key `mcpServers`) — the same block.
-
-**Claude Code** (CLI):
-
-```bash
-claude mcp add sage -- /path/to/sageenv/bin/simple-sagemath-mcp --directory /path/to/your/work
-```
-
 **Codex** (`~/.codex/config.toml`):
 
 ```toml
@@ -99,14 +82,6 @@ args = ["--directory", "/path/to/your/work"]
 
 ```json
 {"servers": {"sage": {"type": "stdio",
-  "command": "/path/to/sageenv/bin/simple-sagemath-mcp",
-  "args": ["--directory", "/path/to/your/work"]}}}
-```
-
-**Zed** (`settings.json`, note `context_servers` and `source`):
-
-```json
-{"context_servers": {"sage": {"source": "custom",
   "command": "/path/to/sageenv/bin/simple-sagemath-mcp",
   "args": ["--directory", "/path/to/your/work"]}}}
 ```
@@ -135,80 +110,9 @@ args = ["--directory", "/path/to/your/work"]
 | `interrupt` | Stop the running computation; the kernel keeps its state |
 | `restart` | Restart the kernel and wipe the namespace |
 
-All seven return one envelope, with `error: null` on success (see **Errors**); the writing tools
-also return `saved`, true when this call wrote the file.
-
-### `exec(code, timeout=None)`
-Returns `{"result", "stdout", "stderr", "truncated", "error"}`: `result` is the `repr()` of the
-final expression (empty for statements or `None`), the streams are kept apart, and `truncated` means
-the inline text was cut and is not recoverable. `timeout` defaults to 2400 s; on expiry the call
-returns `timeout`, the kernel **keeps computing**, and the namespace is kept — call `interrupt` to
-stop it. Sage syntax works: `3^2` is `9`, `1/2` is a rational, `R.<x> = PolynomialRing(QQ)` is a
-ring.
-
-### `nb_run(path)`
-Validates first (JSON, schema, unique ids, no magics, every cell preparses); a failure returns
-`invalid_notebook`, `unsupported_magic`, `invalid_source`, or `not_found` with `saved:false`, and
-the file stays byte-identical. Then it **restarts the kernel**, runs cells in order with
-`execution_count` continuing from the largest existing count, and stops at the first cell that
-raises, writing outputs through that cell and returning `cell_execution_failed` with `saved:true`.
-Otherwise it writes once and leaves the kernel warm.
-
-A notebook with no code cell is not written (`saved:false`), and `nb_run` never creates a file.
-Inline outputs are cut at 20000 characters **by whole output**; on disk nothing is truncated.
-Results keep their mime bundles: `text/plain`, plus `text/latex` and `text/html` when the object
-provides `_latex_()` / `_html_()`.
-
-### `nb_write(path, cells, overwrite=false)`
-Creates a notebook from `[{cell_type, source}]`, with the Sage kernelspec, at nbformat 4.5. Every
-cell gets an id, returned in `cell_ids` ready for `nb_edit`. The whole notebook is validated before
-the write. An existing file without `overwrite:true` returns `exists`; the parent directory must
-exist.
-
-### `nb_read(path, cell_ids=None)`
-Reads from disk only: no write, no execution, no kernel. Without `cell_ids` it returns all cells in
-order; with them, exactly those cells in the order given, and one unknown id fails the call with
-`unknown_cell_id`. Each cell is `{cell_id, cell_type, source}`; code cells carry their full
-`outputs`.
-
-### `nb_edit(path, ops)`
-Ops are `{"op": "edit", "cell_id", "source"}`, `{"op": "add", "source", "cell_type": "code",
-"after"}`, and `{"op": "remove", "cell_id"}`. `add` defaults to code, appends when `after` is
-omitted, and returns its new id in `applied`; `remove` may remove the only cell. The ops are applied
-in memory and the **whole result** is re-validated before one write. On failure nothing is written:
-`applied:[]`, `saved:false`, and `error.details` starts with `op <zero-based index> (<op>):`.
-
-### `interrupt()`
-Sends the interrupt request. `interrupted` is true when a computation may be running and the request
-was sent, otherwise it is a no-op returning false. The namespace survives; the interrupted call
-returns `cell_execution_failed` with `KeyboardInterrupt` in `details`. The flag is approximate right
-after a `timeout`.
-
-### `restart()`
-Replaces the kernel. A running computation is interrupted first; if it does not stop within the
-shutdown timeout, it is killed and respawned and the running call ends with `kernel_died`.
-`restarted` is true only when a new, ready kernel runs.
-
-## Errors
-`error` is `{code, message, details}` on failure, `null` on success. `message` is one sentence; `details` holds a
-traceback, a cell id, or an op index (or `null`); no domain failure is raised as an exception.
-
-| Code | Meaning |
-|------|---------|
-| `invalid_source` | preparse, parse, or compile failed (`exec`, `nb_run`, `nb_write`, `nb_edit`) |
-| `cell_execution_failed` | the code raised, including `KeyboardInterrupt` and a GAP abort (`exec`, `nb_run`) |
-| `timeout` | the per-call budget expired; the kernel may still compute (`exec`) |
-| `gap_crash_loop` | GAP crashed three times in one call; the call was interrupted (`exec`) |
-| `kernel_died` | the kernel died; the namespace was lost, not restarted automatically (`exec`, `nb_run`, `restart`) |
-| `sage_not_found` | no usable Sage from `SAGE_BIN`, `sage` on `PATH`, or the sibling `sage` |
-| `not_found` | the notebook file does not exist (`nb_run`, `nb_read`, `nb_edit`) |
-| `exists` | the target exists and `overwrite` is false (`nb_write`) |
-| `invalid_notebook` | not JSON, not schema-valid, a bad cell id, or text that is not UTF-8 |
-| `unsupported_magic` | a `%` or `!` line in a code cell (`nb_run`, `nb_write`, `nb_edit`) |
-| `unknown_cell_id` | the id is not in the notebook (`nb_read`, `nb_edit`) |
-| `invalid_op` | an op is malformed or impossible beyond an id lookup (`nb_edit`) |
-| `write_failed` | the temp write or the rename failed; the file is untouched |
-| `internal` | unexpected failure; `details` holds `Type: message` (all) |
+All seven return one envelope, with `error: null` on success; the writing tools also return
+`saved`, true when this call wrote the file. [SPEC.md](SPEC.md) §12 has the per-tool behaviour and
+the full table of error codes.
 
 ## Limits
 - No magics and no `!` shell escapes in notebook code cells; they are rejected with the offending

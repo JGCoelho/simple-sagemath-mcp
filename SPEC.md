@@ -459,6 +459,85 @@ schemas are derived from the function signatures. `cells` and `ops` are therefor
 shape) rather than the more precise `oneOf` shape. The output schemas are not
 affected.
 
+### The codes
+
+| Code | Meaning |
+|------|---------|
+| `invalid_source` | preparse, parse, or compile failed (`exec`, `nb_run`, `nb_write`, `nb_edit`) |
+| `cell_execution_failed` | the code raised, including `KeyboardInterrupt` and a GAP abort (`exec`, `nb_run`) |
+| `timeout` | the per-call budget expired; the kernel may still compute (`exec`) |
+| `gap_crash_loop` | GAP crashed three times in one call; the call was interrupted (`exec`) |
+| `kernel_died` | the kernel died; the namespace was lost, not restarted automatically (`exec`, `nb_run`, `restart`) |
+| `sage_not_found` | no usable Sage from `SAGE_BIN`, `sage` on `PATH`, or the sibling `sage` |
+| `not_found` | the notebook file does not exist (`nb_run`, `nb_read`, `nb_edit`) |
+| `exists` | the target exists and `overwrite` is false (`nb_write`) |
+| `invalid_notebook` | not JSON, not schema-valid, a bad cell id, or text that is not UTF-8 |
+| `unsupported_magic` | a `%` or `!` line in a code cell (`nb_run`, `nb_write`, `nb_edit`) |
+| `unknown_cell_id` | the id is not in the notebook (`nb_read`, `nb_edit`) |
+| `invalid_op` | an op is malformed or impossible beyond an id lookup (`nb_edit`) |
+| `write_failed` | the temp write or the rename failed; the file is untouched |
+| `internal` | unexpected failure; `details` holds `Type: message` (all) |
+
+A code is in a tool's `enum` only when that tool can return it, so this table is
+a union: `timeout` and `gap_crash_loop` are `exec`-only, `exists` is
+`nb_write`-only, `invalid_op` is `nb_edit`-only, and `sage_not_found` comes from
+the calls that start a kernel (`exec`, `nb_run`, `restart`).
+
+### Per tool
+
+What each tool promises, which is what its schema enforces.
+
+### `exec(code, timeout=None)`
+Returns `{"result", "stdout", "stderr", "truncated", "error"}`: `result` is the `repr()` of the
+final expression (empty for statements or `None`), the streams are kept apart, and `truncated` means
+the inline text was cut and is not recoverable. `timeout` defaults to 2400 s; on expiry the call
+returns `timeout`, the kernel **keeps computing**, and the namespace is kept — call `interrupt` to
+stop it. Sage syntax works: `3^2` is `9`, `1/2` is a rational, `R.<x> = PolynomialRing(QQ)` is a
+ring.
+
+### `nb_run(path)`
+Validates first (JSON, schema, unique ids, no magics, every cell preparses); a failure returns
+`invalid_notebook`, `unsupported_magic`, `invalid_source`, or `not_found` with `saved:false`, and
+the file stays byte-identical. Then it **restarts the kernel**, runs cells in order with
+`execution_count` continuing from the largest existing count, and stops at the first cell that
+raises, writing outputs through that cell and returning `cell_execution_failed` with `saved:true`.
+Otherwise it writes once and leaves the kernel warm.
+
+A notebook with no code cell is not written (`saved:false`), and `nb_run` never creates a file.
+Inline outputs are cut at 20000 characters **by whole output**; on disk nothing is truncated.
+Results keep their mime bundles: `text/plain`, plus `text/latex` and `text/html` when the object
+provides `_latex_()` / `_html_()`.
+
+### `nb_write(path, cells, overwrite=false)`
+Creates a notebook from `[{cell_type, source}]`, with the Sage kernelspec, at nbformat 4.5. Every
+cell gets an id, returned in `cell_ids` ready for `nb_edit`. The whole notebook is validated before
+the write. An existing file without `overwrite:true` returns `exists`; the parent directory must
+exist.
+
+### `nb_read(path, cell_ids=None)`
+Reads from disk only: no write, no execution, no kernel. Without `cell_ids` it returns all cells in
+order; with them, exactly those cells in the order given, and one unknown id fails the call with
+`unknown_cell_id`. Each cell is `{cell_id, cell_type, source}`; code cells carry their full
+`outputs`.
+
+### `nb_edit(path, ops)`
+Ops are `{"op": "edit", "cell_id", "source"}`, `{"op": "add", "source", "cell_type": "code",
+"after"}`, and `{"op": "remove", "cell_id"}`. `add` defaults to code, appends when `after` is
+omitted, and returns its new id in `applied`; `remove` may remove the only cell. The ops are applied
+in memory and the **whole result** is re-validated before one write. On failure nothing is written:
+`applied:[]`, `saved:false`, and `error.details` starts with `op <zero-based index> (<op>):`.
+
+### `interrupt()`
+Sends the interrupt request. `interrupted` is true when a computation may be running and the request
+was sent, otherwise it is a no-op returning false. The namespace survives; the interrupted call
+returns `cell_execution_failed` with `KeyboardInterrupt` in `details`. The flag is approximate right
+after a `timeout`.
+
+### `restart()`
+Replaces the kernel. A running computation is interrupted first; if it does not stop within the
+shutdown timeout, it is killed and respawned and the running call ends with `kernel_died`.
+`restarted` is true only when a new, ready kernel runs.
+
 ### Output-shape rules worth knowing
 
 - `exec.result` is `repr()` of the trailing expression, `""` when there is none
