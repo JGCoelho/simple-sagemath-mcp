@@ -30,6 +30,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -94,13 +95,21 @@ def _kernel_env(bin_dir: str) -> dict[str, str]:
 def resolve_kernel_python() -> tuple[str, str]:
     """Resolve the python that runs the Sage kernel. Return (python, bin_dir).
 
-    `SAGE_BIN` wins over `sage` on PATH. The sibling `python3`/`python` of the
-    sage executable is preferred; otherwise the sage executable is asked for
-    `sys.executable`. Never falls back to this process's interpreter: a kernel
-    started by a non-Sage python silently lacks Sage. Reads the environment and
-    may run `sage -c`; it starts no kernel and imports no Sage.
+    `SAGE_BIN` wins over `sage` on PATH, which wins over the sibling `sage` of
+    this process's interpreter (an installed console script lives in Sage's bin,
+    so that finds Sage even when the host hides PATH). The sibling
+    `python3`/`python` of the sage executable is preferred; otherwise the sage
+    executable is asked for `sys.executable`. Never falls back to this
+    process's interpreter: a kernel started by a non-Sage python silently lacks
+    Sage. Reads the environment and may run `sage -c`; it starts no kernel and
+    imports no Sage.
     """
     sage_bin = os.environ.get("SAGE_BIN") or shutil.which("sage")
+    if not sage_bin:
+        sibling = os.path.join(
+            os.path.dirname(os.path.realpath(sys.executable)), "sage")
+        if os.path.exists(sibling):
+            sage_bin = sibling
     if not sage_bin:
         raise SageNotFound(SAGE_NOT_FOUND)
     bin_dir = os.path.dirname(os.path.realpath(sage_bin))
@@ -1850,11 +1859,21 @@ async def sage_restart(ctx: Context) -> dict:
     return _restart_out(restarted=True)
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> None:
+    """Run the server on stdio. Parse `argv` (default: the command line).
+
+    `--directory` changes the working directory before the kernel starts, so
+    relative paths in the agent's code point at the agent's work. This is the
+    `simple-sagemath-mcp` console-script entry point.
+    """
     parser = argparse.ArgumentParser(description="SageMath MCP server.")
     parser.add_argument("--directory", metavar="DIR",
                         help="start the kernel in this directory")
-    args = parser.parse_args()
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     if args.directory:
         os.chdir(args.directory)
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()

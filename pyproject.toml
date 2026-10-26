@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simple-sagemath-mcp"
+version = "0.1.0"
+description = "A stateful SageMath MCP server: one persistent kernel, one namespace, seven tools."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "JGCoelho", email = "josegustavocoelho@gmail.com" }]
+keywords = ["sagemath", "mcp", "jupyter", "notebook", "math", "sage"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+# Floor: 3.10. `ast.parse` accepts server.py as far back as 3.9, but the
+# module annotates with PEP 604 unions (`str | None`) and has no
+# `from __future__ import annotations`, so those annotations are evaluated at
+# import time and a 3.9 import raises TypeError. 3.10 is the real floor; it is
+# also the floor in the `# /// script` header of server.py. `test/test_packaging.py`
+# re-derives it from server.py so this value cannot drift.
+requires-python = ">=3.10"
+# fastmcp is pinned to <5: the strict `output_schema` validation that the error
+# envelope relies on may change in a major release.
+dependencies = [
+    "fastmcp>=4.1,<5",
+    "nbformat>=5.10",
+    "jupyter_client>=8.8",
+    "ipykernel>=6",
+]
+
+[project.urls]
+Homepage = "https://github.com/JGCoelho/simple-sagemath-mcp"
+Repository = "https://github.com/JGCoelho/simple-sagemath-mcp"
+Issues = "https://github.com/JGCoelho/simple-sagemath-mcp/issues"
+
+[project.scripts]
+simple-sagemath-mcp = "server:main"
+
+# The server ships as the one file it is: no package directory, no shim, no
+# copy that can drift. Nothing else is included, so test/, images/,
+# .workflow/, and __pycache__ cannot leak into the wheel.
+[tool.setuptools]
+py-modules = ["server"]

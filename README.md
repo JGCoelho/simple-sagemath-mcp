@@ -1,271 +1,243 @@
 ![simple-sagemath-mcp](images/simple-sagemath-banner.png)
 
 # simple-sagemath-mcp
+An MCP server that gives an agent a persistent SageMath kernel — one warm Sage process, one
+namespace, seven tools — and runs `.ipynb` files cell by cell, writing results (LaTeX and HTML
+included) back to disk.
 
-An MCP server that gives an agent a **persistent SageMath kernel**: one warm Sage
-process, one namespace, and Jupyter notebooks you can run cell by cell.
+## Before you start: you need SageMath
+This server does **not** bundle, download, or install SageMath. It drives a SageMath already on the
+machine and cannot work without one; if you work with Sage, you almost certainly have it. Check with
+`sage --version`.
 
-It is small on purpose: one file, seven tools, no daemon, no named sessions. The
-special point is **native notebook support** — it runs `.ipynb` files cell by
-cell and writes the results back, LaTeX and HTML included.
+Everything targets *the python of that Sage*: the server imports Sage's preparser
+(`sage.repl.preparse`) to validate code, and the kernel it starts is that python, which imports
+`sage.all`. So **`sage -pip` is the only pip that can install it**; `pipx`, `uvx`, and a plain `pip
+install` into an unrelated venv cannot be used, because they build an environment on another python
+where the Sage import fails.
 
 ## Install
+Four routes, from fewest lines to most. They all end with a config block for your host.
+
+**One line** — install from git with Sage's pip (works today):
 
 ```bash
+sage -pip install git+https://github.com/JGCoelho/simple-sagemath-mcp
+```
+
+**Three lines** — clone, then install from the checkout; add `--upgrade` later:
+
+```bash
+git clone https://github.com/JGCoelho/simple-sagemath-mcp.git
+cd simple-sagemath-mcp
+sage -pip install .          # later: sage -pip install --upgrade .
+```
+
+**Four lines** — let the installer find Sage, install missing dependencies, and print the config
+block ready to paste (it changes no config file):
+
+```bash
+sage --version
 git clone https://github.com/JGCoelho/simple-sagemath-mcp.git
 cd simple-sagemath-mcp
 ./install.sh
 ```
 
-You need SageMath 10.x (tested with 10.8). `install.sh` finds the `sage`
-executable, derives the python that runs the server from it, installs `fastmcp`
-and `nbformat` into that python if they are missing, and prints the config block
-to paste. It changes no config file.
+If `sage` is not on `PATH`, name it: `SAGE_BIN=/opt/sage/sage ./install.sh`.
 
-Add the block it prints to the MCP config of your host, then restart the host.
-For pi that is `~/.pi/agent/mcp.json`; Claude uses `.mcp.json` or
-`~/.claude.json`:
+**No install at all** — copy `server.py` to the machine and write the config by hand: `command` is
+the python of your Sage and `args` is `["/path/to/server.py"]`, plus `"--directory",
+"/path/to/your/work"` if you want one. The server needs only `fastmcp`, `nbformat`,
+`jupyter_client`, `ipykernel`, and Sage's python.
 
-```json
-{
-  "mcpServers": {
-    "sage": {
-      "command": "/path/to/sage/env/bin/python3",
-      "args": ["/path/to/simple-sagemath-mcp/server.py",
-               "--directory", "/path/to/your/work"]
-    }
-  }
-}
-```
+The first two routes put a `simple-sagemath-mcp` console script next to the `sage` executable; it
+calls `server:main`. On an externally managed (Debian/Ubuntu, PEP 668) `sagemath`, use `sage -pip
+install --user .`, which puts the script in `~/.local/bin` instead. The PyPI name is reserved but not published: `sage -pip install
+simple-sagemath-mcp` is future work, not a current command.
 
-`--directory` changes the working directory of the server before it starts, so a
-relative path in the agent's code points at your work and not at your home
-directory.
-
-If `sage` is not on `PATH`, `install.sh` adds the resolved path to the block,
-because the server looks for Sage in `SAGE_BIN` first and then on `PATH`:
+## Configure your host
+Point the host at the **absolute path** of the console script, because many hosts run MCP servers
+with a sanitized environment:
 
 ```json
-  "env": { "SAGE_BIN": "/opt/sage/sage" }
+{"mcpServers": {"sage": {
+  "command": "/path/to/sageenv/bin/simple-sagemath-mcp",
+  "args": ["--directory", "/path/to/your/work"]}}}
 ```
 
-If the script cannot find Sage, name the executable yourself:
-`SAGE_BIN=/opt/sage/sage ./install.sh`.
+The install is one top-level module (`server.py`), not a package, so `python -m simple_sagemath_mcp`
+does not exist. When the scripts directory is not on the host's `PATH`, the equivalent fallback is:
 
-A manual install is three steps:
+```json
+{ "command": "/path/to/sageenv/bin/python3", "args": ["-m", "server"] }
+```
+
+`--directory` changes the server's working directory before the kernel starts, so a relative path in
+the agent's code points at your work.
+
+## Other hosts
+The command is the same; only the file and the top-level key differ.
+
+**Claude Desktop / Cursor** (`claude_desktop_config.json` or `.cursor/mcp.json`, key `mcpServers`) —
+the JSON block above. **Gemini CLI** (`~/.gemini/settings.json`, key `mcpServers`) — the same block.
+
+**Claude Code** (CLI):
 
 ```bash
-PY=/path/to/sage/env/bin/python3       # the python of your Sage
-"$PY" -m pip install fastmcp nbformat  # one time
-"$PY" server.py                        # starts on stdio and waits for input
+claude mcp add sage -- /path/to/sageenv/bin/simple-sagemath-mcp --directory /path/to/your/work
 ```
 
-The tool list is read at connect time. Start the host again after a change.
+**Codex** (`~/.codex/config.toml`):
 
-## Why a persistent kernel
+```toml
+[mcp_servers.sage]
+command = "/path/to/sageenv/bin/simple-sagemath-mcp"
+args = ["--directory", "/path/to/your/work"]
+```
 
-A fresh Sage process takes about 1.7 s and 200 MB before it can answer `2+2`.
-Without a persistent kernel, an agent that loads a graph, inspects it, and then
-asks for its automorphism group loads the file three times.
+**VS Code** (`.vscode/mcp.json`, note `servers`):
 
-So this server starts one kernel on the first call, keeps it for the life of the
-MCP connection, and keeps everything the agent defines in one namespace.
-Variables, imports, and loaded data survive between calls until `restart` or
-kernel death.
+```json
+{"servers": {"sage": {"type": "stdio",
+  "command": "/path/to/sageenv/bin/simple-sagemath-mcp",
+  "args": ["--directory", "/path/to/your/work"]}}}
+```
+
+**Zed** (`settings.json`, note `context_servers` and `source`):
+
+```json
+{"context_servers": {"sage": {"source": "custom",
+  "command": "/path/to/sageenv/bin/simple-sagemath-mcp",
+  "args": ["--directory", "/path/to/your/work"]}}}
+```
+
+## What differs across hosts
+- **Hidden `PATH`.** Use the absolute path to the console script (or `server.py`); optionally
+  `"env": {"SAGE_BIN": "/path/to/sage"}`. The server also looks for `sage` next to the interpreter
+  running it, so a console script in Sage's `bin` finds Sage with no extra config.
+- **One kernel per server process.** Each session gets its own server and namespace; a restart, a
+  crash, or a recycled process loses it, so write values to keep into a notebook cell (`nb_write`),
+  not only variables.
+- **Client-side timeouts.** Hosts often time out a call before the server's 2400 s budget. Split a
+  long computation or use `interrupt`; a recorded `timeout` means the budget expired, not that the
+  kernel stopped.
+- **Remote-only hosts.** This is a stdio server that starts a local kernel; a remote-only host needs
+  a local bridge.
 
 ## Tools
-
 | Tool | Purpose |
 |------|---------|
 | `exec` | Run Sage code in the kernel namespace and return its output |
-| `nb_run` | Restart the kernel, run the code cells of a notebook, write the outputs into it |
+| `nb_run` | Restart the kernel, run a notebook's code cells, write the outputs |
 | `nb_write` | Write a new notebook from cells and validate it |
 | `nb_read` | Read cells and stored outputs from a notebook |
 | `nb_edit` | Edit, add, or remove cells of an existing notebook atomically |
-| `interrupt` | Stop the running computation. The kernel keeps its state |
+| `interrupt` | Stop the running computation; the kernel keeps its state |
 | `restart` | Restart the kernel and wipe the namespace |
 
-All seven return the same envelope, with `error: null` on success (see
-**Errors**). The three writing tools also return `saved`: true means this call
-wrote the file.
+All seven return one envelope, with `error: null` on success (see **Errors**); the writing tools
+also return `saved`, true when this call wrote the file.
 
 ### `exec(code, timeout=None)`
-
-```json
-{"result": "9", "stdout": "out\n", "stderr": "", "truncated": false,
- "error": null}
-```
-
-- `result` — `repr()` of the final expression, as text; empty when the source is
-  only statements or the value is `None`.
-- `stdout` / `stderr` — what the code wrote on each stream, kept apart.
-- `truncated` — the inline text was cut. The full text is **not recoverable**, so
-  keep individual calls small.
-- `timeout` — seconds for this call, default 2400. On expiry the call returns
-  `timeout`, the kernel **keeps computing**, and the namespace is kept. Call
-  `interrupt` to stop it, `restart` for the hard way out; a second `exec` waits
-  behind the kernel until that computation stops.
-
-Sage syntax works: `3^2` is `9`, `1/2` is a rational, `R.<x> = PolynomialRing(QQ)`
-is a polynomial ring.
+Returns `{"result", "stdout", "stderr", "truncated", "error"}`: `result` is the `repr()` of the
+final expression (empty for statements or `None`), the streams are kept apart, and `truncated` means
+the inline text was cut and is not recoverable. `timeout` defaults to 2400 s; on expiry the call
+returns `timeout`, the kernel **keeps computing**, and the namespace is kept — call `interrupt` to
+stop it. Sage syntax works: `3^2` is `9`, `1/2` is a rational, `R.<x> = PolynomialRing(QQ)` is a
+ring.
 
 ### `nb_run(path)`
+Validates first (JSON, schema, unique ids, no magics, every cell preparses); a failure returns
+`invalid_notebook`, `unsupported_magic`, `invalid_source`, or `not_found` with `saved:false`, and
+the file stays byte-identical. Then it **restarts the kernel**, runs cells in order with
+`execution_count` continuing from the largest existing count, and stops at the first cell that
+raises, writing outputs through that cell and returning `cell_execution_failed` with `saved:true`.
+Otherwise it writes once and leaves the kernel warm.
 
-Runs a notebook the way a user would.
-
-1. Load and validate the file: JSON, nbformat schema, unique cell ids, no
-   magics, every code cell preparses. A failure returns `invalid_notebook`,
-   `unsupported_magic`, `invalid_source`, or `not_found` with `saved:false`; the
-   file stays byte-identical and the kernel is **not** restarted.
-2. Restart the kernel. Variables from earlier `exec` or `nb_run` calls are gone.
-3. Run the code cells in order, with `execution_count` continuing from the
-   largest existing count.
-4. Stop at the first cell that raises, write the outputs through that cell, and
-   return `cell_execution_failed` with `saved:true` and the cells that ran.
-5. Otherwise write once, return the cells with their outputs, and **leave the
-   kernel running and warm** with the notebook's variables.
-
-A notebook with no code cell is not written (`saved:false`), and `nb_run` never
-creates a file. If the kernel dies mid-run, the cells that already ran are still
-written. Inline outputs are cut at 20000 characters **by whole output**; on disk
-nothing is ever truncated, so `nb_read` recovers the full outputs.
-
-Results keep their mime bundles: `text/plain`, plus `text/latex` from `_latex_()`
-and `text/html` from `_html_()` when the object has them — matrices, polynomials,
-and graphs render as real LaTeX in any notebook viewer.
+A notebook with no code cell is not written (`saved:false`), and `nb_run` never creates a file.
+Inline outputs are cut at 20000 characters **by whole output**; on disk nothing is truncated.
+Results keep their mime bundles: `text/plain`, plus `text/latex` and `text/html` when the object
+provides `_latex_()` / `_html_()`.
 
 ### `nb_write(path, cells, overwrite=false)`
-
-Creates a notebook from `[{cell_type, source}]` in the given order, with the Sage
-kernelspec, at nbformat 4.5. Every cell gets an id; the ids come back in
-`cell_ids` in order, ready for `nb_edit`. The whole notebook is validated before
-the write, so a magic or a syntax error leaves the target untouched. An existing
-file without `overwrite:true` returns `exists`. The parent directory must already
-exist; it is never created. `nb_write` never executes and never touches the
-namespace.
-
-Use it to **document your work**: a notebook is the artifact another agent — or
-you after a restart — can read with `nb_read`, rerun with `nb_run`, and pick up
-from, so the steps and the values that matter do not live only in the chat.
+Creates a notebook from `[{cell_type, source}]`, with the Sage kernelspec, at nbformat 4.5. Every
+cell gets an id, returned in `cell_ids` ready for `nb_edit`. The whole notebook is validated before
+the write. An existing file without `overwrite:true` returns `exists`; the parent directory must
+exist.
 
 ### `nb_read(path, cell_ids=None)`
-
-Reads from disk and nothing else: no write, no execution, no kernel. Without
-`cell_ids` it returns all cells in notebook order; with `cell_ids`, exactly those
-cells in the order given, and one unknown id fails the whole call with
-`unknown_cell_id` and the id in `details`.
-
-Each cell is `{cell_id, cell_type, source}`; code cells also carry the full
-`outputs` stored on disk. `nbformat` and `nbformat_minor` are the values **on
-disk**, so a 4.4 file reports `4` and `4`. A notebook that is not UTF-8, or whose
-cell text cannot be sent as UTF-8, is `invalid_notebook`.
+Reads from disk only: no write, no execution, no kernel. Without `cell_ids` it returns all cells in
+order; with them, exactly those cells in the order given, and one unknown id fails the call with
+`unknown_cell_id`. Each cell is `{cell_id, cell_type, source}`; code cells carry their full
+`outputs`.
 
 ### `nb_edit(path, ops)`
-
-```json
-[{"op": "edit", "cell_id": "a1b2c3d4", "source": "x = 2"},
- {"op": "add", "source": "x^2", "cell_type": "code", "after": "a1b2c3d4"},
- {"op": "remove", "cell_id": "e5f6a7b8"}]
-```
-
-`add` defaults to `cell_type: code`, appends when `after` is omitted, and returns
-its new id in `applied`. `remove` may remove the only cell.
-
-The ops are applied in memory and the **whole result** is re-validated, so a
-pre-existing invalid cell blocks an edit that does not fix it. Only then is the
-file written, once. On any failure nothing is written: `applied:[]`,
-`saved:false`, the file is byte-identical, and `error.details` starts with
-`op <zero-based index> (<op>):`. `nb_edit` never creates a file and never
-executes.
+Ops are `{"op": "edit", "cell_id", "source"}`, `{"op": "add", "source", "cell_type": "code",
+"after"}`, and `{"op": "remove", "cell_id"}`. `add` defaults to code, appends when `after` is
+omitted, and returns its new id in `applied`; `remove` may remove the only cell. The ops are applied
+in memory and the **whole result** is re-validated before one write. On failure nothing is written:
+`applied:[]`, `saved:false`, and `error.details` starts with `op <zero-based index> (<op>):`.
 
 ### `interrupt()`
-
-Sends the kernel's interrupt request. `interrupted` is true when the kernel may
-be computing and the request was sent; otherwise it is a no-op returning false.
-The namespace is untouched, so variables survive; the interrupted call returns
-`cell_execution_failed` with `KeyboardInterrupt` in `details`.
-
-One caveat: the server tracks one flag, not the kernel's real state, so right
-after a `timeout` it can report `interrupted:true` for a computation that has
-already ended (the interrupt is harmless there). It clears on the next completed
-call or a restart.
+Sends the interrupt request. `interrupted` is true when a computation may be running and the request
+was sent, otherwise it is a no-op returning false. The namespace survives; the interrupted call
+returns `cell_execution_failed` with `KeyboardInterrupt` in `details`. The flag is approximate right
+after a `timeout`.
 
 ### `restart()`
-
-Replaces the kernel. The old namespace is gone and the new kernel is ready when
-the call returns, so the next call starts clean. A running computation is
-interrupted first; if it does not stop within the shutdown timeout, the kernel is
-killed and respawned, and the running call ends with `kernel_died`. `restarted` is
-true only when a new, ready kernel is running; a failure is reported in `error`,
-never raised.
+Replaces the kernel. A running computation is interrupted first; if it does not stop within the
+shutdown timeout, it is killed and respawned and the running call ends with `kernel_died`.
+`restarted` is true only when a new, ready kernel runs.
 
 ## Errors
+`error` is `{code, message, details}` on failure, `null` on success. `message` is one sentence; `details` holds a
+traceback, a cell id, or an op index (or `null`); no domain failure is raised as an exception.
 
-`error` is `null` on success. On failure it is `{code, message, details}`:
-`message` is one sentence and `details` holds a traceback, the offending cell id,
-or the op index (or `null`). No domain failure is ever raised as an exception.
-
-| Code | Meaning | Tools |
-|------|---------|-------|
-| `invalid_source` | preparse, parse, or compile failed | `exec`, `nb_run`, `nb_write`, `nb_edit` |
-| `cell_execution_failed` | the code raised (includes `KeyboardInterrupt` and a GAP abort) | `exec`, `nb_run` |
-| `timeout` | the per-call budget expired; the kernel may still compute | `exec` |
-| `gap_crash_loop` | GAP crashed three times in one call; the call was interrupted | `exec` |
-| `kernel_died` | the kernel died; the namespace was lost and is not restarted automatically | `exec`, `nb_run`, `restart` |
-| `sage_not_found` | `SAGE_BIN` / `sage` on `PATH` did not resolve to a usable install | `exec`, `nb_run`, `restart` |
-| `not_found` | the notebook file does not exist | `nb_run`, `nb_read`, `nb_edit` |
-| `exists` | the target exists and `overwrite` is false | `nb_write` |
-| `invalid_notebook` | not JSON, not schema-valid, a bad cell id, or text that is not UTF-8 | `nb_run`, `nb_read`, `nb_edit`, `nb_write` |
-| `unsupported_magic` | a `%` or `!` line in a code cell | `nb_run`, `nb_write`, `nb_edit` |
-| `unknown_cell_id` | the id is not in the notebook | `nb_read`, `nb_edit` |
-| `invalid_op` | an op is malformed or impossible beyond an id lookup | `nb_edit` |
-| `write_failed` | the temp write or the rename failed; the file is untouched | `nb_run`, `nb_write`, `nb_edit` |
-| `internal` | unexpected failure; `details` holds `Type: message` | all |
+| Code | Meaning |
+|------|---------|
+| `invalid_source` | preparse, parse, or compile failed (`exec`, `nb_run`, `nb_write`, `nb_edit`) |
+| `cell_execution_failed` | the code raised, including `KeyboardInterrupt` and a GAP abort (`exec`, `nb_run`) |
+| `timeout` | the per-call budget expired; the kernel may still compute (`exec`) |
+| `gap_crash_loop` | GAP crashed three times in one call; the call was interrupted (`exec`) |
+| `kernel_died` | the kernel died; the namespace was lost, not restarted automatically (`exec`, `nb_run`, `restart`) |
+| `sage_not_found` | no usable Sage from `SAGE_BIN`, `sage` on `PATH`, or the sibling `sage` |
+| `not_found` | the notebook file does not exist (`nb_run`, `nb_read`, `nb_edit`) |
+| `exists` | the target exists and `overwrite` is false (`nb_write`) |
+| `invalid_notebook` | not JSON, not schema-valid, a bad cell id, or text that is not UTF-8 |
+| `unsupported_magic` | a `%` or `!` line in a code cell (`nb_run`, `nb_write`, `nb_edit`) |
+| `unknown_cell_id` | the id is not in the notebook (`nb_read`, `nb_edit`) |
+| `invalid_op` | an op is malformed or impossible beyond an id lookup (`nb_edit`) |
+| `write_failed` | the temp write or the rename failed; the file is untouched |
+| `internal` | unexpected failure; `details` holds `Type: message` (all) |
 
 ## Limits
-
-- No magics and no `!` shell escapes in notebook code cells; they are rejected
-  with the offending cell id.
-- One kernel and one lock, so one computation runs at a time. That follows from
-  the one-kernel design.
-- **This is not a sandbox.** The kernel runs the code the agent sends, with your
-  user permissions and access to your files. Use a container or a separate user
-  if you do not trust the agent.
+- No magics and no `!` shell escapes in notebook code cells; they are rejected with the offending
+  cell id. One kernel and one lock, so one computation runs at a time.
+- **This is not a sandbox.** The kernel runs the code the agent sends, with your user permissions
+  and access to your files.
 
 ## Requirements
-
-- SageMath 10.x. Tested with Sage 10.8 on Linux.
-- `fastmcp` and `nbformat` in the python of your Sage (`install.sh` does this).
-- `jupyter_client` and `ipykernel`, which are part of the Sage environment.
-- Python 3.10 or newer.
+- SageMath 10.x (tested with 10.8 on Linux); the server module itself needs Python 3.10+.
+- `fastmcp`, `nbformat`, `jupyter_client`, and `ipykernel` in the python of your Sage. `sage -pip
+  install .` installs all four; `install.sh` installs the first two (`jupyter_client` and
+  `ipykernel` come with Sage).
 
 ## Tests
-
-Run from this directory with the python that `install.sh` printed:
+Run from this directory with the python of your Sage:
 
 ```bash
 PY=/path/to/sage/env/bin/python3
 PATH="$(dirname "$PY"):$PATH" "$PY" -m unittest discover -s test -v
 # or, without sage on PATH:
 SAGE_BIN=/path/to/sage "$PY" -m unittest discover -s test -v
-```
-
-A single test uses its file name as the module, since `test/` has no
-`__init__.py`:
-
-```bash
-PYTHONPATH=test "$PY" -m unittest test_exec.TestExec.test_value -v
-```
-
-Each file finishes in under 30 s. The one long test is opt-in:
-
-```bash
+# a single file (test/ has no __init__.py):
+PYTHONPATH=test "$PY" -m unittest test_packaging -v
+# the one long test is opt-in:
 SAGE_MCP_LONG=1 PATH="$(dirname "$PY"):$PATH" "$PY" test/test_long_exec.py -v
 ```
 
-[SPEC.md](SPEC.md) describes the architecture, the concurrency model, the
-notebook format rules, the constants, and the test layout in detail.
+[SPEC.md](SPEC.md) describes the architecture, the concurrency model, the notebook rules, the
+constants, and the test layout in detail.
 
 ## License
-
 MIT. See [LICENSE](LICENSE).

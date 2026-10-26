@@ -64,7 +64,12 @@ Named sessions were removed deliberately (see §13).
 
 `resolve_kernel_python()` returns `(python, bin_dir)`:
 
-1. `SAGE_BIN` if set, else `shutil.which("sage")`. Neither → `SageNotFound`.
+1. `SAGE_BIN` if set, else `shutil.which("sage")`, else the sibling `sage`
+   of `realpath(sys.executable)` when that file exists. None → `SageNotFound`.
+   The third source exists because an installed console script lives in Sage's
+   `bin`, so it still finds Sage when the host hides `PATH`. It locates the
+   *launcher* only; the kernel python is still derived from the launcher's bin
+   directory, never from `sys.executable`.
 2. `bin_dir = dirname(realpath(sage_bin))`.
 3. Try `bin_dir/python3`, then `bin_dir/python`. A sibling interpreter is the
    normal layout of conda and of the official Sage tarball.
@@ -118,6 +123,27 @@ install, not a dead kernel), and `_start_kernel` stops the kernel. Without that
 check a Sage-less kernel would be accepted as ready, `restart` would claim
 `restarted: true`, and `nb_run` would write the import traceback into the
 notebook as the outputs of its first cell.
+
+### Packaging
+
+`pyproject.toml` ships the server as the single top-level module it already is
+(`[tool.setuptools] py-modules = ["server"]`); there is no package directory, no
+shim, and no copy that can drift from `server.py`. `[project.scripts]` maps
+`simple-sagemath-mcp = "server:main"`, and `main(argv=None)` parses
+`sys.argv[1:]`, changes to `--directory` if given, and calls `mcp.run()`. The
+module layout is flat, so `python -m simple_sagemath_mcp` is not available;
+`python -m server` is.
+
+`requires-python` is `>=3.10`. `ast.parse(feature_version=(3, 9))` accepts the
+source, but the annotations use PEP 604 unions (`str | None`) without
+`from __future__ import annotations`, so importing on 3.9 raises `TypeError`;
+`test/test_packaging.py` re-derives the floor from `server.py`.
+`fastmcp` is pinned to `>=4.1,<5` because the strict `output_schema`
+enforcement that the common error envelope depends on may change in a major
+version. The remaining dependencies (`nbformat`, `jupyter_client`,
+`ipykernel`) are the notebook and kernel APIs the module imports directly.
+The install runs on Sage's own interpreter (`sage -pip install .`): the server
+imports `sage.repl.preparse` for preparsing, and the kernel imports `sage.all`.
 
 ---
 
@@ -482,6 +508,7 @@ affected.
 | `test/test_exec.py` | yes | values, preparse, persistence, runtime/syntax errors, split streams, timeout then interrupt, restart while busy, interrupt idle/busy, truncation, GAP guard, `display` is not the result, output shape |
 | `test/test_nb_edit.py` | no | load/validate, UTF-8 and legacy-id rules, `nb_write`, `nb_read` selection and disk versions, op order, atomicity and hash equality, mode and symlink preservation |
 | `test/test_nb_run.py` | yes | restart first, disk vs inline outputs, stop-at-error with `saved:true`, validation failure without restart or write, zero code cells, inline-only truncation, a concurrent edit is not lost |
+| `test/test_packaging.py` | no | `pyproject.toml` metadata, `main(["--help"])` and `--directory`, the sibling-`sage` resolution fallback, and the `requires-python` floor re-derived from `server.py` |
 | `test/test_long_exec.py` | yes | opt-in (`SAGE_MCP_LONG=1`): a ~50 s `exec` returns its exact value, so a long call survives without a disconnect |
 
 Kernel-free where possible: anything that needs an interpreter is mocked, and

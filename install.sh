@@ -115,3 +115,10 @@ Other hosts use ~/.claude.json, .mcp.json, or a similar file.
 Add "--directory", "/path/to/your/work" to "args" to start the kernel in that
 directory. The server starts one Sage kernel on the first call and keeps it.
 EOF
+
+cat <<'EOF2'
+Packaged alternative: inside the checkout, "sage -pip install ." installs a
+"simple-sagemath-mcp" console script next to the sage executable. Name that
+script by absolute path in the host config, then you no longer need the python
+and server.py paths above. See README.md, "Install".
+EOF2

@@ -81,7 +81,11 @@ class TestResolve(unittest.TestCase):
         self.assertEqual(Path(bin_dir), prefix)
 
     def test_not_found_message(self):
-        with mock.patch.dict(os.environ, {"PATH": str(self.empty)}, clear=True):
+        # No sibling sage next to our interpreter either: patch it out so the
+        # third resolution source (the console-script fallback) cannot fire.
+        no_sage = str(self.root / "nosage" / "python3")
+        with mock.patch.dict(os.environ, {"PATH": str(self.empty)}, clear=True), \
+                mock.patch.object(server.sys, "executable", no_sage):
             with self.assertRaises(server.SageNotFound) as caught:
                 server.resolve_kernel_python()
         self.assertEqual(
@@ -90,7 +94,9 @@ class TestResolve(unittest.TestCase):
 
     def test_missing_sage_bin_is_not_found(self):
         env = {"PATH": str(self.empty), "SAGE_BIN": str(self.root / "nope" / "sage")}
-        with mock.patch.dict(os.environ, env, clear=True):
+        no_sage = str(self.root / "nosage" / "python3")
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(server.sys, "executable", no_sage):
             with self.assertRaises(server.SageNotFound):
                 server.resolve_kernel_python()
 
