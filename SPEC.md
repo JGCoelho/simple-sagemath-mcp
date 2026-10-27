@@ -609,3 +609,59 @@ semantics are covered without paying 2 s per test. Every file except
   design and is the trade the whole server is built on.
 - **`sage_not_found` for `nb_write`/`nb_edit`** is reported as `internal`: those
   tools never start a kernel, so the code is unreachable there.
+
+---
+
+## Tool-surface design (maintainer-only)
+
+- Pi (and MCP hosts following the Code Mode philosophy) drops
+  `FastMCP(instructions=...)`. Do not put agent-facing facts there. It also does
+  not pass a tool's `outputSchema` to the model for direct calls: only `name`,
+  `description`, and `inputSchema` are visible. Every fact the agent needs at
+  call time must live in the docstring or an input-schema description.
+  `outputSchema` remains authoritative for other MCP clients, codemode, and
+  FastMCP's runtime validation; do not delete it, but do not rely on it for
+  direct-call usability. Do not work around this with a first-call `exec`
+  tutorial, a disguised prompt field, or `_hint` metadata; Pi minimizes
+  server-pushed context by design.
+- Each tool docstring ends with an `Errors:` line naming its `error.code`
+  values. That line is duplicated from `outputSchema.error.properties.code.enum`
+  because direct callers cannot see the latter; keep the two in sync.
+- The error envelope is inlined per tool (not `$ref`): FastMCP strict validation
+  needs no resolver. Do not switch to `$ref` without adding one.
+- The per-tool `code` enums are operative. Do not remove, merge, or shorten.
+- Truncation budget: `MAX_INLINE_CHARS = 20000`. `exec` truncation is
+  unrecoverable; `nb_run` truncation is recoverable with `nb_read`. When the
+  inline budget is exceeded, the overflowing code cell and every later code
+  cell come back as `outputs:[]`. A host may also truncate a very large
+  `nb_read` result; the full text is then in the file the host names.
+- Plot recipe: full form in `sage_exec`'s docstring; short form in
+  `sage_nb_run`'s (nb_run writes to disk; the recipe still applies). `Image` is
+  seeded into the kernel namespace, so `display(Image(filename='p.png'))` works
+  without an extra import. A relative `P.save` path resolves against the kernel
+  cwd, not the notebook's directory.
+- `nb_edit`'s `add` op takes `after` as an existing cell id (omit it to append)
+  and takes no `cell_id`. `nb_write` with `overwrite:true` re-mints all cell ids.
+- `nb_write.cells` item schema now declares `{cell_type, source}`. Keep it in
+  sync with the implementation's `extra = set(spec) - {"cell_type","source"}`.
+- `nb_edit.ops` deliberately has no item schema; per-op shapes differ.
+- Size is measured by `tools/measure.py`, which reports the wire size
+  (`name` + `description` + `inputSchema` + `outputSchema`) and the direct-model
+  size (`name` + `description` + `inputSchema`). Current: wire 15,386 chars
+  (baseline 15,396, -0.1%); direct-model 8,557 chars (baseline 7,901, +8.3%).
+  The increase is deliberate: the `Errors:` lines, the `nb_edit`
+  clarifications, and the `P.save` cwd note carry facts that direct callers
+  cannot get from `outputSchema`. Do not trade them away to hit a wire-size
+  target.
+
+---
+
+## Constants
+
+Name-only index; the values live in `server.py` next to the comment that
+explains them.
+
+- `KERNEL_READ_TIMEOUT`
+- `MAX_INLINE_CHARS`
+- `GAP_CRASH_LIMIT`
+- `SHUTDOWN_TIMEOUT`

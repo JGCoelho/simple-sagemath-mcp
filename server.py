@@ -404,6 +404,7 @@ def _wrapper(prepared: str, filename: str) -> str:
 if "__mcp_ns__" not in globals():
     _mcp_seed = {{"__name__": "__main__"}}
     exec("from sage.all import *", _mcp_seed)
+    exec("from IPython.display import Image", _mcp_seed)
     globals()["__mcp_ns__"] = _mcp_seed
 _mcp_ns = globals()["__mcp_ns__"]
 import ast as _mcp_ast
@@ -1256,10 +1257,9 @@ def _error_schema(codes: list[str]) -> dict:
     """
     return {
         "type": ["object", "null"],
-        "description": ("null on success. On failure, an object: `code` is the "
-                        "failure class, `message` is one human sentence, "
-                        "`details` is the machine-useful extra (traceback, "
-                        "offending source) or null."),
+        "description": ("null on success; on failure {code, message, details}. "
+                        "`details` is a traceback, an offending source "
+                        "fragment, or an op/cell identifier, or null."),
         "properties": {
             "code": {"type": "string", "enum": list(codes)},
             "message": {"type": "string"},
@@ -1275,10 +1275,8 @@ OUTPUT_SCHEMA_EXEC = {
     "properties": {
         "result": {
             "type": "string",
-            "description": ("repr() of the value of the final expression, if the "
-                            "source ends in an expression. Empty string if the "
-                            "source is purely statements or the final expression "
-                            "is None."),
+            "description": ("repr() of the trailing expression; empty string if "
+                            "the source is statements-only or the value is None."),
         },
         "stdout": {
             "type": "string",
@@ -1286,15 +1284,13 @@ OUTPUT_SCHEMA_EXEC = {
         },
         "stderr": {
             "type": "string",
-            "description": ("Anything the code wrote to stderr. Kept apart from "
-                            "`stdout`, never folded into it."),
+            "description": "Anything written to stderr; never folded into stdout.",
         },
         "truncated": {
             "type": "boolean",
             "default": False,
-            "description": ("True if the combined `result` + `stdout` + `stderr` "
-                            "payload exceeded the per-call budget and was cut. "
-                            "The untruncated text is not recoverable."),
+            "description": ("True if result+stdout+stderr was cut at the per-call "
+                            "budget; the untruncated text is not recoverable."),
         },
         "error": _error_schema(["invalid_source", "cell_execution_failed",
                                 "timeout", "gap_crash_loop", "kernel_died",
@@ -1309,11 +1305,10 @@ OUTPUT_SCHEMA_INTERRUPT = {
     "properties": {
         "interrupted": {
             "type": "boolean",
-            "description": ("True if the kernel may be computing and the interrupt "
-                            "request was sent; false if no kernel exists or none is "
-                            "computing. After a `timeout`, the abandoned computation "
-                            "is still running, so this stays true until a later call "
-                            "completes or the kernel is restarted."),
+            "description": ("True if a running call was sent an interrupt; false "
+                            "if idle or no kernel. After `timeout`, the abandoned "
+                            "call keeps this true until it completes or the kernel "
+                            "restarts."),
         },
         "error": _error_schema(["internal"]),
     },
@@ -1326,8 +1321,7 @@ OUTPUT_SCHEMA_RESTART = {
     "properties": {
         "restarted": {
             "type": "boolean",
-            "description": ("True iff a new, ready kernel is running after this "
-                            "call. False only with a non-null `error`."),
+            "description": "True iff a new ready kernel is running after this call.",
         },
         "error": _error_schema(["sage_not_found", "kernel_died", "internal"]),
     },
@@ -1341,8 +1335,8 @@ OUTPUT_SCHEMA_NB_RUN = {
     "properties": {
         "cells": {
             "type": "array",
-            "description": ("Code cells in execution order, with their inline "
-                            "outputs. Non-code cells are omitted."),
+            "description": ("Code cells in execution order with inline outputs; "
+                            "non-code cells omitted."),
             "items": {
                 "type": "object",
                 "properties": {
@@ -1357,15 +1351,12 @@ OUTPUT_SCHEMA_NB_RUN = {
         },
         "truncated": {
             "type": "boolean",
-            "description": ("True if the inline outputs exceeded the per-call "
-                            "budget and were cut. On-disk outputs are complete; "
-                            "use `nb_read` to recover them."),
+            "description": ("True if inline outputs were cut; full outputs are "
+                            "on disk (recover with `nb_read`)."),
         },
         "saved": {
             "type": "boolean",
-            "description": ("True if the notebook file was written by this call. "
-                            "False when nothing ran, validation failed, or the "
-                            "write failed."),
+            "description": "True iff the notebook file was written by this call.",
         },
         "error": _error_schema(["invalid_source", "cell_execution_failed",
                                 "kernel_died", "sage_not_found", "not_found",
@@ -1410,8 +1401,8 @@ OUTPUT_SCHEMA_NB_READ = {
         },
         "cells": {
             "type": "array",
-            "description": ("The selected cells, in the requested order (or "
-                            "notebook order). Empty on failure."),
+            "description": ("Selected cells in the requested order (or notebook "
+                            "order); empty on failure."),
             "items": {
                 "type": "object",
                 "properties": {
@@ -1442,8 +1433,7 @@ OUTPUT_SCHEMA_NB_EDIT = {
     "properties": {
         "applied": {
             "type": "array",
-            "description": ("One entry per op that was applied, in order. Empty if "
-                            "the call failed (nothing was written)."),
+            "description": ("Ops applied in order; empty if the call failed."),
             "items": {
                 "type": "object",
                 "properties": {
@@ -1558,9 +1548,11 @@ async def sage_exec(
     `timeout` (seconds, default 2400) bounds this call only. On expiry the call
     returns error code `timeout`; the kernel keeps computing and the namespace
     is kept, so call `interrupt` to stop the work or `restart` to discard it.
-    Plots: a Sage `Graphics` object is not an image here (it reprs as a
-    PGF/LaTeX blob), so a picture needs `P.save('p.png')` plus, in a notebook,
-    `display(Image(filename='p.png'))`.
+    Plots: a Sage `Graphics` reprs as PGF/LaTeX, not an image; save with
+    `P.save('p.png')` (relative to the kernel cwd, not the notebook) and
+    `display(Image(filename='p.png'))` in a notebook.
+    Errors: invalid_source, cell_execution_failed, timeout, gap_crash_loop,
+    kernel_died, sage_not_found, internal.
     """
     state = ctx.lifespan_context
     try:
@@ -1612,12 +1604,12 @@ async def sage_nb_run(
     raises; cells up to and including it are written and later cells keep what
     was already on disk.
     Truncation: the returned inline outputs are cut at the per-call budget, with
-    `truncated:true` and the cut cells returned as `outputs:[]`. The file always
-    holds the full outputs; read them back with `nb_read`.
-    Plots: a cell ending in a `Graphics` object saves a PGF/LaTeX blob, not an
-    image; to embed a picture, end the cell with `P.save('p.png')` +
-    `display(Image(filename='p.png'))`, and crop with
-    `P.set_axes_range(ymin=…, ymax=…)` where a divergent curve flattens the rest.
+    `truncated:true`; the cell that overflows and every later code cell come
+    back as `outputs:[]`. The file always holds the full outputs; read them back
+    with `nb_read`.
+    Plots: end the cell with `P.save('p.png')` (relative to the kernel cwd) + `display(Image(filename='p.png'))`; a bare `Graphics` reprs as a PGF/LaTeX blob, not an image.
+    Errors: invalid_source, cell_execution_failed, kernel_died, sage_not_found,
+    not_found, invalid_notebook, unsupported_magic, write_failed, internal.
     """
     state = ctx.lifespan_context
     async with _nb_lock:
@@ -1663,23 +1655,33 @@ async def sage_nb_write(
         path: Annotated[str, Field(
             description="Filesystem path to the .ipynb to create.")],
         cells: Annotated[list[dict[str, Any]], Field(
-            description="Cells in order, each {cell_type: code|markdown|raw, "
-                        "source: str}. Validated here, never trusted.")],
+            description="Cells in order, each {cell_type, source}.",
+            json_schema_extra={
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "cell_type": {"type": "string",
+                                      "enum": ["code", "markdown", "raw"]},
+                        "source": {"type": "string"},
+                    },
+                    "required": ["cell_type", "source"],
+                }
+            },
+        )],
         overwrite: Annotated[bool, Field(
             description="Replace an existing file. Default false.")] = False) -> dict:
     """Create a new notebook from cells, validate it, and write it atomically.
-
-    A *notebook is a SageMath artifact another agent, or
-    you after a restart, can pick up from* (read with `nb_read`, rerun with
-    `nb_run`). Put the steps that mattered and the values that matter into cells,
-    so they do not live only in the chat.
 
     State: writes the file at `path` at nbformat 4.5, so every cell has an id;
     the ids are returned in `cell_ids` and can go straight into `nb_edit`.
     Metadata is the Sage kernelspec. It never touches the kernel namespace.
     Never: it never creates parent directories, and never creates or truncates
     the file on a validation or write failure. Without `overwrite:true`,
-    an existing file returns `exists` and is left byte-identical.
+    an existing file returns `exists` and is left byte-identical; with
+    `overwrite:true` the cells are rewritten and get fresh ids.
+    Errors: invalid_source, exists, invalid_notebook, unsupported_magic,
+    write_failed, internal.
     """
     async with _nb_lock:
         try:
@@ -1743,13 +1745,15 @@ async def sage_nb_read(
 
     State: reads only. No in-memory notebook state is consulted, so every call
     reflects the file; a notebook below nbformat 4.5 is upgraded in memory (ids
-    are minted) but the file is left byte-identical and `nbformat`/
-    `nbformat_minor` report the on-disk values.
+    are minted); the file is not written and `nbformat`/`nbformat_minor` report
+    on-disk values.
     Never: it does not write, execute, or restart a kernel. An unknown id in
     `cell_ids` returns `unknown_cell_id` with the id in `details`, `cells:[]`,
     and both version fields null.
     Output: code cells carry their full on-disk `outputs`; use this to recover
-    the outputs that an `nb_run` inline view truncated.
+    the outputs that an `nb_run` inline view truncated. A host may truncate a
+    very large result and name a file that holds the full text.
+    Errors: not_found, invalid_notebook, unknown_cell_id, internal.
     """
     try:
         nb, disk_format, disk_minor = _load_nb(path)
@@ -1771,21 +1775,26 @@ async def sage_nb_edit(
         ops: Annotated[list[dict[str, Any]], Field(
             min_length=1,
             description="Operations in order, each one of {op:edit, cell_id, "
-                        "source}, {op:add, source, cell_type?, after?}, or "
-                        "{op:remove, cell_id}. Validated here, never trusted.")]
+                        "source}, {op:add, source, cell_type?, after?} (`after` "
+                        "is an existing cell id; omit it to append; `add` takes "
+                        "no cell_id), or {op:remove, cell_id}. Validated here, "
+                        "never trusted.")]
         ) -> dict:
     """Apply edit/add/remove cell ops to an existing notebook atomically.
 
     State: the ops are applied in memory and the whole result is re-validated;
     only then is the file rewritten once. Cells are addressed by `cell_id`
-    (call `nb_read` first); an `add` without `cell_type` defaults to `code` and
-    its new id is returned in `applied`.
+    (call `nb_read` first); an `add` without `cell_type` defaults to `code`,
+    takes `after` as an existing cell id (omit it to append), and its new id is
+    returned in `applied`.
     Never: it does not create a file (a missing path is `not_found`), does not
     execute the notebook, and never writes on failure: if any op is malformed
     (`invalid_op`), names an unknown id (`unknown_cell_id`), or the result has a
     magic/syntax error, `applied` is empty and the file is byte-identical. The
     error's `details` starts with `op <zero-based index> (<op>):` for an op that
     failed.
+    Errors: invalid_source, not_found, invalid_notebook, unsupported_magic,
+    unknown_cell_id, invalid_op, write_failed, internal.
     """
     async with _nb_lock:
         try:
@@ -1825,6 +1834,7 @@ async def sage_interrupt(ctx: Context) -> dict:
     Never: it does not restart the kernel, wipe variables, or wait for the call
     to finish. `interrupted` is true only if the kernel is alive and a call is
     running; on an idle kernel this is a no-op returning false.
+    Errors: internal.
     """
     state = ctx.lifespan_context
     try:
@@ -1845,6 +1855,7 @@ async def sage_restart(ctx: Context) -> dict:
     and respawned, and that call ends with `kernel_died`.
     Never: it does not leave the kernel stopped, and a failure to resolve Sage or
     start the kernel is reported in `error` (`restarted:false`), not raised.
+    Errors: sage_not_found, kernel_died, internal.
     """
     state = ctx.lifespan_context
     try:

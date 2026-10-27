@@ -116,6 +116,13 @@ class TestExec(unittest.TestCase):
         self.assertIsNone(r["error"])
         self.assertEqual(r["result"], "3")
 
+    def test_image_is_seeded(self):
+        # The plot recipe says `display(Image(...))`; Image must be in the
+        # namespace without an extra import, or the recipe fails.
+        r = _mcp.call("exec", code="Image")
+        self.assertIsNone(r["error"])
+        self.assertIn("IPython", r["result"])
+
     def test_no_session_param(self):
         # There is exactly one namespace: `session` is not part of the input.
         with self.assertRaises(Exception):
