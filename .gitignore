@@ -19,3 +19,6 @@ venv/
 .workflow/
 # notebooks executed while testing the examples
 *.out.ipynb
+
+# local measurement harness, not part of the package
+tools/
