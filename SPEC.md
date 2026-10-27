@@ -588,6 +588,7 @@ shutdown timeout, it is killed and respawned and the running call ends with `ker
 | `test/test_nb_edit.py` | no | load/validate, UTF-8 and legacy-id rules, `nb_write`, `nb_read` selection and disk versions, op order, atomicity and hash equality, mode and symlink preservation |
 | `test/test_nb_run.py` | yes | restart first, disk vs inline outputs, stop-at-error with `saved:true`, validation failure without restart or write, zero code cells, inline-only truncation, a concurrent edit is not lost |
 | `test/test_packaging.py` | no | `pyproject.toml` metadata, `main(["--help"])` and `--directory`, the sibling-`sage` resolution fallback, and the `requires-python` floor re-derived from `server.py` |
+| `test/test_tool_docs.py` | no | each tool's `Errors:` docstring line equals its `outputSchema.error.properties.code.enum` |
 | `test/test_long_exec.py` | yes | opt-in (`SAGE_MCP_LONG=1`): a ~50 s `exec` returns its exact value, so a long call survives without a disconnect |
 
 Kernel-free where possible: anything that needs an interpreter is mocked, and
