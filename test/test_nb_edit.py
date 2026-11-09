@@ -19,6 +19,7 @@ import server
 from sagemcp import constants, notebook_io
 from sagemcp.errors import NotebookError
 from sagemcp.notebook_io import _apply_ops, _load_nb, _save_nb, _validate_cells
+from sagemcp.notebook_run import _cell_error_detail, _clean_traceback
 
 
 def digest(path) -> str:
@@ -607,7 +608,7 @@ class TestErrorDetail(unittest.TestCase):
     ]
 
     def test_wrapper_frames_and_colours_are_removed(self):
-        text = server._clean_traceback(self.TRACEBACK)
+        text = _clean_traceback(self.TRACEBACK)
         self.assertNotIn("_mcp_", text)
         self.assertNotIn("\x1b", text)
         self.assertNotIn("In[3]", text)
@@ -622,7 +623,7 @@ class TestErrorDetail(unittest.TestCase):
                 {"output_type": "error", "ename": "ZeroDivisionError",
                  "evalue": "rational division by zero",
                  "traceback": self.TRACEBACK}]
-        detail = server._cell_error_detail("abc", outs)
+        detail = _cell_error_detail("abc", outs)
         self.assertTrue(detail.startswith("abc: ZeroDivisionError"))
         self.assertNotIn("_mcp_", detail)
         self.assertNotIn("\x1b", detail)
@@ -631,7 +632,7 @@ class TestErrorDetail(unittest.TestCase):
         # A traceback that is nothing but wrapper frames must not leave "".
         outs = [{"output_type": "error", "ename": "ValueError", "evalue": "boom",
                  "traceback": ["Cell In[2], line 10\n _mcp_ns"]}]
-        self.assertEqual(server._cell_error_detail("c1", outs),
+        self.assertEqual(_cell_error_detail("c1", outs),
                          "c1: ValueError: boom")
 
 
