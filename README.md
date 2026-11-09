@@ -105,7 +105,7 @@ args = ["--directory", "/path/to/your/work"]
 - **One kernel per server process.** Each session gets its own server and namespace; a restart, a
   crash, or a recycled process loses it, so keep code you want again in a `.py` or `.sage` file and
   run it with `run_file`, not only in variables.
-- **Client-side timeouts.** Hosts often time out a call before the server's 2400 s budget. Pass a
+- **Client-side timeouts.** Hosts often time out a call before the server's default 2400 s wait. Pass a
   `timeout` below the host's limit: a call past it returns `status: running` with a `job_id`, the job
   keeps running, and `job_status` reports it until it ends. `interrupt` stops it.
 - **Remote-only hosts.** This is a stdio server that starts a local kernel; a remote-only host needs
@@ -122,8 +122,9 @@ args = ["--directory", "/path/to/your/work"]
 
 `exec` and `run_file` run as jobs. A call that outlasts its `timeout` (default 2400 s) returns
 `status: running`, a `job_id`, `elapsed` and the output so far, and the job keeps the kernel. The
-timeout bounds the wait, not the job. Poll `job_status` with the id until it reports `done`, `error`
-or `interrupted`. While a job holds the kernel, other calls return `kernel_busy`; they are not queued.
+timeout bounds the wait, not the job: nothing on the server stops a job for running long. Poll
+`job_status` with the id until it reports `done`, `error` or `interrupted`. While a job holds the
+kernel, other calls return `kernel_busy`; they are not queued.
 
 The server keeps the running job and the latest finished job. An older job id returns `unknown_job`,
 and a server restart drops every record.

@@ -121,6 +121,10 @@ install, not a dead kernel), and `_start_kernel` stops the kernel. Without that
 check a Sage-less kernel would be accepted as ready, and `restart` would claim
 `restarted: true`.
 
+The seed has a finite read budget, `SAGE_SEED_TIMEOUT`, and expiry is a startup
+failure (§7). With SIGINT deferred, the budget is the only way out of an import
+that hangs.
+
 ### Packaging
 
 `pyproject.toml` installs the `sagemcp` package under `src/`
@@ -210,9 +214,9 @@ package import and kernel start independent of the server's own Sage.
 
 ## 6. One execution path
 
-`_run_source(state, source, filename, prepared=..., timeout=...)` is the only
-place a kernel executes code. Its call sites are the namespace seed and the job
-body that `exec` and `run_file` share (`_run_locked`, §10).
+`_run_source(state, source, filename, prepared=..., budget=..., outs=...)` is
+the only place a kernel executes code. Its call sites are the namespace seed and
+the job body that `exec` and `run_file` share (`_run_locked`, §10).
 It:
 
 1. marks `state["busy"] = True`;
@@ -273,7 +277,15 @@ A call that outlives its wait is not a kill. `exec` and `run_file` start a job
 call returns `status: "running"` with `job_id`, `elapsed`, and the output so far.
 The job keeps the kernel and the namespace until it ends. `job_status` reports it
 until then, `interrupt` stops it, and `restart` ends it as `interrupted`. The job
-itself has no budget.
+itself has no execution budget.
+
+The seed is not a job and does have one. `_seed_namespace` reads with
+`SAGE_SEED_TIMEOUT` = 600 s: SIGINT is deferred while `from sage.all import *`
+runs, so an interrupt cannot end a seed that hangs, and the budget is the only
+way out. Expiry is a startup failure, not an execution timeout: it is reported
+as `kernel_died`, and `_start_kernel` stops the kernel. `_run_source` takes its
+budget as a required keyword with no default, so no call site can inherit one by
+omission: the job body passes `math.inf` and the seed passes its own.
 
 ---
 
@@ -328,8 +340,9 @@ leave a broken state for the next unrelated call.
 
 Cancellation is a known limitation: cancelling an MCP tool call cancels the
 `asyncio` task but cannot stop the worker thread in the middle of a kernel read.
-The lock is released while that thread drains, bounded by the drain and read
-timeouts. Fixing it properly needs a supervisor task that outlives the call.
+The lock is released while that thread drains: the drain is bounded by
+`SHELL_DRAIN_TIMEOUT`, the read loop by nothing but the kernel going idle or
+dying. Fixing it properly needs a supervisor task that outlives the call.
 
 ---
 
@@ -482,9 +495,9 @@ job's record reads `interrupted`, with `kernel_died` as its error.
 | file | kernel | covers |
 |---|---|---|
 | `test/_mcp.py` | — | shared client, sync/async helpers, `call_raw`, `wait_job`, `settle`, `Server` for a second process |
-| `test/test_sagebin.py` | no | `SAGE_BIN` over `PATH`, sibling python, `sage -c` fallback, not-found message, `PATH` prefix, seed/start failures (mocked) |
+| `test/test_sagebin.py` | no | `SAGE_BIN` over `PATH`, sibling python, `sage -c` fallback, not-found message, `PATH` prefix, seed/start failures (mocked), the seed's budget and its expiry |
 | `test/test_exec.py` | yes | values, preparse, persistence, runtime/syntax errors, split streams, timeout then interrupt, restart while busy, interrupt idle/busy, truncation, GAP guard, `display` is not the result, output shape |
-| `test/test_jobs.py` | yes | running envelope and partial output, `job_status`, `kernel_busy` without queueing, `unknown_job`, interrupt and restart reaching a running job, the retention rule (the class is kernel-free; a live check shows an older job is unknown) |
+| `test/test_jobs.py` | yes | running envelope and partial output, `job_status`, `kernel_busy` without queueing, `unknown_job`, interrupt and restart reaching a running job, the retention rule (the class is kernel-free; a live check shows an older job is unknown), and no execution budget: the required `budget` parameter and the `math.inf` a job passes (kernel-free) |
 | `test/test_run_file.py` | yes | `.py` and `.sage` values, preparse, persistence, missing file, bad suffix, bad UTF-8, BOM, syntax error, traceback names the file, relative path against `--directory` (a second server), `kernel_busy`, a long file polled to `done`, interrupt |
 | `test/test_tool_list.py` | no | `tools/list` names and order (the five tools), from the shared client and a second server |
 | `test/test_packaging.py` | no | `pyproject.toml` metadata, `main(["--help"])` and `--directory`, the sibling-`sage` resolution fallback, and the `requires-python` floor re-derived from `src/sagemcp/*.py` |
@@ -501,8 +514,8 @@ Kernel-free where possible: anything that needs an interpreter is mocked. Every 
 
 - **`interrupt` while a call's wait has expired** can report `interrupted: true`
   for a computation that has since finished (§10). Documented, not fixed.
-- **Cancellation** cannot stop a worker thread mid-read (§10). Bounded by the
-  drain/read timeouts.
+- **Cancellation** cannot stop a worker thread mid-read (§10). Bounded only by
+  the computation ending, the kernel dying, or `SHELL_DRAIN_TIMEOUT` for the drain.
 - **One computation at a time** per connection. That follows from the one-kernel
   design and is the trade the whole server is built on.
 ---
@@ -550,5 +563,6 @@ comment that explains them.
 - `KERNEL_READ_TIMEOUT`
 - `KERNEL_READY_TIMEOUT`
 - `MAX_INLINE_CHARS`
+- `SAGE_SEED_TIMEOUT`
 - `SHELL_DRAIN_TIMEOUT`
 - `SHUTDOWN_TIMEOUT`

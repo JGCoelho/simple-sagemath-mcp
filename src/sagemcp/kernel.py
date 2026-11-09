@@ -170,10 +170,12 @@ async def _restart(state: dict) -> None:
 def _interrupt(state: dict) -> bool:
     """Interrupt the running computation. Return whether one was running.
 
-    True iff the kernel is alive and may be computing. `busy` is set for the
-    whole read loop and stays set after a `timeout` (that computation is still
-    running), until the next call completes or `restart` replaces the kernel;
-    in that window a repeated interrupt is harmless and still reports true.
+    True iff the kernel is alive and may be computing. `busy` is set by the read
+    loop and cleared when it ends, so it means "a read loop is running", not "a
+    call is in flight": a call whose wait expired long ago still reads true while
+    its job computes, and a repeated interrupt in that window is harmless. The
+    request's wait never changes the flag; only the end of the read loop (or a
+    restart) does.
     Sends the kernel's interrupt request; keeps the namespace and never takes
     the lock (a running computation holds it).
     """
@@ -307,10 +309,14 @@ def _seed_namespace(state: dict) -> None:
     Done at kernel start, so no user call pays the import and no user call can be
     during it (SIGINT is deferred inside the import, which would make `interrupt`
     a no-op). `prepared=""` skips the server-side preparse, so this module still
-    imports no Sage. Raises `SageNotFound` when the kernel cannot import Sage (a
-    broken install or a wrong python), and `KernelDied` when the seed itself
-    fails or is interrupted: a kernel that cannot seed is not a usable kernel, so
-    the caller must stop it. Never starts a kernel and never writes a file.
+    imports no Sage. Reads with `SAGE_SEED_TIMEOUT` as its budget: the seed is not
+    a job, and with SIGINT deferred the budget is the only way out of an import
+    that hangs.
+    Raises `SageNotFound` when the kernel cannot import Sage (a broken install or
+    a wrong python). A seed that is interrupted, or that outlasts its budget,
+    raises `KernelDied`: a kernel that cannot seed is not a usable kernel, so the
+    caller (`_start_kernel`) stops it. Never starts a kernel and never writes a
+    file.
     """
     try:
         outs = _run_source(state, "", "<seed>", prepared="",
@@ -370,13 +376,19 @@ def _run_source(state: dict, source: str, filename: str, *,
     collects stream/execute_result/display_data/error messages for this call's
     message id, drains the shell reply, and guards against a GAP crash loop.
     Raises `SourceError`, `InternalBudgetExpired`, `KernelDied`, or
-    `GapCrashLoop`; when the budget expires the kernel keeps computing (busy
-    stays set so `interrupt` works).
-    A dead kernel is stopped and forgotten before `KernelDied` is raised.
-    `outs`, when given, is the list the outputs are appended to as they arrive,
-    so a job can read them while it runs. `budget=math.inf` means no budget:
-    the read loop runs until the kernel is idle, which is what a job needs.
-    Assumes the lock is held; starts no kernel.
+    `GapCrashLoop`.
+
+    `budget` is the read loop's own limit and has no default, so no call site can
+    inherit one. A user job passes `math.inf`: a job has no execution budget, so
+    its read loop runs until the kernel is idle, is interrupted, or is restarted,
+    and how long the request waits for it is the caller's business. The namespace
+    seed passes `SAGE_SEED_TIMEOUT`, the one finite budget in the server.
+
+    When the budget expires, `InternalBudgetExpired` is raised and busy stays set,
+    so `interrupt` can still reach a kernel that is still computing. A dead kernel
+    is stopped and forgotten before `KernelDied` is raised. `outs`, when given, is
+    the list the outputs are appended to as they arrive, so a job can read them
+    while it runs. Assumes the lock is held; starts no kernel.
     """
     if prepared is None:
         prepared = _prepare(source)
