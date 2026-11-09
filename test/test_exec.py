@@ -10,8 +10,10 @@ from unittest import mock
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
+sys.path.insert(0, str(HERE.parent / "src"))
 import _mcp
 import server
+from sagemcp import constants
 from server import _exec_view, _summarise, _truncate
 
 MARKER_SLACK = 60          # room for "\n… [truncated N characters]"
@@ -54,7 +56,7 @@ class TestSummarise(unittest.TestCase):
                  "data": {"text/plain": "r" * 100}, "metadata": {}},
                 {"output_type": "stream", "name": "stdout", "text": "o" * 100},
                 {"output_type": "stream", "name": "stderr", "text": "e" * 100}]
-        with mock.patch.object(server, "MAX_INLINE_CHARS", 30):
+        with mock.patch.object(constants, "MAX_INLINE_CHARS", 30):
             view = _exec_view(outs)
         self.assertTrue(view["truncated"])
         # `result` is cut first and uses the whole budget; the marker it gets
@@ -104,7 +106,7 @@ class TestExec(unittest.TestCase):
         self.assertTrue(r["truncated"])
         self.assertEqual(r["result"], "")
         self.assertLessEqual(len(r["stdout"]),
-                             server.MAX_INLINE_CHARS + MARKER_SLACK)
+                             constants.MAX_INLINE_CHARS + MARKER_SLACK)
 
     def test_display_is_not_the_result(self):
         # Regression: a `display(...)` in statement-only code was reported as
@@ -158,7 +160,7 @@ class TestExec(unittest.TestCase):
         elapsed = time.monotonic() - started
         self.assertIsNone(r["error"])
         self.assertTrue(r["restarted"])
-        self.assertLess(elapsed, server.SHUTDOWN_TIMEOUT)
+        self.assertLess(elapsed, constants.SHUTDOWN_TIMEOUT)
         busy = _mcp.unwrap(fut.result(120))
         self.assertIn(busy["error"]["code"],
                       ("kernel_died", "cell_execution_failed"))
@@ -176,7 +178,7 @@ class TestExec(unittest.TestCase):
         self.assertIsNone(i["error"])
         self.assertTrue(i["interrupted"])
         busy = _mcp.unwrap(fut.result(120))
-        self.assertLess(time.monotonic() - started, server.SHUTDOWN_TIMEOUT)
+        self.assertLess(time.monotonic() - started, constants.SHUTDOWN_TIMEOUT)
         self.assertEqual(busy["error"]["code"], "cell_execution_failed")
         self.assertIn("KeyboardInterrupt", busy["error"]["details"])
 

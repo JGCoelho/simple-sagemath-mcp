@@ -1,0 +1,48 @@
+"""The server's exception types and the one shared "no Sage" message.
+
+Nothing here imports anything: every other module may import this one.
+"""
+
+SAGE_NOT_FOUND = ("SageMath not found. Install it, or set SAGE_BIN to the sage "
+                  "executable.")
+
+
+class SageNotFound(Exception):
+    """No Sage installation, or no python that can run its kernel, was found."""
+
+
+class SourceError(Exception):
+    """The source is not valid Sage code (preparse, parse, or compile failed)."""
+
+
+class ExecTimeout(Exception):
+    """The per-call budget expired. The kernel may still be computing."""
+
+    def __init__(self, seconds: float):
+        super().__init__(f"the call exceeded {seconds:g} s")
+        self.seconds = seconds
+
+
+class KernelDied(Exception):
+    """The kernel died, so the namespace is gone."""
+
+
+class GapCrashLoop(Exception):
+    """GAP crashed `GAP_CRASH_LIMIT` times in one call; the call was interrupted."""
+
+    def __init__(self, outputs: list[dict]):
+        super().__init__("GAP crashed repeatedly")
+        self.outputs = outputs
+        self.stderr = "".join(
+            o["text"] for o in outputs
+            if o["output_type"] == "stream" and o.get("name") == "stderr")
+
+
+class NotebookError(Exception):
+    """A notebook failure with the SPEC §9.2 `code`, message, and details."""
+
+    def __init__(self, code: str, message: str, details: object = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = None if details is None else str(details)

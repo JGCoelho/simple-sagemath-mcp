@@ -24,6 +24,20 @@ This is not a sandbox: the kernel runs the code that the agent sends, with the
 user's permissions.
 """
 
+import sys
+from pathlib import Path
+
+_SRC = Path(__file__).resolve().parent / "src"
+if _SRC.is_dir():
+    sys.path.insert(0, str(_SRC))
+
+from sagemcp import constants
+from sagemcp.errors import (ExecTimeout, GapCrashLoop, KernelDied,
+                            NotebookError, SAGE_NOT_FOUND, SageNotFound,
+                            SourceError)
+from sagemcp.sageresolve import _kernel_env, resolve_kernel_python
+from sagemcp.source import _prepare, _wrapper
+
 import argparse
 import ast
 import asyncio
@@ -33,11 +47,9 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 import uuid
-from pathlib import Path
 from queue import Empty
 from typing import Annotated, Any, Callable
 
@@ -48,91 +60,6 @@ from jupyter_client import KernelManager
 from jupyter_client.kernelspec import KernelSpec
 from jupyter_client.blocking import BlockingKernelClient
 from pydantic import Field
-
-
-# --- constants ---------------------------------------------------------------
-
-# There are no environment overrides for these: MCP hosts sanitize the
-# environment. SAGE_BIN is the one exception, because a host that hides PATH
-# must still be able to name the Sage install.
-
-KERNEL_READ_TIMEOUT = 2400.0     # default per-call budget for exec and cell runs
-HEARTBEAT_INTERVAL = 15.0        # progress report interval while a call runs
-SHELL_DRAIN_TIMEOUT = 30.0       # wait for the shell reply after idle
-KERNEL_READY_TIMEOUT = 60.0      # wait_for_ready on a new kernel
-SHUTDOWN_TIMEOUT = 30.0          # restart: wait this long for an in-flight call
-MAX_INLINE_CHARS = 20000         # inline budget per call
-GAP_CRASH_LIMIT = 3              # stderr matches of "Gap crashed" before abort
-NOTEBOOK_NBFORMAT = 4
-NOTEBOOK_MINOR = 5
-KERNEL_META = {
-    "kernelspec": {"name": "sagemath",
-                   "display_name": "SageMath",
-                   "language": "sage"},
-    "language_info": {"name": "sage"},
-}
-GAP_CRASH_PATTERN = re.compile(r"Gap crashed|Restarting Gap", re.IGNORECASE)
-
-
-# --- Sage resolution ---------------------------------------------------------
-
-SAGE_NOT_FOUND = ("SageMath not found. Install it, or set SAGE_BIN to the sage "
-                  "executable.")
-
-
-class SageNotFound(Exception):
-    """No Sage installation, or no python that can run its kernel, was found."""
-
-
-def _kernel_env(bin_dir: str) -> dict[str, str]:
-    """Return this process's environment with `bin_dir` first in PATH.
-
-    The kernel needs it: Sage calls Singular and other programs that live next
-    to the sage executable. It reads the process environment once per start.
-    """
-    env = dict(os.environ)
-    env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
-    return env
-
-
-def resolve_kernel_python() -> tuple[str, str]:
-    """Resolve the python that runs the Sage kernel. Return (python, bin_dir).
-
-    `SAGE_BIN` wins over `sage` on PATH, which wins over the sibling `sage` of
-    this process's interpreter (an installed console script lives in Sage's bin,
-    so that finds Sage even when the host hides PATH). The sibling
-    `python3`/`python` of the sage executable is preferred; otherwise the sage
-    executable is asked for `sys.executable`. Never falls back to this
-    process's interpreter: a kernel started by a non-Sage python silently lacks
-    Sage. Reads the environment and may run `sage -c`; it starts no kernel and
-    imports no Sage.
-    """
-    sage_bin = os.environ.get("SAGE_BIN") or shutil.which("sage")
-    if not sage_bin:
-        sibling = os.path.join(
-            os.path.dirname(os.path.realpath(sys.executable)), "sage")
-        if os.path.exists(sibling):
-            sage_bin = sibling
-    if not sage_bin:
-        raise SageNotFound(SAGE_NOT_FOUND)
-    bin_dir = os.path.dirname(os.path.realpath(sage_bin))
-    for name in ("python3", "python"):
-        candidate = os.path.join(bin_dir, name)
-        if os.path.exists(candidate):
-            return candidate, bin_dir
-    try:
-        done = subprocess.run(
-            [sage_bin, "-c", "import sys; print(sys.executable)"],
-            capture_output=True, text=True, timeout=120,
-            env=_kernel_env(bin_dir),
-        )
-    except (OSError, subprocess.SubprocessError):
-        raise SageNotFound(SAGE_NOT_FOUND) from None
-    lines = [line.strip() for line in done.stdout.splitlines() if line.strip()]
-    python = lines[-1] if lines else ""
-    if not python or not os.path.exists(python):
-        raise SageNotFound(SAGE_NOT_FOUND)
-    return python, bin_dir
 
 
 # --- kernel lifecycle --------------------------------------------------------
@@ -188,7 +115,7 @@ def _start_kernel(state: dict) -> None:
     state["km"], state["kc"] = km, kc
     try:
         kc.start_channels()
-        kc.wait_for_ready(timeout=KERNEL_READY_TIMEOUT)
+        kc.wait_for_ready(timeout=constants.KERNEL_READY_TIMEOUT)
     except BaseException:
         _stop_kernel(state)
         raise
@@ -256,7 +183,7 @@ async def _restart(state: dict) -> None:
         except Exception:
             pass
     try:
-        await asyncio.wait_for(_kernel_lock.acquire(), SHUTDOWN_TIMEOUT)
+        await asyncio.wait_for(_kernel_lock.acquire(), constants.SHUTDOWN_TIMEOUT)
     except asyncio.TimeoutError:
         km = state["km"]
         if km is not None:
@@ -265,7 +192,7 @@ async def _restart(state: dict) -> None:
             except Exception:
                 pass
         try:
-            await asyncio.wait_for(_kernel_lock.acquire(), SHUTDOWN_TIMEOUT)
+            await asyncio.wait_for(_kernel_lock.acquire(), constants.SHUTDOWN_TIMEOUT)
         except asyncio.TimeoutError:
             # The in-flight call is stuck outside the kernel (draining, or
             # preparing code). Do not touch the kernel from here: the call may
@@ -316,7 +243,7 @@ async def _locked(ctx: Context, fn: Callable[..., Any], *args) -> Any:
         task = asyncio.ensure_future(asyncio.to_thread(fn, *args))
         try:
             while True:
-                done, _ = await asyncio.wait({task}, timeout=HEARTBEAT_INTERVAL)
+                done, _ = await asyncio.wait({task}, timeout=constants.HEARTBEAT_INTERVAL)
                 if done:
                     return task.result()
                 try:
@@ -335,100 +262,6 @@ async def _locked(ctx: Context, fn: Callable[..., Any], *args) -> Any:
 # The kernel has one namespace: the dict `__mcp_ns__` in its globals, seeded
 # once with `from sage.all import *`. Helper names in the kernel use the `_mcp_`
 # prefix so they do not clutter `dir()` for user code.
-
-
-class SourceError(Exception):
-    """The source is not valid Sage code (preparse, parse, or compile failed)."""
-
-
-class ExecTimeout(Exception):
-    """The per-call budget expired. The kernel may still be computing."""
-
-    def __init__(self, seconds: float):
-        super().__init__(f"the call exceeded {seconds:g} s")
-        self.seconds = seconds
-
-
-class KernelDied(Exception):
-    """The kernel died, so the namespace is gone."""
-
-
-class GapCrashLoop(Exception):
-    """GAP crashed `GAP_CRASH_LIMIT` times in one call; the call was interrupted."""
-
-    def __init__(self, outputs: list[dict]):
-        super().__init__("GAP crashed repeatedly")
-        self.outputs = outputs
-        self.stderr = "".join(
-            o["text"] for o in outputs
-            if o["output_type"] == "stream" and o.get("name") == "stderr")
-
-
-def _prepare(source: str) -> str:
-    """Preparse and compile Sage source; return the preparsed text.
-
-    This is the static check that execution and notebook validation share, so a
-    source that passes here fails at the same place when it runs. Imports Sage
-    lazily (never at module import) and raises `SourceError` with the exception
-    text on a syntax error, `SageNotFound` if Sage cannot be imported.
-    """
-    try:
-        from sage.repl.preparse import preparse
-    except ImportError as e:
-        raise SageNotFound(SAGE_NOT_FOUND) from e
-    prepared = preparse(source)
-    try:
-        ast.parse(prepared)
-        compile(prepared, "<sage>", "exec")
-    except SyntaxError as e:
-        detail = e.msg or "invalid syntax"
-        if e.lineno is not None:
-            detail = f"{detail} (line {e.lineno})"
-        raise SourceError(detail) from None
-    except UnicodeError as e:
-        # A lone surrogate can come out of a JSON \uD800 escape and is not valid
-        # source. It is a property of the source, so `invalid_source` is right.
-        raise SourceError(f"the source is not valid Unicode ({e})") from None
-    return prepared
-
-
-def _wrapper(prepared: str, filename: str) -> str:
-    """Build the kernel-side code that runs one prepared source.
-
-    Seeds the shared namespace once, then execs the prepared tree in it. A
-    trailing expression is evaluated after the statements and published through
-    IPython with the `_mcp_trailing` metadata, so the collector can turn it into
-    an `execute_result`; a `None` value publishes nothing. Pure: it runs no code.
-    """
-    return f'''
-if "__mcp_ns__" not in globals():
-    _mcp_seed = {{"__name__": "__main__"}}
-    exec("from sage.all import *", _mcp_seed)
-    exec("from IPython.display import Image", _mcp_seed)
-    globals()["__mcp_ns__"] = _mcp_seed
-_mcp_ns = globals()["__mcp_ns__"]
-import ast as _mcp_ast
-_mcp_tree = _mcp_ast.parse({prepared!r})
-if _mcp_tree.body and isinstance(_mcp_tree.body[-1], _mcp_ast.Expr):
-    _mcp_last = _mcp_ast.Expression(_mcp_tree.body.pop().value)
-    exec(compile(_mcp_tree, {filename!r}, "exec"), _mcp_ns, _mcp_ns)
-    _mcp_value = eval(compile(_mcp_last, {filename!r}, "eval"), _mcp_ns, _mcp_ns)
-    if _mcp_value is not None:
-        from IPython.display import display as _mcp_display
-        _mcp_data = {{"text/plain": repr(_mcp_value)}}
-        # Sage objects can give LaTeX and HTML. Use them when a notebook shows the value.
-        for _mcp_mime, _mcp_attr, _mcp_fmt in (("text/latex", "_latex_", "$%s$"),
-                                               ("text/html", "_html_", "%s")):
-            _mcp_method = getattr(_mcp_value, _mcp_attr, None)
-            if _mcp_method is not None:
-                try:
-                    _mcp_data[_mcp_mime] = _mcp_fmt % _mcp_method()
-                except Exception:
-                    pass
-        _mcp_display(_mcp_data, raw=True, metadata={{"_mcp_trailing": True}})
-else:
-    exec(compile(_mcp_tree, {filename!r}, "exec"), _mcp_ns, _mcp_ns)
-'''
 
 
 def _seed_namespace(state: dict) -> None:
@@ -459,7 +292,7 @@ def _seed_namespace(state: dict) -> None:
 
 def _drain_shell(kc: BlockingKernelClient, msg_id: str) -> None:
     """Read the shell reply for `msg_id` for up to SHELL_DRAIN_TIMEOUT, ignoring failures."""
-    deadline = time.monotonic() + SHELL_DRAIN_TIMEOUT
+    deadline = time.monotonic() + constants.SHELL_DRAIN_TIMEOUT
     try:
         while True:
             remaining = deadline - time.monotonic()
@@ -498,7 +331,7 @@ def _run_source(state: dict, source: str, filename: str, *,
     """
     if prepared is None:
         prepared = _prepare(source)
-    budget = KERNEL_READ_TIMEOUT if timeout is None else timeout
+    budget = constants.KERNEL_READ_TIMEOUT if timeout is None else timeout
     km, kc = state["km"], state["kc"]
     if km is None or kc is None or not km.is_alive():
         _died(state, "the kernel is not running")
@@ -538,8 +371,8 @@ def _run_source(state: dict, source: str, filename: str, *,
                 text = content.get("text", "")
                 outs.append({"output_type": "stream", "name": name, "text": text})
                 if name == "stderr":
-                    gap_crashes += len(GAP_CRASH_PATTERN.findall(text))
-                    if gap_crashes >= GAP_CRASH_LIMIT:
+                    gap_crashes += len(constants.GAP_CRASH_PATTERN.findall(text))
+                    if gap_crashes >= constants.GAP_CRASH_LIMIT:
                         # Stop the runaway process. Do not wait for a shell reply:
                         # an interrupted GAP may never send one.
                         try:
@@ -624,7 +457,7 @@ def _exec_view(outs: list[dict]) -> dict:
     """
     stdout, stderr, result, _ = _summarise(outs)
     result = result or ""
-    budget = MAX_INLINE_CHARS
+    budget = constants.MAX_INLINE_CHARS
     result, cut_result = _truncate(result, budget)
     # The cut marker is not content: charge only the characters that were kept.
     budget = max(0, budget - (budget if cut_result else len(result)))
@@ -659,16 +492,6 @@ def _exec_locked(state: dict, code: str, timeout: float | None) -> dict:
 # write replaces it atomically. Notebooks below nbformat 4.5 are upgraded in
 # memory (cell ids are minted) so ops can address every cell, but the upgrade
 # only reaches the disk file when a writing tool runs.
-
-
-class NotebookError(Exception):
-    """A notebook failure with the SPEC §9.2 `code`, message, and details."""
-
-    def __init__(self, code: str, message: str, details: object = None):
-        super().__init__(message)
-        self.code = code
-        self.message = message
-        self.details = None if details is None else str(details)
 
 
 def _fresh_id(seen: set[str]) -> str:
@@ -744,7 +567,7 @@ def _upgrade_ids(nb) -> None:
     Never writes.
     """
     seen = {c.get("id") for c in nb.cells if isinstance(c.get("id"), str)}
-    nb.nbformat_minor = NOTEBOOK_MINOR
+    nb.nbformat_minor = constants.NOTEBOOK_MINOR
     for index, cell in enumerate(nb.cells):
         cid = cell.get("id")
         if not isinstance(cid, str) or not cid:
@@ -819,7 +642,7 @@ def _load_nb(path: str) -> tuple[Any, int, int]:
             "invalid_notebook",
             "The notebook does not declare its nbformat version.",
             f"nbformat={disk_format!r}, nbformat_minor={disk_minor!r}")
-    if disk_minor >= NOTEBOOK_MINOR:
+    if disk_minor >= constants.NOTEBOOK_MINOR:
         _check_raw_ids(raw)
     try:
         nb = nbformat.reads(text, as_version=4)
@@ -828,7 +651,7 @@ def _load_nb(path: str) -> tuple[Any, int, int]:
         raise NotebookError(
             "invalid_notebook", "The notebook is not nbformat-valid.",
             f"{type(e).__name__}: {e}") from None
-    if disk_minor < NOTEBOOK_MINOR:
+    if disk_minor < constants.NOTEBOOK_MINOR:
         _upgrade_ids(nb)
     _check_ids(nb)
     _check_text(nb)
@@ -890,8 +713,8 @@ def _save_nb(nb, path: str) -> None:
         mode = target.stat().st_mode & 0o777
     except OSError:
         mode = 0o644
-    nb.nbformat = NOTEBOOK_NBFORMAT
-    nb.nbformat_minor = NOTEBOOK_MINOR
+    nb.nbformat = constants.NOTEBOOK_NBFORMAT
+    nb.nbformat_minor = constants.NOTEBOOK_MINOR
     tmp_name = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -1212,7 +1035,7 @@ def _run_nb_locked(state: dict, nb, path: str) -> tuple[list[dict], bool, bool, 
             break
         count += 1
     _save_nb(nb, path)
-    inline, truncated = _inline_cells(executed, MAX_INLINE_CHARS)
+    inline, truncated = _inline_cells(executed, constants.MAX_INLINE_CHARS)
     return inline, truncated, True, failure
 
 def _inline_cells(cells: list, budget: int) -> tuple[list[dict], bool]:
@@ -1711,7 +1534,7 @@ async def sage_nb_write(
                         f"cell {index}: {cell_type!r}")
                 built.append(_new_cell(cell_type, source))
             nb = nbformat.v4.new_notebook(
-                metadata=copy.deepcopy(KERNEL_META), cells=built)
+                metadata=copy.deepcopy(constants.KERNEL_META), cells=built)
             seen: set[str] = set()
             for cell in nb.cells:
                 cid = cell.get("id")

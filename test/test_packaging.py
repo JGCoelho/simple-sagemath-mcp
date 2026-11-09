@@ -7,6 +7,7 @@ import ast
 import contextlib
 import io
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -16,7 +17,10 @@ from unittest import mock
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 import server
+from sagemcp import sageresolve
+from sagemcp.errors import SageNotFound
 
 try:
     import tomllib
@@ -155,9 +159,9 @@ class TestSiblingSageFallback(unittest.TestCase):
 
     def resolve(self, python: Path):
         with mock.patch.dict(os.environ, {"SAGE_BIN": ""}), \
-                mock.patch.object(server.shutil, "which", return_value=None), \
-                mock.patch.object(server.sys, "executable", str(python)):
-            return server.resolve_kernel_python()
+                mock.patch.object(shutil, "which", return_value=None), \
+                mock.patch.object(sys, "executable", str(python)):
+            return sageresolve.resolve_kernel_python()
 
     def test_finds_sibling_sage_without_path(self):
         bin_dir, python = self.make_fake(with_sage=True)
@@ -167,7 +171,7 @@ class TestSiblingSageFallback(unittest.TestCase):
 
     def test_no_sibling_sage_is_not_found(self):
         _, python = self.make_fake(with_sage=False)
-        with self.assertRaises(server.SageNotFound):
+        with self.assertRaises(SageNotFound):
             self.resolve(python)
 
 

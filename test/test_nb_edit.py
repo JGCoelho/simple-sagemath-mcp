@@ -13,9 +13,12 @@ from unittest import mock
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
+sys.path.insert(0, str(HERE.parent / "src"))
 import _mcp
 import server
-from server import NotebookError, _apply_ops, _load_nb, _save_nb, _validate_cells
+from sagemcp import constants
+from server import _apply_ops, _load_nb, _save_nb, _validate_cells
+from sagemcp.errors import NotebookError
 
 
 def digest(path) -> str:
@@ -36,7 +39,7 @@ def markdown_cell(source, cell_id="m0"):
 def raw_notebook(path, cells, minor=5):
     """Write a minimal notebook as JSON, bypassing nbformat's repair pass."""
     data = {"nbformat": 4, "nbformat_minor": minor,
-            "metadata": copy.deepcopy(server.KERNEL_META), "cells": cells}
+            "metadata": copy.deepcopy(constants.KERNEL_META), "cells": cells}
     Path(path).write_text(json.dumps(data), encoding="utf-8")
 
 

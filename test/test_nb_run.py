@@ -11,8 +11,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
+sys.path.insert(0, str(HERE.parent / "src"))
 import _mcp
 import server
+from sagemcp import constants
 
 
 def code_cell(source, cell_id, outputs=None, execution_count=None):
@@ -24,7 +26,7 @@ def code_cell(source, cell_id, outputs=None, execution_count=None):
 def raw_notebook(path, cells):
     """Write a complete 4.5 notebook straight to disk (full control of outputs)."""
     data = {"nbformat": 4, "nbformat_minor": 5,
-            "metadata": copy.deepcopy(server.KERNEL_META), "cells": cells}
+            "metadata": copy.deepcopy(constants.KERNEL_META), "cells": cells}
     Path(path).write_text(json.dumps(data), encoding="utf-8")
 
 

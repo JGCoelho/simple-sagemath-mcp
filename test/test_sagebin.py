@@ -3,6 +3,7 @@
 # Kernel-free: resolves Sage against fake prefixes under a temp dir.
 
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -12,7 +13,10 @@ from unittest import mock
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "src"))
 import server
+from sagemcp import sageresolve
+from sagemcp.errors import SageNotFound
 
 # Recorded right after importing the server, before any test needs Sage.
 SAGE_LOADED_ON_IMPORT = "sage" in sys.modules or "sage.all" in sys.modules
@@ -46,7 +50,7 @@ class TestResolve(unittest.TestCase):
 
     def run_resolve(self, env: dict):
         with mock.patch.dict(os.environ, env, clear=True):
-            return server.resolve_kernel_python()
+            return sageresolve.resolve_kernel_python()
 
     def test_sage_bin_wins_over_path(self):
         on_path = make_prefix(self.root / "onpath")
@@ -85,9 +89,9 @@ class TestResolve(unittest.TestCase):
         # third resolution source (the console-script fallback) cannot fire.
         no_sage = str(self.root / "nosage" / "python3")
         with mock.patch.dict(os.environ, {"PATH": str(self.empty)}, clear=True), \
-                mock.patch.object(server.sys, "executable", no_sage):
-            with self.assertRaises(server.SageNotFound) as caught:
-                server.resolve_kernel_python()
+                mock.patch.object(sys, "executable", no_sage):
+            with self.assertRaises(SageNotFound) as caught:
+                sageresolve.resolve_kernel_python()
         self.assertEqual(
             str(caught.exception),
             "SageMath not found. Install it, or set SAGE_BIN to the sage executable.")
@@ -96,12 +100,12 @@ class TestResolve(unittest.TestCase):
         env = {"PATH": str(self.empty), "SAGE_BIN": str(self.root / "nope" / "sage")}
         no_sage = str(self.root / "nosage" / "python3")
         with mock.patch.dict(os.environ, env, clear=True), \
-                mock.patch.object(server.sys, "executable", no_sage):
-            with self.assertRaises(server.SageNotFound):
-                server.resolve_kernel_python()
+                mock.patch.object(sys, "executable", no_sage):
+            with self.assertRaises(SageNotFound):
+                sageresolve.resolve_kernel_python()
 
     def test_env_path_prefix(self):
-        env = server._kernel_env("/opt/sage/bin")
+        env = sageresolve._kernel_env("/opt/sage/bin")
         self.assertEqual(env["PATH"].split(os.pathsep)[0], "/opt/sage/bin")
         self.assertIsNot(env, os.environ)
         old = os.environ.get("PATH", "")
@@ -114,7 +118,7 @@ class TestResolve(unittest.TestCase):
                     "traceback": ["Traceback", "ImportError: no sage.all"]}]
         state = {"km": None, "kc": None, "busy": False}
         with mock.patch.object(server, "_run_source", return_value=outputs):
-            with self.assertRaises(server.SageNotFound) as caught:
+            with self.assertRaises(SageNotFound) as caught:
                 server._seed_namespace(state)
         self.assertIn("no sage.all", str(caught.exception))
 
@@ -134,11 +138,14 @@ class TestResolve(unittest.TestCase):
     def test_import_starts_nothing(self):
         # Importing the server must not import Sage: `_prepare` imports it lazily.
         self.assertFalse(SAGE_LOADED_ON_IMPORT)
-        source = (ROOT / "server.py").read_text()
-        module_level = [line for line in source.splitlines()
-                        if line.startswith(("import sage", "from sage"))]
+        corpus = sorted((ROOT / "src" / "sagemcp").glob("*.py"))
+        sources = [path.read_text() for path in corpus + [ROOT / "server.py"]]
+        module_level = [line for source in sources for line in source.splitlines()
+                        if re.match(r"(?:import|from) sage[\s.]", line)]
         self.assertEqual(module_level, [])
-        self.assertIn("from sage.repl.preparse import preparse", source)
+        lazy = sum(source.count("from sage.repl.preparse import preparse")
+                   for source in sources)
+        self.assertEqual(lazy, 1)
 
 
 if __name__ == "__main__":
