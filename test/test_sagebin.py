@@ -14,9 +14,8 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
-import server
-from sagemcp import sageresolve
-from sagemcp.errors import SageNotFound
+from sagemcp import kernel, sageresolve
+from sagemcp.errors import KernelDied, SageNotFound
 
 # Recorded right after importing the server, before any test needs Sage.
 SAGE_LOADED_ON_IMPORT = "sage" in sys.modules or "sage.all" in sys.modules
@@ -117,23 +116,23 @@ class TestResolve(unittest.TestCase):
                     "evalue": "no sage.all",
                     "traceback": ["Traceback", "ImportError: no sage.all"]}]
         state = {"km": None, "kc": None, "busy": False}
-        with mock.patch.object(server, "_run_source", return_value=outputs):
+        with mock.patch.object(kernel, "_run_source", return_value=outputs):
             with self.assertRaises(SageNotFound) as caught:
-                server._seed_namespace(state)
+                kernel._seed_namespace(state)
         self.assertIn("no sage.all", str(caught.exception))
 
     def test_seed_success_is_silent(self):
         state = {"km": None, "kc": None, "busy": False}
-        with mock.patch.object(server, "_run_source", return_value=[]):
-            server._seed_namespace(state)          # must not raise
+        with mock.patch.object(kernel, "_run_source", return_value=[]):
+            kernel._seed_namespace(state)          # must not raise
 
     def test_start_failure_is_kernel_died(self):
         # Regression: a first-call start failure used to surface as `internal`.
         state = {"km": None, "kc": None, "busy": False}
-        with mock.patch.object(server, "_start_kernel",
+        with mock.patch.object(kernel, "_start_kernel",
                                side_effect=RuntimeError("no ipykernel")):
-            with self.assertRaises(server.KernelDied):
-                server._ensure_kernel(state)
+            with self.assertRaises(KernelDied):
+                kernel._ensure_kernel(state)
 
     def test_import_starts_nothing(self):
         # Importing the server must not import Sage: `_prepare` imports it lazily.
