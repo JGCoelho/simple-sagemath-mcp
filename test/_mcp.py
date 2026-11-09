@@ -102,6 +102,22 @@ def call_async(name: str, **args) -> concurrent.futures.Future:
     return asyncio.run_coroutine_threadsafe(_client.call_tool(name, args), _loop)
 
 
+def settle_call(fut: concurrent.futures.Future, limit: float = 120.0) -> dict:
+    """Make sure a call started with `call_async` has returned; return its dict.
+
+    For a `finally` block, when an assertion has failed. The call returns when its
+    job ends, so an interrupt is sent until it does, as `settle` does for a job id.
+    Do not use it on the success path.
+    """
+    deadline = time.monotonic() + limit
+    while not fut.done():
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"the call is still running after {limit:g} s")
+        call("interrupt")
+        time.sleep(0.2)
+    return unwrap(fut.result())
+
+
 def call(name: str, **args):
     """Call a tool, wait for it, and return the dict of the tool."""
     return unwrap(call_async(name, **args).result(300))

@@ -85,11 +85,17 @@ class TestExec(unittest.TestCase):
     def test_interrupt_busy(self):
         self.assertIsNone(_mcp.call("exec", code="survivor = 41")["error"])
         fut = _mcp.call_async("exec", code="while True: pass")
-        time.sleep(1.0)                      # let the computation start
-        r = _mcp.call("interrupt")
-        self.assertIsNone(r["error"])
-        self.assertTrue(r["interrupted"])
-        busy = _mcp.unwrap(fut.result(120))
+        busy = None
+        try:
+            time.sleep(1.0)                  # let the computation start
+            r = _mcp.call("interrupt")
+            self.assertIsNone(r["error"])
+            self.assertTrue(r["interrupted"])
+            busy = _mcp.unwrap(fut.result(120))
+        finally:
+            # A failed assertion above must not leave the job holding the kernel.
+            if busy is None:
+                _mcp.settle_call(fut)
         self.assertEqual(busy["error"]["code"], "cell_execution_failed")
         self.assertIn("KeyboardInterrupt", busy["error"]["details"])
         # The interrupt keeps the namespace.
@@ -147,14 +153,19 @@ class TestExec(unittest.TestCase):
         # the sage.all import is deferred, so restart falls back to the hard kill).
         self.assertIsNone(_mcp.call("exec", code="warm = 1")["error"])
         fut = _mcp.call_async("exec", code="while True: pass")
-        time.sleep(1.0)                      # let the computation start
-        started = time.monotonic()
-        r = _mcp.call("restart")
-        elapsed = time.monotonic() - started
-        self.assertIsNone(r["error"])
-        self.assertTrue(r["restarted"])
-        self.assertLess(elapsed, constants.SHUTDOWN_TIMEOUT)
-        busy = _mcp.unwrap(fut.result(120))
+        busy = None
+        try:
+            time.sleep(1.0)                  # let the computation start
+            started = time.monotonic()
+            r = _mcp.call("restart")
+            elapsed = time.monotonic() - started
+            self.assertIsNone(r["error"])
+            self.assertTrue(r["restarted"])
+            self.assertLess(elapsed, constants.SHUTDOWN_TIMEOUT)
+            busy = _mcp.unwrap(fut.result(120))
+        finally:
+            if busy is None:
+                _mcp.settle_call(fut)
         self.assertIn(busy["error"]["code"],
                       ("kernel_died", "cell_execution_failed"))
 
@@ -165,12 +176,17 @@ class TestExec(unittest.TestCase):
         # SIGINT was deferred into the computation.
         self.assertTrue(_mcp.call("restart")["restarted"])
         fut = _mcp.call_async("exec", code="while True: pass")
-        time.sleep(1.0)
-        started = time.monotonic()
-        i = _mcp.call("interrupt")
-        self.assertIsNone(i["error"])
-        self.assertTrue(i["interrupted"])
-        busy = _mcp.unwrap(fut.result(120))
+        busy = None
+        try:
+            time.sleep(1.0)
+            started = time.monotonic()
+            i = _mcp.call("interrupt")
+            self.assertIsNone(i["error"])
+            self.assertTrue(i["interrupted"])
+            busy = _mcp.unwrap(fut.result(120))
+        finally:
+            if busy is None:
+                _mcp.settle_call(fut)
         self.assertLess(time.monotonic() - started, constants.SHUTDOWN_TIMEOUT)
         self.assertEqual(busy["error"]["code"], "cell_execution_failed")
         self.assertIn("KeyboardInterrupt", busy["error"]["details"])
