@@ -16,7 +16,8 @@ from jupyter_client.kernelspec import KernelSpec
 from jupyter_client.blocking import BlockingKernelClient
 
 from . import constants
-from .errors import ExecTimeout, GapCrashLoop, KernelBusy, KernelDied, SageNotFound
+from .errors import (GapCrashLoop, InternalBudgetExpired, KernelBusy, KernelDied,
+                     SageNotFound)
 from .jobs import Job, new_job, remember, retire
 from .sageresolve import _kernel_env, resolve_kernel_python
 from .shaping import _summarise
@@ -312,7 +313,14 @@ def _seed_namespace(state: dict) -> None:
     the caller must stop it. Never starts a kernel and never writes a file.
     """
     try:
-        outs = _run_source(state, "", "<seed>", prepared="")
+        outs = _run_source(state, "", "<seed>", prepared="",
+                           budget=constants.SAGE_SEED_TIMEOUT)
+    except InternalBudgetExpired:
+        # A seed that outlasts its budget is a startup failure, not an execution
+        # timeout. Stopping the kernel is the caller's job (`_start_kernel`).
+        raise KernelDied(
+            "the namespace seed did not finish within its budget "
+            f"(SAGE_SEED_TIMEOUT = {constants.SAGE_SEED_TIMEOUT:g} s)") from None
     except KeyboardInterrupt:
         raise KernelDied("the namespace seed was interrupted") from None
     detail = _summarise(outs)[3]
@@ -354,31 +362,31 @@ def _died(state: dict, message: str) -> None:
 
 def _run_source(state: dict, source: str, filename: str, *,
                 prepared: str | None = None,
-                timeout: float | None = None,
+                budget: float,
                 outs: list[dict] | None = None) -> list[dict]:
     """Run one source in the shared namespace and return its outputs in order.
 
     The single execution path. Marks the state busy for the whole read loop,
     collects stream/execute_result/display_data/error messages for this call's
     message id, drains the shell reply, and guards against a GAP crash loop.
-    Raises `SourceError`, `ExecTimeout`, `KernelDied`, or `GapCrashLoop`; on a
-    timeout the kernel keeps computing (busy stays set so `interrupt` works).
+    Raises `SourceError`, `InternalBudgetExpired`, `KernelDied`, or
+    `GapCrashLoop`; when the budget expires the kernel keeps computing (busy
+    stays set so `interrupt` works).
     A dead kernel is stopped and forgotten before `KernelDied` is raised.
     `outs`, when given, is the list the outputs are appended to as they arrive,
-    so a job can read them while it runs. `timeout=math.inf` means no budget:
+    so a job can read them while it runs. `budget=math.inf` means no budget:
     the read loop runs until the kernel is idle, which is what a job needs.
     Assumes the lock is held; starts no kernel.
     """
     if prepared is None:
         prepared = _prepare(source)
-    budget = constants.KERNEL_READ_TIMEOUT if timeout is None else timeout
     km, kc = state["km"], state["kc"]
     if km is None or kc is None or not km.is_alive():
         _died(state, "the kernel is not running")
     deadline = time.monotonic() + budget
     outs = [] if outs is None else outs
     gap_crashes = 0
-    timed_out = False
+    budget_expired = False
     state["busy"] = True
     try:
         try:
@@ -390,7 +398,7 @@ def _run_source(state: dict, source: str, filename: str, *,
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise ExecTimeout(budget)
+                raise InternalBudgetExpired(budget)
             try:
                 msg = kc.get_iopub_msg(timeout=min(remaining, 5.0))
             except Empty:
@@ -435,13 +443,13 @@ def _run_source(state: dict, source: str, filename: str, *,
                              "traceback": content.get("traceback") or []})
             elif mtype == "status" and content.get("execution_state") == "idle":
                 break
-    except ExecTimeout:
-        # The kernel is still computing. Keep busy set, so `interrupt` can reach
-        # it (the flag means "may be computing"; it clears on the next completed
-        # call or a restart).
-        timed_out = True
+    except InternalBudgetExpired:
+        # The read loop gave up, but the kernel may still be computing. Keep busy
+        # set, so `interrupt` can reach it (the flag means "may be computing";
+        # it clears on the next completed call or a restart).
+        budget_expired = True
         raise
     finally:
-        state["busy"] = timed_out
+        state["busy"] = budget_expired
     _drain_shell(kc, msg_id)
     return outs

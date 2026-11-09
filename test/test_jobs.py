@@ -3,19 +3,49 @@
 # A job is an exec (or run_file) call that outlives its wait. These tests cover
 # the running envelope, job_status, kernel_busy, unknown_job, the retention rule
 # (the running job and the latest finished one), and an interrupt or a restart
-# that reaches a running job. TestJobRetention needs no kernel.
+# that reaches a running job. TestJobRetention and TestNoExecutionBudget need no
+# kernel.
 
+import inspect
+import math
 import sys
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE.parent / "src"))
 import _mcp
-from sagemcp import jobs
+from sagemcp import jobs, kernel, tools_exec
+
+
+class TestNoExecutionBudget(unittest.TestCase):
+    """A job has no execution budget: the budget is always passed in. No kernel."""
+
+    def test_run_source_requires_an_explicit_budget(self):
+        param = inspect.signature(kernel._run_source).parameters["budget"]
+        self.assertIs(param.default, inspect.Parameter.empty)
+        self.assertEqual(param.kind, inspect.Parameter.KEYWORD_ONLY)
+
+    def test_user_jobs_pass_infinity(self):
+        # Patch the module object: `tools_exec` qualifies the call as
+        # `kernel._run_source`, so this patch reaches its call site.
+        state = {"km": None, "kc": None, "busy": False}
+        seen = {}
+
+        def fake_run_source(state, source, filename, **kwargs):
+            seen.update(kwargs)
+            return []
+
+        with mock.patch.object(kernel, "_ensure_kernel"), \
+                mock.patch.object(kernel, "_run_source", side_effect=fake_run_source):
+            out = tools_exec._run_locked(state, "1 + 1", "<exec>", [],
+                                         full_traceback=False)
+        self.assertIs(seen["budget"], math.inf)
+        self.assertIsNone(out["error"])
 
 
 class TestJobRetention(unittest.TestCase):

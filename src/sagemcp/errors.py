@@ -15,11 +15,16 @@ class SourceError(Exception):
     """The source is not valid Sage code (preparse, parse, or compile failed)."""
 
 
-class ExecTimeout(Exception):
-    """The per-call budget expired. The kernel may still be computing."""
+class InternalBudgetExpired(Exception):
+    """An internal read-loop budget expired. Not a user job timeout.
+
+    The read loop in `_run_source` gives up after its `budget`. No user job can
+    reach this: a job has no execution budget, and the request's wait ending
+    returns `running` instead. Only the namespace seed has a finite budget.
+    """
 
     def __init__(self, seconds: float):
-        super().__init__(f"the call exceeded {seconds:g} s")
+        super().__init__(f"the read loop gave up after {seconds:g} s")
 
 
 class KernelDied(Exception):

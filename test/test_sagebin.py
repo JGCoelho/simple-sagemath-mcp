@@ -8,14 +8,15 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from queue import Empty
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
-from sagemcp import kernel, sageresolve
-from sagemcp.errors import KernelDied, SageNotFound
+from sagemcp import constants, kernel, sageresolve
+from sagemcp.errors import InternalBudgetExpired, KernelDied, SageNotFound
 
 # Recorded right after importing the server, before any test needs Sage.
 SAGE_LOADED_ON_IMPORT = "sage" in sys.modules or "sage.all" in sys.modules
@@ -145,6 +146,68 @@ class TestResolve(unittest.TestCase):
         lazy = sum(source.count("from sage.repl.preparse import preparse")
                    for source in sources)
         self.assertEqual(lazy, 1)
+
+
+class _AliveKM:
+    """A kernel manager that always reports a live kernel."""
+
+    def is_alive(self):
+        return True
+
+    def interrupt_kernel(self):
+        pass
+
+    def shutdown_kernel(self, now=False):
+        pass
+
+
+class _SilentKC:
+    """A kernel client that accepts the code and then publishes nothing."""
+
+    def execute(self, code, allow_stdin=False):
+        return "msg-1"
+
+    def get_iopub_msg(self, timeout=None):
+        raise Empty
+
+    def get_shell_msg(self, timeout=None):
+        raise Empty
+
+    def stop_channels(self):
+        pass
+
+
+class TestSeedBudget(unittest.TestCase):
+    """The seed's internal read budget and its failure. No kernel, no Sage import."""
+
+    def test_seed_passes_its_own_budget(self):
+        state = {"km": None, "kc": None, "busy": False}
+        seen = []
+
+        def fake_run_source(*args, **kwargs):
+            seen.append(kwargs)
+            return []
+
+        with mock.patch.object(kernel, "_run_source", side_effect=fake_run_source):
+            kernel._seed_namespace(state)
+        self.assertEqual(seen[0]["budget"], constants.SAGE_SEED_TIMEOUT)
+
+    def test_seed_budget_expiry_is_kernel_died_and_stops_the_kernel(self):
+        state = {"km": _AliveKM(), "kc": _SilentKC(), "busy": False}
+        with mock.patch.object(constants, "SAGE_SEED_TIMEOUT", 0.05):
+            with self.assertRaises(KernelDied) as caught:
+                # The caller is `_start_kernel`; its wrapper stops the kernel on any
+                # seed failure. These lines are that wrapper, not a second stop.
+                try:
+                    kernel._seed_namespace(state)
+                except BaseException:
+                    kernel._stop_kernel(state)
+                    raise
+        self.assertNotIsInstance(caught.exception, InternalBudgetExpired)
+        self.assertIn("SAGE_SEED_TIMEOUT", str(caught.exception))
+        self.assertIn("0.05", str(caught.exception))
+        self.assertIsNone(state["km"])
+        self.assertIsNone(state["kc"])
 
 
 if __name__ == "__main__":

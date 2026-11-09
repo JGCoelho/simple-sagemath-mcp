@@ -36,9 +36,9 @@ def _run_locked(state: dict, code: str, filename: str, outs: list, *,
     names the file (run_file). The other failures are raised for `_failure_out`.
     """
     kernel._ensure_kernel(state)
-    # No budget: the wait belongs to the request. The job runs until the kernel
-    # is idle, is interrupted, or is restarted (see `_run_source`).
-    kernel._run_source(state, code, filename, timeout=math.inf, outs=outs)
+    # No execution budget: the wait belongs to the request. The job runs until the
+    # kernel is idle, is interrupted, or is restarted (see `_run_source`).
+    kernel._run_source(state, code, filename, budget=math.inf, outs=outs)
     view = _exec_view(outs)
     detail = _summarise(outs)[3]
     if detail is None:
