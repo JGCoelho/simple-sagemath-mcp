@@ -16,9 +16,9 @@ sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE.parent / "src"))
 import _mcp
 import server
-from sagemcp import constants
-from server import _apply_ops, _load_nb, _save_nb, _validate_cells
+from sagemcp import constants, notebook_io
 from sagemcp.errors import NotebookError
+from sagemcp.notebook_io import _apply_ops, _load_nb, _save_nb, _validate_cells
 
 
 def digest(path) -> str:
@@ -106,8 +106,8 @@ class TestNotebookIO(NotebookTestCase):
         self.assertEqual(cm.exception.code, "invalid_notebook")
 
     def test_magic_details_name_cell_and_line(self):
-        nb = server.nbformat.v4.new_notebook(cells=[
-            server.nbformat.v4.new_code_cell("%matplotlib inline")])
+        nb = notebook_io.nbformat.v4.new_notebook(cells=[
+            notebook_io.nbformat.v4.new_code_cell("%matplotlib inline")])
         with self.assertRaises(NotebookError) as cm:
             _validate_cells(nb)
         self.assertEqual(cm.exception.code, "unsupported_magic")
@@ -115,27 +115,27 @@ class TestNotebookIO(NotebookTestCase):
         self.assertIn("%matplotlib", cm.exception.details)
 
     def test_shell_escape_rejected(self):
-        nb = server.nbformat.v4.new_notebook(cells=[
-            server.nbformat.v4.new_code_cell("x = 1\n  !ls")])
+        nb = notebook_io.nbformat.v4.new_notebook(cells=[
+            notebook_io.nbformat.v4.new_code_cell("x = 1\n  !ls")])
         with self.assertRaises(NotebookError) as cm:
             _validate_cells(nb)
         self.assertEqual(cm.exception.code, "unsupported_magic")
 
     def test_syntax_error_details_name_cell(self):
-        nb = server.nbformat.v4.new_notebook(cells=[
-            server.nbformat.v4.new_code_cell("1 +")])
+        nb = notebook_io.nbformat.v4.new_notebook(cells=[
+            notebook_io.nbformat.v4.new_code_cell("1 +")])
         with self.assertRaises(NotebookError) as cm:
             _validate_cells(nb)
         self.assertEqual(cm.exception.code, "invalid_source")
         self.assertTrue(cm.exception.details.startswith(nb.cells[0].id + ": "))
 
     def test_markdown_is_not_validated_as_code(self):
-        nb = server.nbformat.v4.new_notebook(cells=[
-            server.nbformat.v4.new_markdown_cell("%not a magic\n!nor this")])
+        nb = notebook_io.nbformat.v4.new_notebook(cells=[
+            notebook_io.nbformat.v4.new_markdown_cell("%not a magic\n!nor this")])
         _validate_cells(nb)                      # does not raise
 
     def test_missing_directory_is_write_failed_and_leaves_no_tmp(self):
-        nb = server.nbformat.v4.new_notebook(cells=[])
+        nb = notebook_io.nbformat.v4.new_notebook(cells=[])
         target = self.dir / "no-such-dir" / "x.ipynb"
         with self.assertRaises(NotebookError) as cm:
             _save_nb(nb, str(target))
@@ -143,7 +143,7 @@ class TestNotebookIO(NotebookTestCase):
         self.assertEqual(list(self.dir.glob("**/*.tmp")), [])
 
     def test_temp_file_lives_next_to_the_target(self):
-        nb = server.nbformat.v4.new_notebook(cells=[])
+        nb = notebook_io.nbformat.v4.new_notebook(cells=[])
         p = self.path("same-dir.ipynb")
         seen = []
         real = tempfile.NamedTemporaryFile
@@ -161,8 +161,9 @@ class TestNotebookIO(NotebookTestCase):
         p = self.path("replace.ipynb")
         Path(p).write_text("original")
         before = digest(p)
-        nb = server.nbformat.v4.new_notebook(cells=[])
-        with mock.patch("server.os.replace", side_effect=OSError("nope")):
+        nb = notebook_io.nbformat.v4.new_notebook(cells=[])
+        with mock.patch.object(notebook_io.os, "replace",
+                                side_effect=OSError("nope")):
             with self.assertRaises(NotebookError) as cm:
                 _save_nb(nb, p)
         self.assertEqual(cm.exception.code, "write_failed")
@@ -170,8 +171,8 @@ class TestNotebookIO(NotebookTestCase):
         self.assertEqual(list(self.dir.glob("*.tmp")), [])
 
     def test_add_defaults_to_code(self):
-        nb = server.nbformat.v4.new_notebook(cells=[
-            server.nbformat.v4.new_markdown_cell("m")])
+        nb = notebook_io.nbformat.v4.new_notebook(cells=[
+            notebook_io.nbformat.v4.new_markdown_cell("m")])
         applied = _apply_ops(nb, [{"op": "add", "source": "1 + 1"}])
         self.assertEqual(applied[0]["op"], "add")
         self.assertEqual(nb.cells[-1]["cell_type"], "code")
