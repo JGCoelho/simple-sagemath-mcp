@@ -15,8 +15,11 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE.parent / "src"))
 import _mcp
-import server
 from sagemcp import constants, notebook_io
+from sagemcp.envelope import (OUTPUT_SCHEMA_NB_EDIT, OUTPUT_SCHEMA_NB_READ,
+                              OUTPUT_SCHEMA_NB_RUN, OUTPUT_SCHEMA_NB_WRITE,
+                              _nb_edit_out, _nb_read_out, _nb_run_out,
+                              _nb_write_out)
 from sagemcp.errors import NotebookError
 from sagemcp.notebook_io import _apply_ops, _load_nb, _save_nb, _validate_cells
 from sagemcp.notebook_run import _cell_error_detail, _clean_traceback
@@ -641,12 +644,12 @@ class TestNotebookSchemas(unittest.TestCase):
 
     def test_closed_and_required(self):
         cases = [
-            (server.OUTPUT_SCHEMA_NB_RUN,
+            (OUTPUT_SCHEMA_NB_RUN,
              {"cells", "truncated", "saved", "error"}),
-            (server.OUTPUT_SCHEMA_NB_WRITE, {"cell_ids", "saved", "error"}),
-            (server.OUTPUT_SCHEMA_NB_READ,
+            (OUTPUT_SCHEMA_NB_WRITE, {"cell_ids", "saved", "error"}),
+            (OUTPUT_SCHEMA_NB_READ,
              {"nbformat", "nbformat_minor", "cells", "error"}),
-            (server.OUTPUT_SCHEMA_NB_EDIT, {"applied", "saved", "error"}),
+            (OUTPUT_SCHEMA_NB_EDIT, {"applied", "saved", "error"}),
         ]
         for schema, required in cases:
             self.assertFalse(schema["additionalProperties"])
@@ -657,13 +660,13 @@ class TestNotebookSchemas(unittest.TestCase):
             self.assertNotIn("timeout", codes)
 
     def test_builder_keys(self):
-        self.assertEqual(set(server._nb_run_out()),
+        self.assertEqual(set(_nb_run_out()),
                          {"cells", "truncated", "saved", "error"})
-        self.assertEqual(set(server._nb_write_out()),
+        self.assertEqual(set(_nb_write_out()),
                          {"cell_ids", "saved", "error"})
-        self.assertEqual(set(server._nb_read_out()),
+        self.assertEqual(set(_nb_read_out()),
                          {"nbformat", "nbformat_minor", "cells", "error"})
-        self.assertEqual(set(server._nb_edit_out()),
+        self.assertEqual(set(_nb_edit_out()),
                          {"applied", "saved", "error"})
 
 

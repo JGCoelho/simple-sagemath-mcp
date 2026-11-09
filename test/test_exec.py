@@ -12,8 +12,8 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE.parent / "src"))
 import _mcp
-import server
 from sagemcp import constants
+from sagemcp.envelope import OUTPUT_SCHEMA_EXEC
 from sagemcp.shaping import _exec_view, _summarise, _truncate
 
 MARKER_SLACK = 60          # room for "\n… [truncated N characters]"
@@ -239,7 +239,7 @@ class TestExecSchema(unittest.TestCase):
     """The declared output schema and the builder agree with the return value."""
 
     def test_schema_is_closed_and_error_is_required(self):
-        schema = server.OUTPUT_SCHEMA_EXEC
+        schema = OUTPUT_SCHEMA_EXEC
         self.assertFalse(schema["additionalProperties"])
         self.assertEqual(set(schema["required"]),
                          {"result", "stdout", "stderr", "truncated", "error"})

@@ -13,8 +13,8 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE.parent / "src"))
 import _mcp
-import server
 from sagemcp import constants
+from sagemcp.envelope import OUTPUT_SCHEMA_NB_RUN, _nb_run_out
 
 
 def code_cell(source, cell_id, outputs=None, execution_count=None):
@@ -218,7 +218,7 @@ class TestNbRunSchema(unittest.TestCase):
     """The declared output schema and the builder agree with the return value."""
 
     def test_schema_is_closed_and_error_is_required(self):
-        schema = server.OUTPUT_SCHEMA_NB_RUN
+        schema = OUTPUT_SCHEMA_NB_RUN
         self.assertFalse(schema["additionalProperties"])
         self.assertEqual(set(schema["required"]),
                          {"cells", "truncated", "saved", "error"})
@@ -232,8 +232,8 @@ class TestNbRunSchema(unittest.TestCase):
         self.assertNotIn("timeout", codes)
 
     def test_builder_keys(self):
-        self.assertEqual(set(server._nb_run_out()),
-                         set(server.OUTPUT_SCHEMA_NB_RUN["required"]))
+        self.assertEqual(set(_nb_run_out()),
+                         set(OUTPUT_SCHEMA_NB_RUN["required"]))
 
 
 if __name__ == "__main__":
