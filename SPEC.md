@@ -27,8 +27,10 @@ MCP host  ──stdio──>  sagemcp/  ──Jupyter protocol──>  ipykernel
 - **The kernel** is a real Jupyter kernel running the python of the Sage
   installation. It holds one namespace (`__mcp_ns__`) for the life of the
   connection. All computation happens here, never in the server process.
-- **Notebook files** are the only durable output. The server never stores
-  results elsewhere; `nb_run` writes them into the file.
+- **Files on disk** are the only durable output. `run_file` runs a `.py` or
+  `.sage` file that already exists. The deprecated notebook tools read and write
+  `.ipynb` files, and `nb_run` writes results into one. The server never stores
+  results elsewhere.
 
 The server imports Sage (`sage.repl.preparse`) for preparsing but never imports
 `sage.all`: only the kernel pays that cost. `import sagemcp` therefore stays
@@ -172,7 +174,7 @@ else:
     exec(compile(_mcp_tree, filename, "exec"), ns, ns)
 ```
 
-Two consequences:
+Three consequences:
 
 - **The trailing expression is evaluated separately**, so `x = 6` followed by
   `x*7` in one source returns `42`, exactly as a notebook's last line would.
@@ -181,6 +183,9 @@ Two consequences:
   and `text/html` from `_html_()` when the object has them. Matrices,
   polynomials, and graphs therefore render as real LaTeX in a notebook viewer,
   and the mime bundle is the same shape Jupyter itself would store.
+- **The filename is the caller's.** `run_file` passes the file's path, so a
+  traceback names the file. `exec` passes `<exec>`, and a notebook cell passes
+  `<path>:<cell id>`.
 
 The `_mcp_trailing` metadata key is the contract between the wrapper and the
 collector: only a display carrying that key becomes an `execute_result`; every
@@ -198,8 +203,8 @@ kernel buys three things:
 - **Early rejection.** A syntax error surfaces as `invalid_source` before the
   kernel sees anything, so a broken cell cannot poison a `nb_run` half-way
   through and no kernel state is touched.
-- **One static check shared by everything.** `exec`, `nb_write`, `nb_edit`, and
-  `nb_run` validate with the same `_prepare`, so a cell that passes validation
+- **One static check shared by everything.** `exec`, `run_file`, `nb_write`,
+  `nb_edit`, and `nb_run` validate with the same `_prepare`, so a cell that passes validation
   fails at the same place when it actually runs.
 - **The kernel stays a dumb interpreter of valid Python**, and the wrapper only
   has to parse an already-valid tree.
@@ -218,8 +223,9 @@ package import and kernel start independent of the server's own Sage.
 ## 6. One execution path
 
 `_run_source(state, source, filename, prepared=..., timeout=...)` is the only
-place a kernel executes code. Its three call sites are the namespace seed,
-`exec`, and each cell of `nb_run`. It:
+place a kernel executes code. Its call sites are the namespace seed, the job body
+that `exec` and `run_file` share (`_run_locked`, §10), and each cell of `nb_run`.
+It:
 
 1. marks `state["busy"] = True`;
 2. `kc.execute(wrapper, allow_stdin=False)`;
@@ -260,7 +266,7 @@ Three independent limits:
 
 | limit | value | where |
 |---|---|---|
-| per-call kernel budget | `KERNEL_READ_TIMEOUT` = 2400 s | `exec(timeout=…)` can lower it |
+| wait budget | `KERNEL_READ_TIMEOUT` = 2400 s | the default `timeout` of `exec` and `run_file`: how long the call waits, not how long its job may run. A notebook cell gets the same figure as its own limit |
 | shell-reply drain | `SHELL_DRAIN_TIMEOUT` = 30 s | after the idle message |
 | inline payload | `MAX_INLINE_CHARS` = 20000 | the tool response |
 
@@ -280,14 +286,25 @@ While a call runs, `_locked` reports progress every `HEARTBEAT_INTERVAL` (15 s)
 through `ctx.report_progress`, so a computation that lasts minutes does not look
 like a hung connection to the host.
 
-A timeout is not a kill. On `ExecTimeout` the call returns `timeout`, the kernel
-**keeps computing**, the namespace is kept, and any partial outputs collected so
-far travel with the exception (`ExecTimeout.outputs`) so that `nb_run` can still
-write what a cell printed. `interrupt` is the way out; `restart` is the hard way.
+A call that outlives its wait is not a kill. `exec` and `run_file` start a job
+(§10) and wait at most their `timeout`. If the job is still running then, the
+call returns `status: "running"` with `job_id`, `elapsed`, and the output so far.
+The job keeps the kernel and the namespace until it ends. `job_status` reports it
+until then, `interrupt` stops it, and `restart` ends it as `interrupted`. The job
+itself has no budget.
+
+A notebook cell still has one. When a cell exceeds `KERNEL_READ_TIMEOUT`,
+`_run_source` raises `ExecTimeout`, and the kernel **keeps computing**. Any partial
+outputs travel with the exception (`ExecTimeout.outputs`), so `nb_run` can still
+write what the cell printed, and the run ends with `cell_execution_failed`.
+`interrupt` is the way out; `restart` is the hard way.
 
 ---
 
 ## 8. Notebook rules
+
+The notebook tools are deprecated (§12): they are served only with
+`--legacy-notebook-tools`. The rules in this section are theirs.
 
 ### Load (`_load_nb`)
 
@@ -376,24 +393,39 @@ reverted by a `nb_run` that had loaded the file before the edit and wrote its
 stale copy afterwards. This was a real bug found in review, and the lock is the
 fix.
 
-**`_kernel_lock`** serializes *computations*. `exec` and `nb_run` hold it for the
-whole computation. Kernel helpers are synchronous and assume the caller holds
-it; only `_locked` (which also emits heartbeats) and `_restart` acquire it.
+**`_kernel_lock`** serializes *computations*. `nb_run` holds it for the whole run
+(through `_locked`, which also emits heartbeats). An `exec` or `run_file` job holds
+it from `_run_job` until the job ends, which can be after the call that started it
+has returned (below). Kernel helpers are synchronous and assume the caller holds
+it; only `_locked`, `_run_job` and `_restart` acquire it.
 
 **Order is always notebook lock, then kernel lock.** `nb_run` is the only tool
 that takes both, and it takes them in that order; nothing takes them the other
 way, so the two cannot deadlock.
 
+**Jobs never queue.** `exec` and `run_file` start a job: `kernel._start_job`
+registers its record (`jobs.py`) and starts a task that holds the kernel lock for
+the whole run. `_claim` checks, with no `await` before the job is registered,
+whether a job or another holder has the kernel. If one has, the call gets
+`kernel_busy` with the holder's job id, and its work does not start. The notebook
+tools check the same way, including `nb_read` and `nb_write`, which never touch
+the kernel. A job finishes its record before it releases the lock, so a
+`job_status` that sees the job end sees its final envelope. The last
+`JOB_RETENTION` finished records are kept; the running job is never dropped.
+Records are in memory only.
+
 **`interrupt` takes neither lock**, by design: it must work while a call holds
 the kernel lock. It reads and sets nothing but the `busy` flag, and sends
 `km.interrupt_kernel()`. `busy` means "the kernel may be computing" — not "a
-call is in flight". After a timeout the abandoned computation is still running,
-so the flag stays set until the next completed call or a restart, which is why a
-repeated `interrupt` in that window reports `true` and is harmless. Knowing the
+call is in flight". While a call's wait has expired, its computation is still
+running, so the flag stays set until the job ends, the next completed call, or a
+restart; a repeated `interrupt` in that window reports `true` and is harmless. Knowing the
 kernel's real state would need a second iopub reader, which would race the call's
 own reader and lose messages; the approximation is documented instead.
 
-**`restart`** is the only operation that deliberately disturbs a running call:
+**`restart`** is the only operation that deliberately disturbs a running call. It
+first marks the active job `interrupted`, so the job's record says so whatever its
+computation returns:
 
 1. `km.interrupt_kernel()` (a no-op if idle), so the busy call can notice;
 2. `wait_for(_kernel_lock.acquire(), SHUTDOWN_TIMEOUT = 30 s)`;
@@ -428,7 +460,9 @@ timeouts. Fixing it properly needs a supervisor task that outlives the call.
 | no `sage` at all | `resolve_kernel_python` | `sage_not_found` | unchanged |
 | code raises | `error` output | `cell_execution_failed` | namespace mutated as Python left it |
 | code is invalid Sage/Python | `_prepare` | `invalid_source` | kernel untouched |
-| limit exceeded | deadline | `timeout` | kernel still computing, `busy` stays set |
+| a call outlives its wait | `timeout` expires | `status: running` with `job_id` | the job keeps the kernel; poll `job_status`, or `interrupt` or `restart` |
+| a call while a job holds the kernel | `_claim` | `kernel_busy`, `details` names the job | refused, not queued; the job runs on |
+| a notebook cell outlives `KERNEL_READ_TIMEOUT` | `ExecTimeout` in `_run_source` | `cell_execution_failed`, partial outputs kept | kernel still computing, `busy` stays set |
 | user cancels the tool call | `asyncio.CancelledError` | task ends | see §10, cancellation |
 | anything else | `except Exception` in the tool wrapper | `internal` with `Type: message` | best effort |
 
@@ -447,6 +481,11 @@ Every tool returns `{…payload…, "error": null | {"code", "message", "details
 `details` holds a traceback, an offending cell id, an op index, or `null`. The
 three writing tools add `saved` (true = this call wrote the file; a no-op edit
 still writes, so `saved` stays truthful).
+
+`exec` and `run_file` add `status`, `job_id` and `elapsed` only while the call is
+still running (`status` is then `"running"`). A finished call has the five base
+keys. `job_status` reports a job's `status`, `elapsed` and output, and its
+`result` once the job has finished.
 
 The schemas are declared **per tool** as `output_schema` dicts, because FastMCP
 enforces them strictly (verified against 4.1.3): the payload must validate, and
@@ -468,25 +507,30 @@ affected.
 
 | Code | Meaning |
 |------|---------|
-| `invalid_source` | preparse, parse, or compile failed (`exec`, `nb_run`, `nb_write`, `nb_edit`) |
-| `cell_execution_failed` | the code raised, including `KeyboardInterrupt` and a GAP abort (`exec`, `nb_run`) |
-| `timeout` | the per-call budget expired; the kernel may still compute (`exec`) |
-| `gap_crash_loop` | GAP crashed three times in one call; the call was interrupted (`exec`) |
-| `kernel_died` | the kernel died; the namespace was lost, not restarted automatically (`exec`, `nb_run`, `restart`) |
-| `sage_not_found` | no usable Sage from `SAGE_BIN`, `sage` on `PATH`, or the sibling `sage` |
+| `invalid_source` | preparse, parse, or compile failed; for `run_file`, also a suffix other than `.py` or `.sage`, or bytes that are not UTF-8 (`exec`, `run_file`, `job_status`, `nb_run`, `nb_write`, `nb_edit`) |
+| `file_not_found` | the `run_file` path is not a file (`run_file`) |
+| `cell_execution_failed` | the code raised, including `KeyboardInterrupt` and a GAP abort (`exec`, `run_file`, `job_status`, `nb_run`) |
+| `gap_crash_loop` | GAP crashed three times in one call; the call was interrupted (`exec`, `run_file`, `job_status`) |
+| `kernel_busy` | another job or a notebook run holds the kernel; the call is refused, not queued, and `details` names the job (`exec`, `run_file`, `nb_run`, `nb_write`, `nb_read`, `nb_edit`) |
+| `unknown_job` | no job has this id: it never existed, its record was dropped, or the server restarted (`job_status`) |
+| `kernel_died` | the kernel died; the namespace was lost, not restarted automatically (`exec`, `run_file`, `job_status`, `nb_run`, `restart`) |
+| `sage_not_found` | no usable Sage from `SAGE_BIN`, `sage` on `PATH`, or the sibling `sage` (`exec`, `run_file`, `job_status`, `nb_run`, `restart`) |
 | `not_found` | the notebook file does not exist (`nb_run`, `nb_read`, `nb_edit`) |
 | `exists` | the target exists and `overwrite` is false (`nb_write`) |
-| `invalid_notebook` | not JSON, not schema-valid, a bad cell id, or text that is not UTF-8 |
+| `invalid_notebook` | not JSON, not schema-valid, a bad cell id, or text that is not UTF-8 (`nb_run`, `nb_write`, `nb_read`, `nb_edit`) |
 | `unsupported_magic` | a `%` or `!` line in a code cell (`nb_run`, `nb_write`, `nb_edit`) |
 | `unknown_cell_id` | the id is not in the notebook (`nb_read`, `nb_edit`) |
 | `invalid_op` | an op is malformed or impossible beyond an id lookup (`nb_edit`) |
-| `write_failed` | the temp write or the rename failed; the file is untouched |
+| `write_failed` | the temp write or the rename failed; the file is untouched (`nb_run`, `nb_write`, `nb_edit`) |
 | `internal` | unexpected failure; `details` holds `Type: message` (all) |
 
+There is no `timeout` code: a call that outlives its wait returns `status: running` (§7).
+
 A code is in a tool's `enum` only when that tool can return it, so this table is
-a union: `timeout` and `gap_crash_loop` are `exec`-only, `exists` is
-`nb_write`-only, `invalid_op` is `nb_edit`-only, and `sage_not_found` comes from
-the calls that start a kernel (`exec`, `nb_run`, `restart`).
+a union: `gap_crash_loop` is `exec`-, `run_file`- and `job_status`-only;
+`file_not_found` is `run_file`-only; `unknown_job` is `job_status`-only; `exists`
+is `nb_write`-only; `invalid_op` is `nb_edit`-only; and `sage_not_found` comes from
+the calls that start a kernel (`exec`, `run_file`, `job_status`, `nb_run`, `restart`).
 
 ### Per tool
 
@@ -495,12 +539,33 @@ What each tool promises, which is what its schema enforces.
 ### `exec(code, timeout=None)`
 Returns `{"result", "stdout", "stderr", "truncated", "error"}`: `result` is the `repr()` of the
 final expression (empty for statements or `None`), the streams are kept apart, and `truncated` means
-the inline text was cut and is not recoverable. `timeout` defaults to 2400 s; on expiry the call
-returns `timeout`, the kernel **keeps computing**, and the namespace is kept — call `interrupt` to
-stop it. Sage syntax works: `3^2` is `9`, `1/2` is a rational, `R.<x> = PolynomialRing(QQ)` is a
-ring.
+the inline text was cut and is not recoverable. The call runs as a job (§10). `timeout` defaults to
+2400 s and bounds how long the call waits, not how long the job runs. Past it, the call returns the
+same keys plus `status: "running"`, `job_id` and `elapsed`, with the output so far. The kernel stays
+busy and the namespace is kept. Poll `job_status` with the id, or call `interrupt` to stop it. Sage
+syntax works: `3^2` is `9`, `1/2` is a rational, `R.<x> = PolynomialRing(QQ)` is a ring. A `!` shell
+escape or a `%` magic is not Sage syntax, so it is `invalid_source`.
 
-### `nb_run(path)`
+### `run_file(path, timeout=None)`
+Runs a `.py` or `.sage` file in the namespace `exec` uses, and returns the same envelope, with the same
+job behaviour: `timeout`, `running`, `job_status`, and `kernel_busy`. A relative `path` resolves
+against the server's working directory (`--directory`); an absolute one is used as it is. Only the
+exact suffixes `.py` and `.sage` are accepted. Any other suffix is `invalid_source`, decided before the
+file is looked for; a missing file is `file_not_found`. The file is read once, when the call is made,
+as UTF-8 with a leading byte-order mark dropped (`utf-8-sig`). That is a deliberate small deviation
+from plain UTF-8, which would hand the BOM to the parser. Bytes that are not UTF-8 are
+`invalid_source`. Both suffixes are preparsed, as `exec`'s source is. A traceback names the file,
+because the file is compiled under its path. A syntax error reports its line but not the file name.
+
+### `job_status(job_id)`
+Reads a job that `exec` or `run_file` started. It never waits and never touches the kernel. `status`
+is `running`, `done` (finished without an error result), `error` (finished with one), or
+`interrupted` (a restart ended it). While the job runs, `stdout`, `stderr` and `elapsed` are the
+output so far. Once it has finished, `result`, `stdout`, `stderr`, `truncated` and `error` are the
+values its call would have returned. An unknown id is `unknown_job`. That covers an id that never
+existed, a record that was dropped, and every id after a server restart.
+
+### `nb_run(path)` (deprecated)
 Validates first (JSON, schema, unique ids, no magics, every cell preparses); a failure returns
 `invalid_notebook`, `unsupported_magic`, `invalid_source`, or `not_found` with `saved:false`, and
 the file stays byte-identical. Then it **restarts the kernel**, runs cells in order with
@@ -513,19 +578,19 @@ Inline outputs are cut at 20000 characters **by whole output**; on disk nothing 
 Results keep their mime bundles: `text/plain`, plus `text/latex` and `text/html` when the object
 provides `_latex_()` / `_html_()`.
 
-### `nb_write(path, cells, overwrite=false)`
+### `nb_write(path, cells, overwrite=false)` (deprecated)
 Creates a notebook from `[{cell_type, source}]`, with the Sage kernelspec, at nbformat 4.5. Every
 cell gets an id, returned in `cell_ids` ready for `nb_edit`. The whole notebook is validated before
 the write. An existing file without `overwrite:true` returns `exists`; the parent directory must
 exist.
 
-### `nb_read(path, cell_ids=None)`
+### `nb_read(path, cell_ids=None)` (deprecated)
 Reads from disk only: no write, no execution, no kernel. Without `cell_ids` it returns all cells in
 order; with them, exactly those cells in the order given, and one unknown id fails the call with
 `unknown_cell_id`. Each cell is `{cell_id, cell_type, source}`; code cells carry their full
 `outputs`.
 
-### `nb_edit(path, ops)`
+### `nb_edit(path, ops)` (deprecated)
 Ops are `{"op": "edit", "cell_id", "source"}`, `{"op": "add", "source", "cell_type": "code",
 "after"}`, and `{"op": "remove", "cell_id"}`. `add` defaults to code, appends when `after` is
 omitted, and returns its new id in `applied`; `remove` may remove the only cell. The ops are applied
@@ -534,18 +599,19 @@ in memory and the **whole result** is re-validated before one write. On failure 
 
 ### `interrupt()`
 Sends the interrupt request. `interrupted` is true when a computation may be running and the request
-was sent, otherwise it is a no-op returning false. The namespace survives; the interrupted call
-returns `cell_execution_failed` with `KeyboardInterrupt` in `details`. The flag is approximate right
-after a `timeout`.
+was sent, otherwise it is a no-op returning false. The namespace survives; the interrupted job ends
+with `cell_execution_failed` and `KeyboardInterrupt` in `details`. While a call's wait has expired the
+flag is approximate: it stays true until the job ends, so a repeated interrupt is harmless.
 
 ### `restart()`
 Replaces the kernel. A running computation is interrupted first; if it does not stop within the
-shutdown timeout, it is killed and respawned and the running call ends with `kernel_died`.
+shutdown timeout, it is killed and respawned and the running call ends with `kernel_died`. A running
+job's record reads `interrupted`, with `kernel_died` as its error.
 `restarted` is true only when a new, ready kernel runs.
 
 ### Output-shape rules worth knowing
 
-- `exec.result` is `repr()` of the trailing expression, `""` when there is none
+- `exec.result` and `run_file.result` are `repr()` of the trailing expression, `""` when there is none
   or it is `None`.
 - `stdout`/`stderr` are separate strings, never concatenated.
 - `nb_read` reports the **on-disk** nbformat versions and the **full** on-disk
@@ -582,18 +648,20 @@ shutdown timeout, it is killed and respawned and the running call ends with `ker
 ## 14. Tests
 
 `unittest`, no `pytest` requirement, no new dependencies. `test/_mcp.py` starts
-**one server process per test file** and offers `call()` / `call_async()` plus
-`unwrap()` so each test reads like a tool call.
+**one server process per test run**, with the notebook flag (the nb tests share a kernel with `exec`), and offers `call()` / `call_async()`, `call_raw()`, `wait_job()` and `settle()`, plus `unwrap()`, so each test reads like a tool call. `Server()` starts a second process with other arguments.
 
 | file | kernel | covers |
 |---|---|---|
-| `test/_mcp.py` | — | shared client, one server per file, sync/async helpers |
+| `test/_mcp.py` | — | shared client (started with `--legacy-notebook-tools`), sync/async helpers, `call_raw`, `wait_job`, `settle`, `Server` for a second process |
 | `test/test_sagebin.py` | no | `SAGE_BIN` over `PATH`, sibling python, `sage -c` fallback, not-found message, `PATH` prefix, seed/start failures (mocked) |
 | `test/test_exec.py` | yes | values, preparse, persistence, runtime/syntax errors, split streams, timeout then interrupt, restart while busy, interrupt idle/busy, truncation, GAP guard, `display` is not the result, output shape |
-| `test/test_nb_edit.py` | no | load/validate, UTF-8 and legacy-id rules, `nb_write`, `nb_read` selection and disk versions, op order, atomicity and hash equality, mode and symlink preservation |
-| `test/test_nb_run.py` | yes | restart first, disk vs inline outputs, stop-at-error with `saved:true`, validation failure without restart or write, zero code cells, inline-only truncation, a concurrent edit is not lost |
+| `test/test_jobs.py` | yes | running envelope and partial output, `job_status`, `kernel_busy` without queueing, `unknown_job`, interrupt and restart reaching a running job, finished-record retention (no kernel) |
+| `test/test_run_file.py` | yes | `.py` and `.sage` values, preparse, persistence, missing file, bad suffix, bad UTF-8, BOM, syntax error, traceback names the file, relative path against `--directory` (a second server), `kernel_busy`, a long file polled to `done`, interrupt |
+| `test/test_tool_list.py` | no | default `tools/list` names and order; the four legacy tools only with the flag, after `restart` |
+| `test/test_nb_edit.py` | no | legacy tools: load/validate, UTF-8 and legacy-id rules, `nb_write`, `nb_read` selection and disk versions, op order, atomicity and hash equality, mode and symlink preservation |
+| `test/test_nb_run.py` | yes | legacy tools: restart first, disk vs inline outputs, stop-at-error with `saved:true`, validation failure without restart or write, zero code cells, inline-only truncation, a concurrent edit is not lost |
 | `test/test_packaging.py` | no | `pyproject.toml` metadata, `main(["--help"])` and `--directory`, the sibling-`sage` resolution fallback, and the `requires-python` floor re-derived from `src/sagemcp/*.py` |
-| `test/test_tool_docs.py` | no | each tool's `Errors:` docstring line equals its `outputSchema.error.properties.code.enum` |
+| `test/test_tool_docs.py` | no | each default tool's `Errors:` docstring line equals its `outputSchema.error.properties.code.enum`; the deprecated nb tools are checked the same way, and their summaries say DEPRECATED |
 | `test/test_long_exec.py` | yes | opt-in (`SAGE_MCP_LONG=1`): a ~50 s `exec` returns its exact value, so a long call survives without a disconnect |
 
 Kernel-free where possible: anything that needs an interpreter is mocked, and
@@ -605,8 +673,8 @@ semantics are covered without paying 2 s per test. Every file except
 
 ## 15. Known limitations
 
-- **`interrupt` after a timeout** can report `interrupted: true` for a
-  computation that has since finished (§10). Documented, not fixed.
+- **`interrupt` while a call's wait has expired** can report `interrupted: true`
+  for a computation that has since finished (§10). Documented, not fixed.
 - **Cancellation** cannot stop a worker thread mid-read (§10). Bounded by the
   drain/read timeouts.
 - **Input schemas** for `cells`/`ops` are looser than the plan's `oneOf` (§12),
@@ -636,7 +704,7 @@ semantics are covered without paying 2 s per test. Every file except
 - The error envelope is inlined per tool (not `$ref`): FastMCP strict validation
   needs no resolver. Do not switch to `$ref` without adding one.
 - The per-tool `code` enums are operative. Do not remove, merge, or shorten.
-- Truncation budget: `MAX_INLINE_CHARS = 20000`. `exec` truncation is
+- Truncation budget: `MAX_INLINE_CHARS = 20000`. `exec` and `run_file` truncation is
   unrecoverable; `nb_run` truncation is recoverable with `nb_read`. When the
   inline budget is exceeded, the overflowing code cell and every later code
   cell come back as `outputs:[]`. A host may also truncate a very large
@@ -653,8 +721,9 @@ semantics are covered without paying 2 s per test. Every file except
 - `nb_edit.ops` deliberately has no item schema; per-op shapes differ.
 - Size is measured by `tools/measure.py`, which reports the wire size
   (`name` + `description` + `inputSchema` + `outputSchema`) and the direct-model
-  size (`name` + `description` + `inputSchema`). Current: wire 15,386 chars
-  (baseline 15,396, -0.1%); direct-model 8,557 chars (baseline 7,901, +8.3%).
+  size (`name` + `description` + `inputSchema`). The figures that were recorded
+  here predate `run_file` and the deprecation; re-run `tools/measure.py` for the
+  current surface (the default surface is wire 11,592 chars, direct-model 5,864).
   The increase is deliberate: the `Errors:` lines, the `nb_edit`
   clarifications, and the `P.save` cwd note carry facts that direct callers
   cannot get from `outputSchema`. Do not trade them away to hit a wire-size
@@ -668,6 +737,7 @@ Name-only index; the values live in `src/sagemcp/constants.py` next to the
 comment that explains them.
 
 - `KERNEL_READ_TIMEOUT`
+- `JOB_RETENTION`
 - `MAX_INLINE_CHARS`
 - `GAP_CRASH_LIMIT`
 - `SHUTDOWN_TIMEOUT`

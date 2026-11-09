@@ -2,8 +2,8 @@
 
 # simple-sagemath-mcp
 An MCP server that gives an agent a persistent SageMath kernel — one warm Sage process, one
-namespace, seven tools — and runs `.ipynb` files cell by cell, writing results (LaTeX and HTML
-included) back to disk.
+namespace, five tools — and runs `.py` and `.sage` files in it. Its deprecated notebook tools, behind
+a flag, run `.ipynb` files cell by cell and write results (LaTeX and HTML included) back to disk.
 
 ## Before you start: you need SageMath
 This server does **not** bundle, download, or install SageMath. It drives a SageMath already on the
@@ -78,7 +78,8 @@ fallback is:
 `sys.path`; do not use it in a config for an installed copy.
 
 `--directory` changes the server's working directory before the kernel starts, so a relative path in
-the agent's code points at your work.
+the agent's code points at your work. `--legacy-notebook-tools` also serves the deprecated notebook
+tools; see [Tools](#tools).
 
 ## Other hosts
 The command is the same; only the file and the top-level key differ.
@@ -104,11 +105,11 @@ args = ["--directory", "/path/to/your/work"]
   `"env": {"SAGE_BIN": "/path/to/sage"}`. The server also looks for `sage` next to the interpreter
   running it, so a console script in Sage's `bin` finds Sage with no extra config.
 - **One kernel per server process.** Each session gets its own server and namespace; a restart, a
-  crash, or a recycled process loses it, so write values to keep into a notebook cell (`nb_write`),
-  not only variables.
-- **Client-side timeouts.** Hosts often time out a call before the server's 2400 s budget. Split a
-  long computation or use `interrupt`; a recorded `timeout` means the budget expired, not that the
-  kernel stopped.
+  crash, or a recycled process loses it, so keep code you want again in a `.py` or `.sage` file and
+  run it with `run_file`, not only in variables.
+- **Client-side timeouts.** Hosts often time out a call before the server's 2400 s budget. Pass a
+  `timeout` below the host's limit: a call past it returns `status: running` with a `job_id`, the job
+  keeps running, and `job_status` reports it until it ends. `interrupt` stops it.
 - **Remote-only hosts.** This is a stdio server that starts a local kernel; a remote-only host needs
   a local bridge.
 
@@ -116,20 +117,33 @@ args = ["--directory", "/path/to/your/work"]
 | Tool | Purpose |
 |------|---------|
 | `exec` | Run Sage code in the kernel namespace and return its output |
-| `nb_run` | Restart the kernel, run a notebook's code cells, write the outputs |
-| `nb_write` | Write a new notebook from cells and validate it |
-| `nb_read` | Read cells and stored outputs from a notebook |
-| `nb_edit` | Edit, add, or remove cells of an existing notebook atomically |
+| `run_file` | Run a `.py` or `.sage` file in the same namespace and return its output |
+| `job_status` | Read a job that `exec` or `run_file` started: its status and output so far |
 | `interrupt` | Stop the running computation; the kernel keeps its state |
 | `restart` | Restart the kernel and wipe the namespace |
 
-All seven return one envelope, with `error: null` on success; the writing tools also return
-`saved`, true when this call wrote the file. [SPEC.md](SPEC.md) §12 has the per-tool behaviour and
-the full table of error codes.
+`exec` and `run_file` run as jobs. A call that outlasts its `timeout` (default 2400 s) returns
+`status: running`, a `job_id`, `elapsed` and the output so far, and the job keeps the kernel. Poll
+`job_status` with the id until it reports `done`, `error` or `interrupted`. While a job holds the
+kernel, other calls return `kernel_busy`; they are not queued.
+
+`run_file` takes a path to a `.py` or `.sage` file, and a relative path is resolved against
+`--directory`. Only those two suffixes are accepted. The file runs in the same namespace as `exec`, so
+its names stay for later calls.
+
+**Deprecated: notebook tools.** `nb_run`, `nb_write`, `nb_read` and `nb_edit` work on `.ipynb` files.
+They are not served by default. Start the server with `--legacy-notebook-tools` to get them, for
+example `"args": ["--directory", "/path/to/your/work", "--legacy-notebook-tools"]`. Use `run_file` for
+code.
+
+Every tool returns one envelope, with `error: null` on success. The writing tools also return `saved`,
+true when this call wrote the file. [SPEC.md](SPEC.md) §12 has the per-tool behaviour and the full
+table of error codes.
 
 ## Limits
-- No magics and no `!` shell escapes in notebook code cells; they are rejected with the offending
-  cell id. One kernel and one lock, so one computation runs at a time.
+- No magics and no `!` shell escapes: `exec` and `run_file` reject them as `invalid_source`, and the
+  deprecated notebook tools reject them with the offending cell id. One kernel and one lock, so one
+  job runs at a time; a second call gets `kernel_busy`, it is not queued.
 - **This is not a sandbox.** The kernel runs the code the agent sends, with your user permissions
   and access to your files.
 
