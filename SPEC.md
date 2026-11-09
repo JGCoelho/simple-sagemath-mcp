@@ -4,9 +4,10 @@ How `simple-sagemath-mcp` works inside. This is a design document for readers
 who want to understand, audit, or change the server. If you only want to
 install it and use the tools, read [README.md](README.md) instead.
 
-Everything here is checkable against `server.py`, which is the single source of
-truth: the whole server is one file, about 1800 lines, with no package, no
-daemon, and no runtime configuration beyond `SAGE_BIN`.
+Everything here is checkable against the `sagemcp` package under `src/`, which is
+the single source of truth; the root `server.py` is only the checkout entry
+point into it. There is no daemon and no runtime configuration beyond
+`SAGE_BIN`.
 
 ---
 
@@ -15,7 +16,7 @@ daemon, and no runtime configuration beyond `SAGE_BIN`.
 Three processes are involved:
 
 ```
-MCP host  ──stdio──>  server.py  ──Jupyter protocol──>  ipykernel (Sage python)
+MCP host  ──stdio──>  sagemcp/  ──Jupyter protocol──>  ipykernel (Sage python)
                         │
                         └── reads and writes .ipynb files on disk
 ```
@@ -30,7 +31,7 @@ MCP host  ──stdio──>  server.py  ──Jupyter protocol──>  ipykerne
   results elsewhere; `nb_run` writes them into the file.
 
 The server imports Sage (`sage.repl.preparse`) for preparsing but never imports
-`sage.all`: only the kernel pays that cost. `import server` therefore stays
+`sage.all`: only the kernel pays that cost. `import sagemcp` therefore stays
 cheap, and the server can be started by any python that has `fastmcp` and
 `nbformat`. It does need a Sage-backed python for `preparse`, which is why
 `install.sh` derives the server interpreter from `sage` itself.
@@ -126,22 +127,26 @@ notebook as the outputs of its first cell.
 
 ### Packaging
 
-`pyproject.toml` ships the server as the single top-level module it already is
-(`[tool.setuptools] py-modules = ["server"]`); there is no package directory, no
-shim, and no copy that can drift from `server.py`. `[project.scripts]` maps
-`simple-sagemath-mcp = "server:main"`, and `main(argv=None)` parses
-`sys.argv[1:]`, changes to `--directory` if given, and calls `mcp.run()`. The
-module layout is flat, so `python -m simple_sagemath_mcp` is not available;
-`python -m server` is.
+`pyproject.toml` installs the `sagemcp` package under `src/`
+(`package-dir = {"" = "src"}`, `packages.find where = ["src"]`), one module per
+concern: kernel lifecycle and execution, notebook I/O, notebook execution, output
+shaping, the error envelope and schemas, the FastMCP app, and one module per tool
+group. The root `server.py` is not installed; it is the entry point for a
+checkout and does nothing but put `src/` on `sys.path` and call
+`sagemcp.app.main`. `[project.scripts]` maps
+`simple-sagemath-mcp = "sagemcp.app:main"`, and `main(argv=None)` parses
+`sys.argv[1:]`, changes to `--directory` if given, and calls `mcp.run()`.
+Installed, `python -m sagemcp` runs the same `main`; `python -m server` also
+works, but only inside the checkout, where the repo root is on `sys.path`.
 
 `requires-python` is `>=3.10`. `ast.parse(feature_version=(3, 9))` accepts the
 source, but the annotations use PEP 604 unions (`str | None`) without
 `from __future__ import annotations`, so importing on 3.9 raises `TypeError`;
-`test/test_packaging.py` re-derives the floor from `server.py`.
-`fastmcp` is pinned to `>=4.1,<5` because the strict `output_schema`
+`test/test_packaging.py` re-derives the floor from every module under
+`src/sagemcp/`. `fastmcp` is pinned to `>=4.1,<5` because the strict `output_schema`
 enforcement that the common error envelope depends on may change in a major
 version. The remaining dependencies (`nbformat`, `jupyter_client`,
-`ipykernel`) are the notebook and kernel APIs the module imports directly.
+`ipykernel`) are the notebook and kernel APIs the code imports directly.
 The install runs on Sage's own interpreter (`sage -pip install .`): the server
 imports `sage.repl.preparse` for preparsing, and the kernel imports `sage.all`.
 
@@ -204,9 +209,9 @@ through, maps `SyntaxError` to a message with the line number, and maps
 `UnicodeError` to `invalid_source` (a lone surrogate can come from a JSON
 `\uD800` escape and is not valid source).
 
-Preparse is lazy-imported inside `_prepare`, so `import server` never imports
+Preparse is lazy-imported inside `_prepare`, so `import sagemcp` never imports
 Sage. `_seed_namespace` passes `prepared=""` to skip it entirely, which keeps
-module import and kernel start independent of the server's own Sage.
+package import and kernel start independent of the server's own Sage.
 
 ---
 
@@ -587,7 +592,7 @@ shutdown timeout, it is killed and respawned and the running call ends with `ker
 | `test/test_exec.py` | yes | values, preparse, persistence, runtime/syntax errors, split streams, timeout then interrupt, restart while busy, interrupt idle/busy, truncation, GAP guard, `display` is not the result, output shape |
 | `test/test_nb_edit.py` | no | load/validate, UTF-8 and legacy-id rules, `nb_write`, `nb_read` selection and disk versions, op order, atomicity and hash equality, mode and symlink preservation |
 | `test/test_nb_run.py` | yes | restart first, disk vs inline outputs, stop-at-error with `saved:true`, validation failure without restart or write, zero code cells, inline-only truncation, a concurrent edit is not lost |
-| `test/test_packaging.py` | no | `pyproject.toml` metadata, `main(["--help"])` and `--directory`, the sibling-`sage` resolution fallback, and the `requires-python` floor re-derived from `server.py` |
+| `test/test_packaging.py` | no | `pyproject.toml` metadata, `main(["--help"])` and `--directory`, the sibling-`sage` resolution fallback, and the `requires-python` floor re-derived from `src/sagemcp/*.py` |
 | `test/test_tool_docs.py` | no | each tool's `Errors:` docstring line equals its `outputSchema.error.properties.code.enum` |
 | `test/test_long_exec.py` | yes | opt-in (`SAGE_MCP_LONG=1`): a ~50 s `exec` returns its exact value, so a long call survives without a disconnect |
 
@@ -659,8 +664,8 @@ semantics are covered without paying 2 s per test. Every file except
 
 ## Constants
 
-Name-only index; the values live in `server.py` next to the comment that
-explains them.
+Name-only index; the values live in `src/sagemcp/constants.py` next to the
+comment that explains them.
 
 - `KERNEL_READ_TIMEOUT`
 - `MAX_INLINE_CHARS`

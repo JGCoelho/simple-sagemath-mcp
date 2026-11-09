@@ -51,9 +51,9 @@ to install the server and write the config.**_ It can run the commands, find the
 and check that the host starts the server.
 
 Note: The two pip routes put a `simple-sagemath-mcp` console script next to the `sage` executable; it
-calls `server:main`. On an externally managed (Debian/Ubuntu, PEP 668) `sagemath`, use `sage -pip
-install --user .`, which puts the script in `~/.local/bin` instead. The third route needs no
-package at all: the config names the python of your Sage and `server.py`.
+calls into the `sagemcp` package. On an externally managed (Debian/Ubuntu, PEP 668) `sagemath`, use
+`sage -pip install --user .`, which puts the script in `~/.local/bin` instead. The third route
+installs nothing: the config names the python of your Sage and the repo's `server.py`.
 
 ## Configure your host
 Point the host at the **absolute path** of the console script, because many hosts run MCP servers
@@ -65,12 +65,17 @@ with a sanitized environment:
   "args": ["--directory", "/path/to/your/work"]}}}
 ```
 
-The install is one top-level module (`server.py`), not a package, so `python -m simple_sagemath_mcp`
-does not exist. When the scripts directory is not on the host's `PATH`, the equivalent fallback is:
+The code is the `sagemcp` package under `src/`. Both pip routes install it, and `server.py` at the
+repo root is the entry point for a checkout (`python server.py`); installed, the equivalent of the
+console script is `python -m sagemcp`. So when the scripts directory is not on the host's `PATH`, the
+fallback is:
 
 ```json
-{ "command": "/path/to/sageenv/bin/python3", "args": ["-m", "server"] }
+{ "command": "/path/to/sageenv/bin/python3", "args": ["-m", "sagemcp"] }
 ```
+
+`python -m server` also works, but only from the checkout, where the repo root is already on
+`sys.path`; do not use it in a config for an installed copy.
 
 `--directory` changes the server's working directory before the kernel starts, so a relative path in
 the agent's code points at your work.
@@ -129,7 +134,7 @@ the full table of error codes.
   and access to your files.
 
 ## Requirements
-- SageMath 10.x (tested with 10.8 on Linux); the server module itself needs Python 3.10+.
+- SageMath 10.x (tested with 10.8 on Linux); the server code itself needs Python 3.10+.
 - `fastmcp`, `nbformat`, `jupyter_client`, and `ipykernel` in the python of your Sage. `sage -pip
   install .` installs all four; `install.sh` installs the first two (`jupyter_client` and
   `ipykernel` come with Sage).
@@ -142,7 +147,7 @@ PY=/path/to/sage/env/bin/python3
 PATH="$(dirname "$PY"):$PATH" "$PY" -m unittest discover -s test -v
 # or, without sage on PATH:
 SAGE_BIN=/path/to/sage "$PY" -m unittest discover -s test -v
-# a single file (test/ has no __init__.py):
+# one test file at a time (test/ has no __init__.py):
 PYTHONPATH=test "$PY" -m unittest test_packaging -v
 # the one long test is opt-in:
 SAGE_MCP_LONG=1 PATH="$(dirname "$PY"):$PATH" "$PY" test/test_long_exec.py -v
