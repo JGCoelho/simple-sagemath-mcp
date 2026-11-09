@@ -6,19 +6,19 @@ namespace, five tools — and runs `.py` and `.sage` files in it.
 
 ## Before you start: you need SageMath
 This server does **not** bundle, download, or install SageMath. It drives a SageMath already on the
-machine and cannot work without one; _if you work with Sage, you almost certainly have it._
-Check with `sage --version`.
+machine and cannot work without one; _if you work with Sage, you almost certainly have it._ Check
+with `sage --version`; what actually matters is that Sage's python can `import sage.all`.
 
 Everything targets *the python of that Sage*: the server imports Sage's preparser
 (`sage.repl.preparse`) to validate code, and the kernel it starts is that python, which imports
 `sage.all`. So **`sage -pip` is the only pip that can install it**; `pipx`, `uvx`, and a plain `pip
-install` into an unrelated venv _cannot_ be used, because they build an environment on another python
-where the Sage import fails.
+install` into an unrelated venv _cannot_ be used: they build an environment on another python, where
+the Sage import fails.
 
 ## Install
-Three routes, from fewest lines to most. They all end with a config block for your host.
+Three routes, from fewest lines to most; each ends with a config block for your host.
 
-**One line** — install from git with Sage's pip (works today):
+**One line** — install from git with Sage's pip:
 
 ```bash
 sage -pip install git+https://github.com/JGCoelho/simple-sagemath-mcp
@@ -43,16 +43,11 @@ cd simple-sagemath-mcp
 ./install.sh
 ```
 
-If `sage` is not on `PATH`, name it: `SAGE_BIN=/opt/sage/sage ./install.sh`.
-
-_**If any of this gives you trouble, hand it over: paste this README to your coding agent and ask it
-to install the server and write the config.**_ It can run the commands, find the python of your Sage,
-and check that the host starts the server.
-
-Note: The two pip routes put a `simple-sagemath-mcp` console script next to the `sage` executable; it
-calls into the `sagemcp` package. On an externally managed (Debian/Ubuntu, PEP 668) `sagemath`, use
-`sage -pip install --user .`, which puts the script in `~/.local/bin` instead. The third route
-installs nothing: the config names the python of your Sage and the repo's `server.py`.
+If `sage` is not on `PATH`, name it: `SAGE_BIN=/opt/sage/sage ./install.sh`. On an externally managed
+(Debian/Ubuntu, PEP 668) `sagemath`, use `sage -pip install --user .`, which puts the console script
+in `~/.local/bin` instead of next to `sage`. The third route installs nothing: the config names the
+python of your Sage and the repo's `server.py`. Stuck? Paste this README to your coding agent and ask
+it to install the server and write the config.
 
 ## Configure your host
 Point the host at the **absolute path** of the console script, because many hosts run MCP servers
@@ -64,25 +59,19 @@ with a sanitized environment:
   "args": ["--directory", "/path/to/your/work"]}}}
 ```
 
-The code is the `sagemcp` package under `src/`. Both pip routes install it, and `server.py` at the
-repo root is the entry point for a checkout (`python server.py`); installed, the equivalent of the
-console script is `python -m sagemcp`. So when the scripts directory is not on the host's `PATH`, the
-fallback is:
+The code is the `sagemcp` package under `src/`; both pip routes install it and create that script.
+When the scripts directory is not on the host's `PATH`, name the interpreter instead:
 
 ```json
 { "command": "/path/to/sageenv/bin/python3", "args": ["-m", "sagemcp"] }
 ```
 
-`python -m server` also works, but only from the checkout, where the repo root is already on
-`sys.path`; do not use it in a config for an installed copy.
-
-`--directory` changes the server's working directory before the kernel starts, so a relative path in
-the agent's code points at your work.
+From a checkout, name `server.py` itself (`"args": ["/path/to/repo/server.py"]`); `python -m server`
+works there too. `--directory` changes the server's working directory before the kernel starts, so a
+relative path in the agent's code points at your work.
 
 ## Other hosts
-The command is the same; only the file and the top-level key differ.
-
-**Codex** (`~/.codex/config.toml`):
+Same command; only the file and the top-level key differ. **Codex** (`~/.codex/config.toml`):
 
 ```toml
 [mcp_servers.sage]
@@ -93,23 +82,20 @@ args = ["--directory", "/path/to/your/work"]
 **VS Code** (`.vscode/mcp.json`, note `servers`):
 
 ```json
-{"servers": {"sage": {"type": "stdio",
-  "command": "/path/to/sageenv/bin/simple-sagemath-mcp",
-  "args": ["--directory", "/path/to/your/work"]}}}
+{"servers": {"sage": {"type": "stdio", "command": "/path/to/sageenv/bin/simple-sagemath-mcp", "args": ["--directory", "/path/to/your/work"]}}}
 ```
 
 ## What differs across hosts
 - **Hidden `PATH`.** Use the absolute path to the console script (or `server.py`); optionally
   `"env": {"SAGE_BIN": "/path/to/sage"}`. The server also looks for `sage` next to the interpreter
-  running it, so a console script in Sage's `bin` finds Sage with no extra config.
-- **One kernel per server process.** Each session gets its own server and namespace; a restart, a
-  crash, or a recycled process loses it, so keep code you want again in a `.py` or `.sage` file and
-  run it with `run_file`, not only in variables.
-- **Client-side timeouts.** Hosts often time out a call before the server's default 2400 s wait. Pass a
-  `timeout` below the host's limit: a call past it returns `status: running` with a `job_id`, the job
-  keeps running, and `job_status` reports it until it ends. `interrupt` stops it.
-- **Remote-only hosts.** This is a stdio server that starts a local kernel; a remote-only host needs
-  a local bridge.
+  running it, so a script in Sage's `bin` finds Sage unaided.
+- **One kernel per server process.** Each session gets its own namespace; a restart, a crash, or a
+  recycled process loses it, so keep code you want again in a `.py` or `.sage` file and run it with
+  `run_file`, not only in variables.
+- **Client-side timeouts.** Hosts often time out a call before the default 2400 s wait. Pass a
+  `timeout` below the host's limit: the call returns `status: running` with a `job_id`, the job keeps
+  running, and `job_status` reports it until it ends.
+- **Remote-only hosts** need a local bridge: this is stdio, and it starts a local kernel.
 
 ## Tools
 | Tool | Purpose |
@@ -122,21 +108,16 @@ args = ["--directory", "/path/to/your/work"]
 
 `exec` and `run_file` run as jobs. A call that outlasts its `timeout` (default 2400 s) returns
 `status: running`, a `job_id`, `elapsed` and the output so far, and the job keeps the kernel. The
-timeout bounds the wait, not the job: nothing on the server stops a job for running long. Poll
-`job_status` with the id until it reports `done`, `error` or `interrupted`. While a job holds the
-kernel, other calls return `kernel_busy`; they are not queued.
+timeout bounds the wait, not the job: nothing stops a job for running long. Poll `job_status` with the
+id until it reports `done`, `error` or `interrupted`. While a job holds the kernel, other calls return
+`kernel_busy`; they are not queued. The server keeps the running job and the latest finished job; an
+older id returns `unknown_job`, and a restart drops every record.
 
-The server keeps the running job and the latest finished job. An older job id returns `unknown_job`,
-and a server restart drops every record.
-
-`interrupt` stops the running computation and keeps the namespace; the job it stopped ends with
-`execution_failed` and `KeyboardInterrupt`. `restart` ends a running job as `interrupted`, with
-`kernel_died` as its error, and starts a new kernel with an empty namespace.
-
-`run_file` takes a path to a `.py` or `.sage` file, and a relative path is resolved against
-`--directory`. Only those two suffixes are accepted. The file is read once, as UTF-8 with a leading
-byte-order mark dropped; bytes that are not UTF-8 are `invalid_source`. It runs in the same namespace
-as `exec`, so its names stay for later calls, and a traceback names the file.
+`interrupt` keeps the namespace; the job it stopped ends with `execution_failed` and
+`KeyboardInterrupt`. `restart` ends a running job as `interrupted`, with `kernel_died` as its error.
+`run_file` resolves a relative path against `--directory` and accepts only those two suffixes. It
+reads the file once, as UTF-8 with a leading byte-order mark dropped; other bytes are
+`invalid_source`, and a traceback names the file.
 
 Every tool returns one envelope, with `error: null` on success. [SPEC.md](SPEC.md) §12 has the
 per-tool behaviour and the full table of error codes.
@@ -149,8 +130,8 @@ per-tool behaviour and the full table of error codes.
 
 ## Requirements
 - SageMath 10.x (tested with 10.8 on Linux); the server code itself needs Python 3.10+.
-- `fastmcp`, `jupyter_client`, and `ipykernel` in the python of your Sage. `sage -pip install .`
-  installs all three; `install.sh` installs `fastmcp` (`jupyter_client` and `ipykernel` come with Sage).
+- `fastmcp`, `jupyter_client`, and `ipykernel` in the python of your Sage. The pip routes install all
+  three; `install.sh` installs `fastmcp` (`jupyter_client` and `ipykernel` come with Sage).
 
 ## Tests
 Run from this directory with the python of your Sage:
@@ -158,16 +139,12 @@ Run from this directory with the python of your Sage:
 ```bash
 PY=/path/to/sage/env/bin/python3
 PATH="$(dirname "$PY"):$PATH" "$PY" -m unittest discover -s test -v
-# or, without sage on PATH:
-SAGE_BIN=/path/to/sage "$PY" -m unittest discover -s test -v
-# one test file at a time (test/ has no __init__.py):
-PYTHONPATH=test "$PY" -m unittest test_packaging -v
-# the one long test is opt-in:
-SAGE_MCP_LONG=1 PATH="$(dirname "$PY"):$PATH" "$PY" test/test_long_exec.py -v
+SAGE_BIN=/path/to/sage "$PY" -m unittest discover -s test -v   # sage not on PATH
+PYTHONPATH=test "$PY" -m unittest test_packaging -v             # one file (no __init__.py)
+SAGE_MCP_LONG=1 PATH="$(dirname "$PY"):$PATH" "$PY" test/test_long_exec.py -v  # opt-in
 ```
 
-[SPEC.md](SPEC.md) describes the architecture, the concurrency model, the constants, and the test
-layout in detail.
+[SPEC.md](SPEC.md) covers the architecture, the concurrency model, the constants and the test layout.
 
 ## License
 MIT. See [LICENSE](LICENSE).
