@@ -3,6 +3,8 @@
 from . import constants
 
 
+# --- output shaping ----------------------------------------------------------
+
 def _summarise(outs: list[dict]) -> tuple[str, str, str | None, str | None]:
     """Pure: make the short text view of outputs.
 

@@ -12,9 +12,9 @@ import re
 
 import nbformat
 
-from . import constants
+from . import constants, kernel
 from .errors import ExecTimeout, GapCrashLoop, KernelDied, NotebookError
-from .kernel import _restart_locked, _run_source
+from .kernel import _restart_locked
 from .notebook_io import _save_nb
 from .shaping import _summarise
 
@@ -104,7 +104,7 @@ def _run_nb_locked(state: dict, nb, path: str) -> tuple[list[dict], bool, bool, 
         cell_id = cell.get("id") or ""
         outs: list[dict] = []
         try:
-            outs = _run_source(state, cell.get("source") or "",
+            outs = kernel._run_source(state, cell.get("source") or "",
                                f"{path}:{cell_id}")
         except GapCrashLoop as e:
             outs = e.outputs

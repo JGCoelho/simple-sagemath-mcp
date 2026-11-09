@@ -1,4 +1,4 @@
-"""The error envelope and the seven closed output schemas. Copy verbatim.
+"""The error envelope and the seven closed output schemas.
 
 The dict literals and the key order are the wire contract: `tools/list`
 carries them, and the builders are the only constructors of a tool result.

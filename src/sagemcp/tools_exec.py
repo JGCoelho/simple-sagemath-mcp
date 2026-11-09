@@ -13,7 +13,8 @@ from .app import mcp
 from .envelope import OUTPUT_SCHEMA_EXEC, _err, _exec_out
 from .errors import (ExecTimeout, GapCrashLoop, KernelDied, SageNotFound,
                      SourceError)
-from .kernel import _ensure_kernel, _locked, _run_source
+from . import kernel
+from .kernel import _ensure_kernel, _locked
 from .shaping import _exec_view, _summarise
 
 
@@ -27,7 +28,7 @@ def _exec_locked(state: dict, code: str, timeout: float | None) -> dict:
     failure types are raised for the tool wrapper to map.
     """
     _ensure_kernel(state)
-    outs = _run_source(state, code, "<exec>", timeout=timeout)
+    outs = kernel._run_source(state, code, "<exec>", timeout=timeout)
     view = _exec_view(outs)
     detail = _summarise(outs)[3]
     if detail is None:
