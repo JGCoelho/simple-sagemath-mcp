@@ -27,6 +27,10 @@ from fastmcp.client.transports import PythonStdioTransport
 
 SERVER = str(Path(__file__).resolve().parent.parent / "server.py")
 
+# The shared client runs with the legacy notebook tools: nb_* and exec must share
+# one kernel in one process, so the nb tests cannot use a second server.
+SHARED_ARGS = ["--legacy-notebook-tools"]
+
 _loop = asyncio.new_event_loop()
 threading.Thread(target=_loop.run_forever, daemon=True).start()
 _client = None
@@ -38,7 +42,8 @@ def _start() -> None:
     global _client, _stack
     _stack = contextlib.AsyncExitStack()
     _client = asyncio.run_coroutine_threadsafe(
-        _stack.enter_async_context(Client(Path(SERVER))), _loop).result(120)
+        _stack.enter_async_context(Client(PythonStdioTransport(SERVER, args=SHARED_ARGS))),
+        _loop).result(120)
 
 
 class Server:
@@ -80,6 +85,14 @@ def unwrap(result) -> dict:
         return dataclasses.asdict(data)
     model_dump = getattr(data, "model_dump", None)
     return model_dump() if model_dump is not None else data
+
+
+def tool_names() -> list[str]:
+    """The names of the shared client's tools, in tools/list order."""
+    if _client is None:
+        _start()
+    future = asyncio.run_coroutine_threadsafe(_client.list_tools(), _loop)
+    return [tool.name for tool in future.result(120)]
 
 
 def call_async(name: str, **args) -> concurrent.futures.Future:

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # Run from the repo root: python test/test_tool_docs.py -v
 # Kernel-free: imports the `sagemcp` package and reads the registered tool
-# schemas. No Sage, no kernel, no server process.
+# schemas. No Sage, no kernel, no server process. The deprecated notebook tools
+# are not on the default tool list, so their docstrings are checked directly.
 
 import asyncio
 import sys
@@ -83,6 +84,24 @@ class TestToolDocErrors(unittest.TestCase):
                 errors = docstring_errors(function.__doc__)
                 enum = (wire["outputSchema"]["properties"]["error"]
                         ["properties"]["code"]["enum"])
+                self.assertEqual(errors, enum,
+                                 f"{name}: docstring and outputSchema differ")
+
+
+class TestLegacyToolDocs(unittest.TestCase):
+    """The deprecated nb_* tools: a DEPRECATED summary, and an Errors line that matches."""
+
+    def test_summary_says_deprecated(self):
+        for name, function, _ in tools_notebook.LEGACY_TOOLS:
+            with self.subTest(tool=name):
+                first = (function.__doc__ or "").strip().splitlines()[0]
+                self.assertEqual(first, "DEPRECATED: use run_file.")
+
+    def test_errors_match_output_schema(self):
+        for name, function, schema in tools_notebook.LEGACY_TOOLS:
+            with self.subTest(tool=name):
+                errors = docstring_errors(function.__doc__)
+                enum = schema["properties"]["error"]["properties"]["code"]["enum"]
                 self.assertEqual(errors, enum,
                                  f"{name}: docstring and outputSchema differ")
 

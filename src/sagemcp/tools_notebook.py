@@ -1,4 +1,8 @@
-"""The four notebook tools: `nb_run`, `nb_write`, `nb_read`, `nb_edit`.
+"""The four notebook tools: `nb_run`, `nb_write`, `nb_read`, `nb_edit`. Deprecated.
+
+They are not registered by default. `app.main` registers them, after the default
+tools, when the server is started with `--legacy-notebook-tools`
+(`register_legacy_notebook_tools`). `run_file` replaces them.
 
 Every write goes through `notebook_io`'s atomic replace; the three tools that
 mutate the file hold the notebook lock, and `nb_run` holds it across the restart
@@ -15,7 +19,7 @@ from fastmcp import Context
 from pydantic import Field
 
 from . import constants
-from .app import mcp
+from .app import OPTIONAL_TOOLS
 from .envelope import (OUTPUT_SCHEMA_NB_EDIT, OUTPUT_SCHEMA_NB_READ,
                        OUTPUT_SCHEMA_NB_RUN, OUTPUT_SCHEMA_NB_WRITE, _err,
                        _kernel_busy_err, _nb_edit_out, _nb_read_out,
@@ -29,13 +33,15 @@ from .notebook_run import _run_nb_locked
 
 
 # --- notebook tools ----------------------------------------------------------
+# The functions are plain: `register_legacy_notebook_tools` decorates them onto
+# the server only when the flag is passed, so the default tool list never has them.
 
-@mcp.tool(name="nb_run", output_schema=OUTPUT_SCHEMA_NB_RUN)
 async def sage_nb_run(
         ctx: Context,
         path: Annotated[str, Field(
             description="Filesystem path to the .ipynb notebook to run.")]) -> dict:
-    """Run every code cell of a notebook in a fresh kernel and write its outputs.
+    """DEPRECATED: use run_file.
+    Run every code cell of a notebook in a fresh kernel and write its outputs.
 
     State: the kernel is restarted first, so every variable from prior `exec` or
     `nb_run` calls is discarded; afterwards it stays alive and warm with the
@@ -100,7 +106,6 @@ async def sage_nb_run(
                            error=error)
 
 
-@mcp.tool(name="nb_write", output_schema=OUTPUT_SCHEMA_NB_WRITE)
 async def sage_nb_write(
         ctx: Context,
         path: Annotated[str, Field(
@@ -122,7 +127,8 @@ async def sage_nb_write(
         )],
         overwrite: Annotated[bool, Field(
             description="Replace an existing file. Default false.")] = False) -> dict:
-    """Create a new notebook from cells, validate it, and write it atomically.
+    """DEPRECATED: use run_file.
+    Create a new notebook from cells, validate it, and write it atomically.
 
     State: writes the file at `path` at nbformat 4.5, so every cell has an id;
     the ids are returned in `cell_ids` and can go straight into `nb_edit`.
@@ -188,14 +194,14 @@ async def sage_nb_write(
                 f"{type(e).__name__}: {e}"))
 
 
-@mcp.tool(name="nb_read", output_schema=OUTPUT_SCHEMA_NB_READ)
 async def sage_nb_read(
         ctx: Context,
         path: Annotated[str, Field(description="Filesystem path to the .ipynb.")],
         cell_ids: Annotated[list[str] | None, Field(
             description="Optional. Return only these cells, in the order given "
                         "here. Unknown ids fail the whole call.")] = None) -> dict:
-    """Read and validate a notebook from disk and return its cells.
+    """DEPRECATED: use run_file.
+    Read and validate a notebook from disk and return its cells.
 
     State: reads only. No in-memory notebook state is consulted, so every call
     reflects the file; a notebook below nbformat 4.5 is upgraded in memory (ids
@@ -225,7 +231,6 @@ async def sage_nb_read(
             f"{type(e).__name__}: {e}"))
 
 
-@mcp.tool(name="nb_edit", output_schema=OUTPUT_SCHEMA_NB_EDIT)
 async def sage_nb_edit(
         ctx: Context,
         path: Annotated[str, Field(description="Filesystem path to the .ipynb.")],
@@ -237,7 +242,8 @@ async def sage_nb_edit(
                         "no cell_id), or {op:remove, cell_id}. Validated here, "
                         "never trusted.")]
         ) -> dict:
-    """Apply edit/add/remove cell ops to an existing notebook atomically.
+    """DEPRECATED: use run_file.
+    Apply edit/add/remove cell ops to an existing notebook atomically.
 
     State: the ops are applied in memory and the whole result is re-validated;
     only then is the file rewritten once. Cells are addressed by `cell_id`
@@ -282,3 +288,28 @@ async def sage_nb_edit(
             return _nb_edit_out(error=_err(
                 "internal", "Unexpected failure inside the server.",
                 f"{type(e).__name__}: {e}"))
+
+
+# --- legacy registration -----------------------------------------------------
+
+# The four tools in their historical order. `tools/list` shows them in this order
+# after the default tools, and only when the server runs with the flag.
+LEGACY_TOOLS = (
+    ("nb_run", sage_nb_run, OUTPUT_SCHEMA_NB_RUN),
+    ("nb_write", sage_nb_write, OUTPUT_SCHEMA_NB_WRITE),
+    ("nb_read", sage_nb_read, OUTPUT_SCHEMA_NB_READ),
+    ("nb_edit", sage_nb_edit, OUTPUT_SCHEMA_NB_EDIT),
+)
+
+
+def register_legacy_notebook_tools(server) -> None:
+    """Register the four deprecated notebook tools on `server`, in LEGACY_TOOLS order.
+
+    `app.main` calls this only when `--legacy-notebook-tools` is passed. Without
+    the flag none of these tools exists on the server.
+    """
+    for name, function, schema in LEGACY_TOOLS:
+        server.tool(name=name, output_schema=schema)(function)
+
+
+OPTIONAL_TOOLS["legacy_notebook_tools"] = register_legacy_notebook_tools
