@@ -1,15 +1,14 @@
-"""The Sage kernel: the locks, the lifecycle, and the execution loop.
+"""The Sage kernel: the lock, the lifecycle, the jobs, and the execution loop.
 
-One lock serializes every computation and one notebook lock serializes file
-mutations (lock order: notebook, then kernel). The kernel starts lazily on
-the first call and is seeded with sage.all before it is handed out. Nothing
-here imports Sage: only the kernel process does, when it seeds the namespace.
+One lock serializes every computation. The kernel starts lazily on the first
+call and is seeded with sage.all before it is handed out. Nothing here imports
+Sage: only the kernel process does, when it seeds the namespace.
 """
 
 import asyncio
 import time
 from queue import Empty
-from typing import Any, Callable
+from typing import Callable
 
 from fastmcp import Context
 from jupyter_client import KernelManager
@@ -27,22 +26,11 @@ from .source import _prepare, _wrapper
 
 # --- kernel lifecycle --------------------------------------------------------
 
-# One lock serializes every computation. Only `_locked` and `_restart` touch it;
-# all other kernel helpers are sync and assume the caller holds it.
+# One lock serializes every computation. A job holds it from its start to its
+# end (`_run_job`), and `_restart` takes it; all other kernel helpers are sync
+# and assume the caller holds it.
 
 _kernel_lock = asyncio.Lock()
-
-# Serializes notebook file mutations across tool calls. `nb_run` holds it
-# for the whole run, so a concurrent `nb_edit`/`nb_write` cannot land
-# between its load and its write (that was a silent lost update). Lock
-# order is always notebook lock, then kernel lock; nothing takes them the
-# other way, so the two cannot deadlock.
-#
-# A job (exec, run_file) takes only the kernel lock, not this one: it never
-# reads or writes a notebook file, so there is nothing for this lock to order.
-# The notebook tools check for a running job before they take either lock, so
-# a notebook write cannot start while a job holds the kernel either.
-_nb_lock = asyncio.Lock()
 
 
 def _stop_kernel(state: dict) -> None:
@@ -197,38 +185,6 @@ def _interrupt(state: dict) -> bool:
     except Exception:
         pass
     return True
-
-
-def _consume(task: asyncio.Future) -> None:
-    """Read a finished future's exception so asyncio does not warn about it."""
-    if not task.cancelled():
-        task.exception()
-
-
-async def _locked(ctx: Context, fn: Callable[..., Any], *args) -> Any:
-    """Run sync `fn` in a thread while holding the kernel lock, with heartbeats.
-
-    Reports progress every HEARTBEAT_INTERVAL so a long computation keeps the
-    connection alive. Returns fn's value or re-raises its exception. Never calls
-    fn outside the lock and never starts a kernel itself. Used by the notebook
-    run only; exec and run_file go through `_start_job`.
-    """
-    async with _kernel_lock:
-        task = asyncio.ensure_future(asyncio.to_thread(fn, *args))
-        try:
-            while True:
-                done, _ = await asyncio.wait({task}, timeout=constants.HEARTBEAT_INTERVAL)
-                if done:
-                    return task.result()
-                try:
-                    await ctx.report_progress(progress=0, total=None,
-                                              message="Sage kernel still running...")
-                except Exception:
-                    pass
-        finally:
-            if not task.done():
-                task.cancel()
-                task.add_done_callback(_consume)
 
 
 # --- jobs --------------------------------------------------------------------
@@ -480,12 +436,11 @@ def _run_source(state: dict, source: str, filename: str, *,
                              "traceback": content.get("traceback") or []})
             elif mtype == "status" and content.get("execution_state") == "idle":
                 break
-    except ExecTimeout as e:
+    except ExecTimeout:
         # The kernel is still computing. Keep busy set, so `interrupt` can reach
         # it (the flag means "may be computing"; it clears on the next completed
-        # call or a restart). Keep the partial outputs for a notebook caller.
+        # call or a restart).
         timed_out = True
-        e.outputs = outs
         raise
     finally:
         state["busy"] = timed_out

@@ -1,4 +1,4 @@
-"""The error envelope and the seven closed output schemas.
+"""The error envelope and the five closed output schemas.
 
 The dict literals and the key order are the wire contract: `tools/list`
 carries them, and the builders are the only constructors of a tool result.
@@ -164,136 +164,6 @@ OUTPUT_SCHEMA_RESTART = {
 }
 
 
-OUTPUT_SCHEMA_NB_RUN = {
-    "type": "object",
-    "properties": {
-        "cells": {
-            "type": "array",
-            "description": ("Code cells in execution order with inline outputs; "
-                            "non-code cells omitted."),
-            "items": {
-                "type": "object",
-                "properties": {
-                    "cell_id": {"type": "string"},
-                    "cell_type": {"type": "string",
-                                  "enum": ["code", "markdown", "raw"]},
-                    "outputs": {"type": "array", "items": {"type": "object"}},
-                },
-                "required": ["cell_id", "cell_type", "outputs"],
-                "additionalProperties": False,
-            },
-        },
-        "truncated": {
-            "type": "boolean",
-            "description": ("True if inline outputs were cut; full outputs are "
-                            "on disk (recover with `nb_read`)."),
-        },
-        "saved": {
-            "type": "boolean",
-            "description": "True iff the notebook file was written by this call.",
-        },
-        "error": _error_schema(["invalid_source", "cell_execution_failed",
-                                "kernel_died", "sage_not_found", "not_found",
-                                "invalid_notebook", "unsupported_magic",
-                                "write_failed", "internal", "kernel_busy"]),
-    },
-    "required": ["cells", "truncated", "saved", "error"],
-    "additionalProperties": False,
-}
-
-OUTPUT_SCHEMA_NB_WRITE = {
-    "type": "object",
-    "properties": {
-        "cell_ids": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Cell IDs assigned to the written cells, in order.",
-        },
-        "saved": {
-            "type": "boolean",
-            "description": "True iff the notebook file was written by this call.",
-        },
-        "error": _error_schema(["invalid_source", "exists", "invalid_notebook",
-                                "unsupported_magic", "write_failed", "internal",
-                                "kernel_busy"]),
-    },
-    "required": ["cell_ids", "saved", "error"],
-    "additionalProperties": False,
-}
-
-OUTPUT_SCHEMA_NB_READ = {
-    "type": "object",
-    "properties": {
-        "nbformat": {
-            "type": ["integer", "null"],
-            "description": ("The major nbformat version stored on disk; null on "
-                            "failure."),
-        },
-        "nbformat_minor": {
-            "type": ["integer", "null"],
-            "description": ("The minor nbformat version stored on disk (4 for a "
-                            "file upgraded in memory); null on failure."),
-        },
-        "cells": {
-            "type": "array",
-            "description": ("Selected cells in the requested order (or notebook "
-                            "order); empty on failure."),
-            "items": {
-                "type": "object",
-                "properties": {
-                    "cell_id": {"type": "string"},
-                    "cell_type": {"type": "string",
-                                  "enum": ["code", "markdown", "raw"]},
-                    "source": {"type": "string"},
-                    "outputs": {
-                        "type": "array",
-                        "items": {"type": "object"},
-                        "description": ("Only on code cells: the full nbformat "
-                                        "outputs stored on disk."),
-                    },
-                },
-                "required": ["cell_id", "cell_type", "source"],
-                "additionalProperties": False,
-            },
-        },
-        "error": _error_schema(["not_found", "invalid_notebook",
-                                "unknown_cell_id", "internal", "kernel_busy"]),
-    },
-    "required": ["nbformat", "nbformat_minor", "cells", "error"],
-    "additionalProperties": False,
-}
-
-OUTPUT_SCHEMA_NB_EDIT = {
-    "type": "object",
-    "properties": {
-        "applied": {
-            "type": "array",
-            "description": ("Ops applied in order; empty if the call failed."),
-            "items": {
-                "type": "object",
-                "properties": {
-                    "op": {"type": "string",
-                           "enum": ["edit", "add", "remove"]},
-                    "cell_id": {"type": "string"},
-                },
-                "required": ["op", "cell_id"],
-                "additionalProperties": False,
-            },
-        },
-        "saved": {
-            "type": "boolean",
-            "description": "True iff the notebook file was written by this call.",
-        },
-        "error": _error_schema(["invalid_source", "not_found",
-                                "invalid_notebook", "unsupported_magic",
-                                "unknown_cell_id", "invalid_op",
-                                "write_failed", "internal", "kernel_busy"]),
-    },
-    "required": ["applied", "saved", "error"],
-    "additionalProperties": False,
-}
-
-
 def _exec_out(*, result: str = "", stdout: str = "", stderr: str = "",
               truncated: bool = False, error: dict | None = None) -> dict:
     """The only constructor of a finished `exec`/`run_file` result. Five keys."""
@@ -334,37 +204,7 @@ def _kernel_busy_err(job_id: str | None) -> dict:
     return _err("kernel_busy",
                 "The Sage kernel is busy with another call; calls do not queue. "
                 "Poll job_status for the job, or interrupt it.",
-                job_id or "a notebook run or a restart holds the kernel")
-
-
-def _nb_run_out(*, cells: list | None = None, truncated: bool = False,
-                saved: bool = False, error: dict | None = None) -> dict:
-    """The only constructor of an `nb_run` result."""
-    return {"cells": [] if cells is None else cells, "truncated": truncated,
-            "saved": saved, "error": error}
-
-
-def _nb_write_out(*, cell_ids: list | None = None, saved: bool = False,
-                  error: dict | None = None) -> dict:
-    """The only constructor of an `nb_write` result."""
-    return {"cell_ids": [] if cell_ids is None else cell_ids,
-            "saved": saved, "error": error}
-
-
-def _nb_read_out(*, nbformat: int | None = None,
-                 nbformat_minor: int | None = None,
-                 cells: list | None = None,
-                 error: dict | None = None) -> dict:
-    """The only constructor of an `nb_read` result."""
-    return {"nbformat": nbformat, "nbformat_minor": nbformat_minor,
-            "cells": [] if cells is None else cells, "error": error}
-
-
-def _nb_edit_out(*, applied: list | None = None, saved: bool = False,
-                 error: dict | None = None) -> dict:
-    """The only constructor of an `nb_edit` result."""
-    return {"applied": [] if applied is None else applied,
-            "saved": saved, "error": error}
+                job_id or "a restart holds the kernel")
 
 
 def _interrupt_out(*, interrupted: bool = False,

@@ -27,10 +27,6 @@ from fastmcp.client.transports import PythonStdioTransport
 
 SERVER = str(Path(__file__).resolve().parent.parent / "server.py")
 
-# The shared client runs with the legacy notebook tools: nb_* and exec must share
-# one kernel in one process, so the nb tests cannot use a second server.
-SHARED_ARGS = ["--legacy-notebook-tools"]
-
 _loop = asyncio.new_event_loop()
 threading.Thread(target=_loop.run_forever, daemon=True).start()
 _client = None
@@ -42,7 +38,7 @@ def _start() -> None:
     global _client, _stack
     _stack = contextlib.AsyncExitStack()
     _client = asyncio.run_coroutine_threadsafe(
-        _stack.enter_async_context(Client(PythonStdioTransport(SERVER, args=SHARED_ARGS))),
+        _stack.enter_async_context(Client(PythonStdioTransport(SERVER))),
         _loop).result(120)
 
 

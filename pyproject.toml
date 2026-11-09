@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "simple-sagemath-mcp"
 version = "0.1.0"
-description = "A stateful SageMath MCP server: one persistent kernel, one namespace, seven tools."
+description = "A stateful SageMath MCP server: one persistent kernel, one namespace, five tools."
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "JGCoelho", email = "josegustavocoelho@gmail.com" }]
-keywords = ["sagemath", "mcp", "jupyter", "notebook", "math", "sage"]
+keywords = ["sagemath", "mcp", "jupyter", "math", "sage"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
@@ -35,7 +35,6 @@ requires-python = ">=3.10"
 # envelope relies on may change in a major release.
 dependencies = [
     "fastmcp>=4.1,<5",
-    "nbformat>=5.10",
     "jupyter_client>=8.8",
     "ipykernel>=6",
 ]

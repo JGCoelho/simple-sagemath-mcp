@@ -102,9 +102,6 @@ class TestJobs(unittest.TestCase):
             self.assertEqual(refused["error"]["code"], "kernel_busy")
             self.assertEqual(refused["error"]["details"], job_id)
             self.assertNotIn("status", refused)     # a refusal is not a running job
-            nb = _mcp.call("nb_read", path="/nonexistent/none.ipynb")
-            self.assertEqual(nb["error"]["code"], "kernel_busy")
-            self.assertEqual(nb["error"]["details"], job_id)
             self.assertEqual(_mcp.wait_job(job_id)["status"], "done")
             self.assertIsNone(_mcp.call("exec", code="busy_done")["error"])
         finally:

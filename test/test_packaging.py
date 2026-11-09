@@ -186,8 +186,7 @@ class TestShim(unittest.TestCase):
         deps = re.search(r"^# dependencies = \[(.*)\]$", body, re.MULTILINE)
         self.assertIsNotNone(deps, "the PEP 723 block has no dependencies line")
         names = re.findall(r'"([^"]+)"', deps.group(1))
-        self.assertEqual(sorted(names), ["fastmcp", "ipykernel",
-                                         "jupyter_client", "nbformat"])
+        self.assertEqual(sorted(names), ["fastmcp", "ipykernel", "jupyter_client"])
 
 
 class TestSiblingSageFallback(unittest.TestCase):

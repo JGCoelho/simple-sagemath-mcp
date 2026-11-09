@@ -31,7 +31,7 @@ class KernelBusy(Exception):
     """Another call holds the kernel, so this one is refused, not queued.
 
     `job_id` names the running job, or is None when the holder is not a job
-    (a notebook run or a restart).
+    (a restart).
     """
 
     def __init__(self, job_id: str | None):
@@ -49,12 +49,3 @@ class GapCrashLoop(Exception):
             o["text"] for o in outputs
             if o["output_type"] == "stream" and o.get("name") == "stderr")
 
-
-class NotebookError(Exception):
-    """A notebook failure with the SPEC §9.2 `code`, message, and details."""
-
-    def __init__(self, code: str, message: str, details: object = None):
-        super().__init__(message)
-        self.code = code
-        self.message = message
-        self.details = None if details is None else str(details)

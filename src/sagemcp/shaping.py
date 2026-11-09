@@ -33,7 +33,7 @@ def _truncate(text: str, budget: int) -> tuple[str, bool]:
 
     Returns `(text, cut)`; a cut text keeps the first `budget` characters and
     appends a marker naming how many were dropped. The marker is not counted in
-    the budget. Never touches the source of the text (a file, a notebook).
+    the budget. Never touches where the text came from.
     """
     if len(text) <= budget:
         return text, False
@@ -81,8 +81,7 @@ def _clean_traceback(lines: list) -> str:
     Drops the ANSI escapes and every traceback entry that mentions a name from
     the generated wrapper, keeping the exception header, the frames in the
     user's file and the library frames, and the final `Ename: evalue` line.
-    The notebook's on-disk outputs are untouched: only `error.details` is
-    cleaned. Pure, and never raises.
+    Pure, and never raises.
     """
     kept: list[str] = []
     for line in lines:

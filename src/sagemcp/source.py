@@ -13,8 +13,8 @@ from .errors import SAGE_NOT_FOUND, SageNotFound, SourceError
 def _prepare(source: str) -> str:
     """Preparse and compile Sage source; return the preparsed text.
 
-    This is the static check that execution and notebook validation share, so a
-    source that passes here fails at the same place when it runs. Imports Sage
+    This is the static check that runs before any source reaches the kernel, so
+    a source that passes here fails at the same place when it runs. Imports Sage
     lazily (never at module import) and raises `SourceError` with the exception
     text on a syntax error, `SageNotFound` if Sage cannot be imported.
     """
@@ -61,17 +61,8 @@ if _mcp_tree.body and isinstance(_mcp_tree.body[-1], _mcp_ast.Expr):
     _mcp_value = eval(compile(_mcp_last, {filename!r}, "eval"), _mcp_ns, _mcp_ns)
     if _mcp_value is not None:
         from IPython.display import display as _mcp_display
-        _mcp_data = {{"text/plain": repr(_mcp_value)}}
-        # Sage objects can give LaTeX and HTML. Use them when a notebook shows the value.
-        for _mcp_mime, _mcp_attr, _mcp_fmt in (("text/latex", "_latex_", "$%s$"),
-                                               ("text/html", "_html_", "%s")):
-            _mcp_method = getattr(_mcp_value, _mcp_attr, None)
-            if _mcp_method is not None:
-                try:
-                    _mcp_data[_mcp_mime] = _mcp_fmt % _mcp_method()
-                except Exception:
-                    pass
-        _mcp_display(_mcp_data, raw=True, metadata={{"_mcp_trailing": True}})
+        _mcp_display({{"text/plain": repr(_mcp_value)}}, raw=True,
+                     metadata={{"_mcp_trailing": True}})
 else:
     exec(compile(_mcp_tree, {filename!r}, "exec"), _mcp_ns, _mcp_ns)
 '''

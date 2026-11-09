@@ -129,10 +129,9 @@ async def sage_exec(
     long this call waits, not the job. On expiry it returns status `running`, a
     `job_id`, `elapsed` and the output so far, and the job keeps running. Poll
     `job_status` with the id, or stop it with `interrupt` or `restart`. While a
-    job holds the kernel, exec, run_file and nb_* calls return `kernel_busy`.
+    job holds the kernel, exec and run_file calls return `kernel_busy`.
     Plots: a Sage `Graphics` reprs as PGF/LaTeX, not an image; save with
-    `P.save('p.png')` (relative to the kernel cwd, not the notebook) and
-    `display(Image(filename='p.png'))` in a notebook.
+    `P.save('p.png')`, which writes relative to the kernel's working directory.
     Errors: invalid_source, cell_execution_failed, gap_crash_loop, kernel_died,
     sage_not_found, internal, kernel_busy.
     """
@@ -197,7 +196,7 @@ async def sage_run_file(
     Output: as exec: `result`, `stdout` and `stderr`. An uncaught exception is
     `cell_execution_failed`, and its `details` is the traceback, which names the file.
     Jobs: the call runs as a job, with the same timeout, `running` and `job_status`
-    behaviour as exec. While a job holds the kernel, exec, run_file and nb_* calls
+    behaviour as exec. While a job holds the kernel, exec and run_file calls
     return `kernel_busy`.
     Errors: invalid_source, file_not_found, cell_execution_failed, gap_crash_loop,
     kernel_died, sage_not_found, internal, kernel_busy.

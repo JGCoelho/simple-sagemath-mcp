@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["fastmcp", "nbformat", "jupyter_client", "ipykernel"]
+# dependencies = ["fastmcp", "jupyter_client", "ipykernel"]
 # ///
 # Run:      python server.py     (the python of your Sage install)
 # Install:  sage -pip install .  (or, from git: sage -pip install
