@@ -162,7 +162,7 @@ if _mcp_tree.body and isinstance(_mcp_tree.body[-1], ast.Expr):
     exec(compile(_mcp_tree, filename, "exec"), ns, ns)
     value = eval(compile(last, filename, "eval"), ns, ns)
     if value is not None:
-        display({mime bundle}, raw=True, metadata={"_mcp_trailing": True})
+        display({"text/plain": repr(value)}, raw=True, metadata={"_mcp_trailing": True})
 else:
     exec(compile(_mcp_tree, filename, "exec"), ns, ns)
 ```
@@ -290,9 +290,12 @@ only `_run_job` and `_restart` acquire it.
 registers its record (`jobs.py`) and starts a task that holds the kernel lock for
 the whole run. `_claim` checks, with no `await` before the job is registered,
 whether a job or another holder has the kernel. If one has, the call gets
-`kernel_busy` with the holder's job id, and its work does not start. A job finishes its record before it releases the lock, so a
-`job_status` that sees the job end sees its final envelope. The last
-`JOB_RETENTION` finished records are kept; the running job is never dropped.
+`kernel_busy` with the holder's job id, and its work does not start. A job
+finishes its record before it releases the lock, so a `job_status` that sees the
+job end sees its final envelope.
+
+Retention: the running job and the latest finished job. As each job ends,
+`jobs.retire` drops every other finished record, so an older id is `unknown_job`.
 Records are in memory only.
 
 **`interrupt` takes neither lock**, by design: it must work while a call holds
@@ -364,12 +367,16 @@ still running (`status` is then `"running"`). A finished call has the five base
 keys. `job_status` reports a job's `status`, `elapsed` and output, and its
 `result` once the job has finished.
 
-The schemas are declared **per tool** as `output_schema` dicts, because FastMCP
-enforces them strictly (verified against 4.1.3): the payload must validate, and
-`error` must be `["object", "null"]` with a per-tool `enum` of the codes that
-tool can actually produce. An enum member that is unreachable is removed rather
-than documented (e.g. `interrupt` cannot report `kernel_died`, since it never
-takes the lock and never starts anything). `additionalProperties: false` is set everywhere, so a tool that forgets a field
+The schemas are declared **per tool** as `output_schema` dicts, built in
+`envelope.py` from shared fragments. A field such as `result`, `stdout` or `error`
+is defined once, and each tool that returns it copies that definition, so the
+tools agree by construction. A tool adds its own fields and its own `code` enum.
+FastMCP enforces the schemas strictly (verified against 4.1.3): the payload must
+validate, and `error` must be `["object", "null"]` with a per-tool `enum` of the
+codes that tool can actually produce. An enum member that is unreachable is
+removed rather than documented (e.g. `interrupt` cannot report `kernel_died`,
+since it never takes the lock and never starts anything).
+`additionalProperties: false` is set everywhere, so a tool that forgets a field
 fails at development time instead of surprising a client.
 
 ### The codes
@@ -425,7 +432,8 @@ is `running`, `done` (finished without an error result), `error` (finished with 
 `interrupted` (a restart ended it). While the job runs, `stdout`, `stderr` and `elapsed` are the
 output so far. Once it has finished, `result`, `stdout`, `stderr`, `truncated` and `error` are the
 values its call would have returned. An unknown id is `unknown_job`. That covers an id that never
-existed, a record that was dropped, and every id after a server restart.
+existed, an older finished job whose record was dropped, and every id after a server restart. Only
+the running job and the latest finished job have records.
 
 ### `interrupt()`
 Sends the interrupt request. `interrupted` is true when a computation may be running and the request
@@ -476,11 +484,12 @@ job's record reads `interrupted`, with `kernel_died` as its error.
 | `test/_mcp.py` | — | shared client, sync/async helpers, `call_raw`, `wait_job`, `settle`, `Server` for a second process |
 | `test/test_sagebin.py` | no | `SAGE_BIN` over `PATH`, sibling python, `sage -c` fallback, not-found message, `PATH` prefix, seed/start failures (mocked) |
 | `test/test_exec.py` | yes | values, preparse, persistence, runtime/syntax errors, split streams, timeout then interrupt, restart while busy, interrupt idle/busy, truncation, GAP guard, `display` is not the result, output shape |
-| `test/test_jobs.py` | yes | running envelope and partial output, `job_status`, `kernel_busy` without queueing, `unknown_job`, interrupt and restart reaching a running job, finished-record retention (no kernel) |
+| `test/test_jobs.py` | yes | running envelope and partial output, `job_status`, `kernel_busy` without queueing, `unknown_job`, interrupt and restart reaching a running job, the retention rule (the class is kernel-free; a live check shows an older job is unknown) |
 | `test/test_run_file.py` | yes | `.py` and `.sage` values, preparse, persistence, missing file, bad suffix, bad UTF-8, BOM, syntax error, traceback names the file, relative path against `--directory` (a second server), `kernel_busy`, a long file polled to `done`, interrupt |
-| `test/test_tool_list.py` | no | `tools/list` names and order, from the shared client and a second server |
+| `test/test_tool_list.py` | no | `tools/list` names and order (the five tools), from the shared client and a second server |
 | `test/test_packaging.py` | no | `pyproject.toml` metadata, `main(["--help"])` and `--directory`, the sibling-`sage` resolution fallback, and the `requires-python` floor re-derived from `src/sagemcp/*.py` |
-| `test/test_tool_docs.py` | no | each default tool's `Errors:` docstring line equals its `outputSchema.error.properties.code.enum` |
+| `test/test_tool_docs.py` | no | each tool's `Errors:` docstring line equals its `outputSchema.error.properties.code.enum` |
+| `test/test_envelope.py` | no | output schemas: closed objects, each schema's keys equal its builder's keys, the code enums, shared fields defined once |
 | `test/test_long_exec.py` | yes | opt-in (`SAGE_MCP_LONG=1`): a ~50 s `exec` returns its exact value, so a long call survives without a disconnect |
 
 Kernel-free where possible: anything that needs an interpreter is mocked. Every file except
@@ -522,13 +531,11 @@ Kernel-free where possible: anything that needs an interpreter is mocked. Every 
   against the kernel cwd, not the directory of any file.
 - Size is measured by `tools/measure.py`, which reports the wire size
   (`name` + `description` + `inputSchema` + `outputSchema`) and the direct-model
-  size (`name` + `description` + `inputSchema`). The figures that were recorded
-  here predate `run_file` and the deprecation; re-run `tools/measure.py` for the
-  current surface (the default surface is wire 11,592 chars, direct-model 5,864).
-  The increase is deliberate: the `Errors:` lines and the `P.save` cwd note carry
-  facts that direct callers
-  cannot get from `outputSchema`. Do not trade them away to hit a wire-size
-  target.
+  size (`name` + `description` + `inputSchema`). At this commit the five-tool
+  surface is wire 12,037 chars and direct-model 5,797. Re-run `tools/measure.py`
+  after a change. The growth is deliberate: the `Errors:` lines and the `P.save`
+  cwd note carry facts that direct callers cannot get from `outputSchema`. Do not
+  trade them away to hit a wire-size target.
 
 ---
 
@@ -538,7 +545,6 @@ Name-only index; the values live in `src/sagemcp/constants.py` next to the
 comment that explains them.
 
 - `KERNEL_READ_TIMEOUT`
-- `JOB_RETENTION`
 - `MAX_INLINE_CHARS`
 - `GAP_CRASH_LIMIT`
 - `SHUTDOWN_TIMEOUT`

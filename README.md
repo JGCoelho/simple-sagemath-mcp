@@ -121,13 +121,21 @@ args = ["--directory", "/path/to/your/work"]
 | `restart` | Restart the kernel and wipe the namespace |
 
 `exec` and `run_file` run as jobs. A call that outlasts its `timeout` (default 2400 s) returns
-`status: running`, a `job_id`, `elapsed` and the output so far, and the job keeps the kernel. Poll
-`job_status` with the id until it reports `done`, `error` or `interrupted`. While a job holds the
-kernel, other calls return `kernel_busy`; they are not queued.
+`status: running`, a `job_id`, `elapsed` and the output so far, and the job keeps the kernel. The
+timeout bounds the wait, not the job. Poll `job_status` with the id until it reports `done`, `error`
+or `interrupted`. While a job holds the kernel, other calls return `kernel_busy`; they are not queued.
+
+The server keeps the running job and the latest finished job. An older job id returns `unknown_job`,
+and a server restart drops every record.
+
+`interrupt` stops the running computation and keeps the namespace; the job it stopped ends with
+`cell_execution_failed` and `KeyboardInterrupt`. `restart` ends a running job as `interrupted`, with
+`kernel_died` as its error, and starts a new kernel with an empty namespace.
 
 `run_file` takes a path to a `.py` or `.sage` file, and a relative path is resolved against
-`--directory`. Only those two suffixes are accepted. The file runs in the same namespace as `exec`, so
-its names stay for later calls.
+`--directory`. Only those two suffixes are accepted. The file is read once, as UTF-8 with a leading
+byte-order mark dropped; bytes that are not UTF-8 are `invalid_source`. It runs in the same namespace
+as `exec`, so its names stay for later calls, and a traceback names the file.
 
 Every tool returns one envelope, with `error: null` on success. [SPEC.md](SPEC.md) §12 has the
 per-tool behaviour and the full table of error codes.
