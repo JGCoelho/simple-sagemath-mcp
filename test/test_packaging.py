@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # Run from the repo root: python test/test_packaging.py -v
-# Kernel-free and fast: packaging metadata, main(), and the sibling-sage
-# resolution fallback. No Sage, no kernel, no server process.
+# Kernel-free and fast: packaging metadata, main(), the shim, and the
+# sibling-sage resolution fallback. No Sage, no kernel, no server process.
 
 import ast
 import contextlib
 import io
 import os
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -16,9 +18,8 @@ from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
-sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
-import server
+from sagemcp import app
 from sagemcp import sageresolve
 from sagemcp.errors import SageNotFound
 
@@ -28,7 +29,10 @@ except ModuleNotFoundError:          # Python 3.10 has no tomllib
     tomllib = None
 
 PYPROJECT = ROOT / "pyproject.toml"
-SERVER = ROOT / "server.py"
+SHIM = ROOT / "server.py"
+SRC = ROOT / "src"
+PACKAGE = SRC / "sagemcp"
+MODULES = sorted(PACKAGE.glob("*.py"))
 MINORS = (9, 10, 11)
 
 
@@ -37,9 +41,9 @@ def read_pyproject() -> dict:
         return tomllib.load(fh)
 
 
-def parses(minor: int) -> bool:
+def parses(path: Path, minor: int) -> bool:
     try:
-        ast.parse(SERVER.read_text(encoding="utf-8"), feature_version=(3, minor))
+        ast.parse(path.read_text(encoding="utf-8"), feature_version=(3, minor))
     except SyntaxError:
         return False
     return True
@@ -78,19 +82,35 @@ def uses_pep604_annotations(tree) -> bool:
     return False
 
 
-def runtime_floor() -> int:
-    """The smallest Python minor that can import server.py.
+def module_tree(path: Path):
+    return ast.parse(path.read_text(encoding="utf-8"))
+
+
+def annotated_modules() -> list[str]:
+    """Modules with a PEP 604 union in an annotation evaluated at def time."""
+    return [path.name for path in MODULES
+            if uses_pep604_annotations(module_tree(path))]
+
+
+def file_floor(path: Path) -> int:
+    """The smallest Python minor that can import `path`.
 
     `ast.parse` alone is not enough: a PEP 604 union in an annotation parses on
     3.9 but raises TypeError at import, because the annotation is evaluated when
     the function is defined. So the floor is the larger of the syntax floor and
     3.10 when such an annotation exists.
     """
-    syntax = next(n for n in MINORS if parses(n))
-    tree = ast.parse(SERVER.read_text(encoding="utf-8"))
-    if uses_pep604_annotations(tree):
+    text = path.read_text(encoding="utf-8")
+    syntax = next(n for n in MINORS if parses(path, n))
+    if uses_pep604_annotations(ast.parse(text)):
         syntax = max(syntax, 10)
     return syntax
+
+
+def runtime_floor() -> int:
+    """The floor of the package: the largest floor over every module."""
+    assert MODULES, "no modules found under src/sagemcp"
+    return max(file_floor(path) for path in MODULES)
 
 
 class TestPyproject(unittest.TestCase):
@@ -106,11 +126,13 @@ class TestPyproject(unittest.TestCase):
     def test_console_script(self):
         self.assertEqual(
             self.data["project"]["scripts"],
-            {"simple-sagemath-mcp": "server:main"})
+            {"simple-sagemath-mcp": "sagemcp.app:main"})
 
-    def test_single_module(self):
-        self.assertEqual(self.data["tool"]["setuptools"]["py-modules"],
-                         ["server"])
+    def test_package_layout(self):
+        tool = self.data["tool"]["setuptools"]
+        self.assertEqual(tool["package-dir"], {"": "src"})
+        self.assertEqual(tool["packages"]["find"]["where"], ["src"])
+        self.assertNotIn("py-modules", tool)
 
     def test_fastmcp_pin(self):
         deps = self.project["dependencies"]
@@ -126,7 +148,7 @@ class TestMain(unittest.TestCase):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             with self.assertRaises(SystemExit) as caught:
-                server.main(["--help"])
+                app.main(["--help"])
         self.assertEqual(caught.exception.code, 0)
         self.assertIn("--directory", out.getvalue())
 
@@ -134,10 +156,38 @@ class TestMain(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             old = os.getcwd()
             self.addCleanup(os.chdir, old)
-            with mock.patch.object(server.mcp, "run") as run:
-                server.main(["--directory", tmp])
+            with mock.patch.object(app.mcp, "run") as run:
+                app.main(["--directory", tmp])
             run.assert_called_once_with()
             self.assertEqual(Path(os.getcwd()).resolve(), Path(tmp).resolve())
+
+
+class TestShim(unittest.TestCase):
+    """The root server.py: a PEP 723 header, the src/ path insert, and main()."""
+
+    def test_help_runs(self):
+        # The only executable proof that the sys.path insert works.
+        proc = subprocess.run([sys.executable, str(SHIM), "--help"],
+                              capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--directory", proc.stdout)
+
+    def test_pep723_header(self):
+        # `uv run server.py` resolves the four dependencies from this block.
+        if tomllib is None:
+            self.skipTest("tomllib needs Python 3.11+")
+        text = SHIM.read_text(encoding="utf-8")
+        block = re.search(r"^# /// script$(.*?)^# ///$", text,
+                          re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(block, "server.py has no PEP 723 script block")
+        body = block.group(1)
+        declared = read_pyproject()["project"]["requires-python"]
+        self.assertIn(f'# requires-python = "{declared}"', body)
+        deps = re.search(r"^# dependencies = \[(.*)\]$", body, re.MULTILINE)
+        self.assertIsNotNone(deps, "the PEP 723 block has no dependencies line")
+        names = re.findall(r'"([^"]+)"', deps.group(1))
+        self.assertEqual(sorted(names), ["fastmcp", "ipykernel",
+                                         "jupyter_client", "nbformat"])
 
 
 class TestSiblingSageFallback(unittest.TestCase):
@@ -185,7 +235,16 @@ class TestSyntaxFloor(unittest.TestCase):
         self.assertRegex(declared, r"^>=\d+\.\d+$")
         minor = int(declared.split(">=")[1].split(".")[1])
         self.assertEqual(minor, runtime_floor())
-        self.assertTrue(parses(minor))
+        for path in MODULES:
+            with self.subTest(module=path.name):
+                self.assertTrue(parses(path, minor))
+
+    def test_floor_is_not_vacuous(self):
+        # An annotation-free corpus cannot satisfy the floor by accident: at
+        # least one module must evaluate a PEP 604 union at def time.
+        self.assertTrue(annotated_modules(),
+                        "no module under src/sagemcp has a PEP 604 union in an "
+                        "evaluated annotation, so the 3.10 floor is untested")
 
 
 if __name__ == "__main__":

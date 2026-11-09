@@ -24,12 +24,12 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Topic :: Scientific/Engineering :: Mathematics",
 ]
-# Floor: 3.10. `ast.parse` accepts server.py as far back as 3.9, but the
-# module annotates with PEP 604 unions (`str | None`) and has no
+# Floor: 3.10. `ast.parse` accepts the modules as far back as 3.9, but they
+# annotate with PEP 604 unions (`str | None`) and have no
 # `from __future__ import annotations`, so those annotations are evaluated at
 # import time and a 3.9 import raises TypeError. 3.10 is the real floor; it is
 # also the floor in the `# /// script` header of server.py. `test/test_packaging.py`
-# re-derives it from server.py so this value cannot drift.
+# re-derives it from `src/sagemcp/*.py` so this value cannot drift.
 requires-python = ">=3.10"
 # fastmcp is pinned to <5: the strict `output_schema` validation that the error
 # envelope relies on may change in a major release.
@@ -46,10 +46,14 @@ Repository = "https://github.com/JGCoelho/simple-sagemath-mcp"
 Issues = "https://github.com/JGCoelho/simple-sagemath-mcp/issues"
 
 [project.scripts]
-simple-sagemath-mcp = "server:main"
+simple-sagemath-mcp = "sagemcp.app:main"
 
-# The server ships as the one file it is: no package directory, no shim, no
-# copy that can drift. Nothing else is included, so test/, images/,
-# .workflow/, and __pycache__ cannot leak into the wheel.
+# The code ships as the `sagemcp` package under `src/`; the root `server.py` is
+# the checkout entry point and is not installed. Nothing else is included, so
+# test/, images/, .workflow/, and __pycache__ cannot leak into the wheel.
 [tool.setuptools]
-py-modules = ["server"]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["sagemcp*"]

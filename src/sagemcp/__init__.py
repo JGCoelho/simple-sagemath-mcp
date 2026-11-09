@@ -12,3 +12,8 @@ connection.
 This is not a sandbox: the kernel runs the code that the agent sends, with the
 user's permissions.
 """
+
+from . import app                # noqa: F401  (mcp exists before tools register)
+from . import tools_exec         # noqa: F401  (exec)
+from . import tools_notebook     # noqa: F401  (nb_run, nb_write, nb_read, nb_edit)
+from . import tools_kernel       # noqa: F401  (interrupt, restart)

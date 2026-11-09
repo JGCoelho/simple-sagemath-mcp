@@ -1,9 +1,8 @@
 """Kernel and notebook constants for the server.
 
-Read these through the module (`constants.MAX_INLINE_CHARS`), never
-`from .constants import MAX_INLINE_CHARS`: the tests patch them here, and a
-snapshot import would make such a patch vacuous. The one exception is
-`re`, which the module needs at import time.
+Read these through the module (`constants.MAX_INLINE_CHARS`); never bind them
+with a from-import, or the tests' patches stop reaching the call sites. The one
+exception is `re`, which the module needs at import time.
 """
 
 import re
