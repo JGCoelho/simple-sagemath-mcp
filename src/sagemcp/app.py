@@ -24,7 +24,8 @@ from .kernel import _stop_kernel
 @lifespan
 async def sage_lifespan(server):
     """Hold the one kernel. Nothing starts at connect; shutdown stops it."""
-    state = {"km": None, "kc": None, "busy": False}
+    # active: the job holding the kernel, or None. jobs: id -> Job, oldest first.
+    state = {"km": None, "kc": None, "busy": False, "active": None, "jobs": {}}
     try:
         yield state
     finally:

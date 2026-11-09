@@ -12,6 +12,7 @@ import concurrent.futures
 import contextlib
 import dataclasses
 import threading
+import time
 from pathlib import Path
 
 from fastmcp import Client
@@ -58,6 +59,28 @@ def call_async(name: str, **args) -> concurrent.futures.Future:
 def call(name: str, **args):
     """Call a tool, wait for it, and return the dict of the tool."""
     return unwrap(call_async(name, **args).result(300))
+
+
+def call_raw(name: str, **args) -> dict:
+    """Call a tool and return the payload exactly as the server sent it.
+
+    `unwrap` goes through the client's generated type, which fills every absent
+    optional field with None. This returns the wire dict, so a test can check
+    which keys the server actually sent.
+    """
+    return call_async(name, **args).result(300).structured_content
+
+
+def wait_job(job_id: str, limit: float = 120.0) -> dict:
+    """Poll `job_status` until the job is no longer running; return that reply."""
+    deadline = time.monotonic() + limit
+    while True:
+        reply = call("job_status", job_id=job_id)
+        if reply.get("status") != "running":
+            return reply
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"job {job_id} still running after {limit:g} s")
+        time.sleep(0.2)
 
 
 @atexit.register

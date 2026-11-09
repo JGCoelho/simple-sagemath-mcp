@@ -27,6 +27,18 @@ class KernelDied(Exception):
     """The kernel died, so the namespace is gone."""
 
 
+class KernelBusy(Exception):
+    """Another call holds the kernel, so this one is refused, not queued.
+
+    `job_id` names the running job, or is None when the holder is not a job
+    (a notebook run or a restart).
+    """
+
+    def __init__(self, job_id: str | None):
+        super().__init__("the kernel is busy with another call")
+        self.job_id = job_id
+
+
 class GapCrashLoop(Exception):
     """GAP crashed `GAP_CRASH_LIMIT` times in one call; the call was interrupted."""
 

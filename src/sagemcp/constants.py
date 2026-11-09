@@ -14,13 +14,14 @@ import re
 # environment. SAGE_BIN is the one exception, because a host that hides PATH
 # must still be able to name the Sage install.
 
-KERNEL_READ_TIMEOUT = 2400.0     # default per-call budget for exec and cell runs
+KERNEL_READ_TIMEOUT = 2400.0     # default wait for exec/run_file; budget for notebook cells
 HEARTBEAT_INTERVAL = 15.0        # progress report interval while a call runs
 SHELL_DRAIN_TIMEOUT = 30.0       # wait for the shell reply after idle
 KERNEL_READY_TIMEOUT = 60.0      # wait_for_ready on a new kernel
 SHUTDOWN_TIMEOUT = 30.0          # restart: wait this long for an in-flight call
 MAX_INLINE_CHARS = 20000         # inline budget per call
 GAP_CRASH_LIMIT = 3              # stderr matches of "Gap crashed" before abort
+JOB_RETENTION = 20               # finished job records kept for job_status; the running job is never dropped
 NOTEBOOK_NBFORMAT = 4
 NOTEBOOK_MINOR = 5
 KERNEL_META = {

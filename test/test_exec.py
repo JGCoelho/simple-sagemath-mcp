@@ -213,13 +213,22 @@ class TestExec(unittest.TestCase):
     def test_timeout_then_interrupt(self):
         self.assertIsNone(_mcp.call("exec", code="timeout_kept = 5")["error"])
         r = _mcp.call("exec", code="while True: pass", timeout=1)
-        self.assertEqual(r["error"]["code"], "timeout")
+        # The wait expired, not the job: it is still running and can be polled.
+        self.assertIsNone(r["error"])
+        self.assertEqual(r["status"], "running")
+        self.assertTrue(r["job_id"])
+        self.assertGreater(r["elapsed"], 0)
         self.assertFalse(r["truncated"])
+        self.assertEqual(_mcp.call("job_status", job_id=r["job_id"])["status"],
+                         "running")
         i = _mcp.call("interrupt")
         self.assertIsNone(i["error"])
         self.assertTrue(i["interrupted"])
-        time.sleep(0.5)                      # the kernel needs to become idle
-        # The namespace survived the timeout.
+        done = _mcp.wait_job(r["job_id"])
+        self.assertEqual(done["status"], "error")
+        self.assertEqual(done["error"]["code"], "cell_execution_failed")
+        self.assertIn("KeyboardInterrupt", done["error"]["details"])
+        # The namespace survived the interrupt.
         self.assertEqual(_mcp.call("exec", code="timeout_kept * 2")["result"], "10")
 
     def test_timeout_zero_rejected(self):
@@ -243,13 +252,19 @@ class TestExecSchema(unittest.TestCase):
         self.assertFalse(schema["additionalProperties"])
         self.assertEqual(set(schema["required"]),
                          {"result", "stdout", "stderr", "truncated", "error"})
-        self.assertEqual(set(schema["properties"]), set(schema["required"]))
+        # The job fields are declared but optional: only a running call has them.
+        self.assertEqual(set(schema["properties"]) - set(schema["required"]),
+                         {"status", "job_id", "elapsed"})
         self.assertIn("error", schema["required"])
-        self.assertIn("cell_execution_failed",
-                      schema["properties"]["error"]["properties"]["code"]["enum"])
+        codes = schema["properties"]["error"]["properties"]["code"]["enum"]
+        self.assertIn("cell_execution_failed", codes)
+        self.assertIn("kernel_busy", codes)
+        self.assertNotIn("timeout", codes)
 
     def test_return_keys(self):
-        r = _mcp.call("exec", code="1")
+        # A call that finishes in time has the five base keys on the wire, and
+        # no job fields.
+        r = _mcp.call_raw("exec", code="1")
         self.assertEqual(set(r),
                          {"result", "stdout", "stderr", "truncated", "error"})
 

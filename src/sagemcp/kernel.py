@@ -17,8 +17,9 @@ from jupyter_client.kernelspec import KernelSpec
 from jupyter_client.blocking import BlockingKernelClient
 
 from . import constants
-from .errors import (ExecTimeout, GapCrashLoop, KernelDied, SageNotFound,
-                     SourceError)
+from .errors import (ExecTimeout, GapCrashLoop, KernelBusy, KernelDied,
+                     SageNotFound, SourceError)
+from .jobs import Job, new_job, remember, trim
 from .sageresolve import _kernel_env, resolve_kernel_python
 from .shaping import _summarise
 from .source import _prepare, _wrapper
@@ -36,6 +37,11 @@ _kernel_lock = asyncio.Lock()
 # between its load and its write (that was a silent lost update). Lock
 # order is always notebook lock, then kernel lock; nothing takes them the
 # other way, so the two cannot deadlock.
+#
+# A job (exec, run_file) takes only the kernel lock, not this one: it never
+# reads or writes a notebook file, so there is nothing for this lock to order.
+# The notebook tools check for a running job before they take either lock, so
+# a notebook write cannot start while a job holds the kernel either.
 _nb_lock = asyncio.Lock()
 
 
@@ -138,6 +144,11 @@ async def _restart(state: dict) -> None:
     so a restart that cannot start one fails now, not on the next call. Never
     starts a second kernel and never touches the namespace directly.
     """
+    # A restart ends the running job. Mark it before the interrupt, so the job
+    # reports `interrupted` whatever its computation returns on the way out.
+    job = state.get("active")
+    if job is not None and job.status == "running":
+        job.status = "interrupted"
     km = state["km"]
     if km is not None and km.is_alive():
         try:
@@ -199,7 +210,8 @@ async def _locked(ctx: Context, fn: Callable[..., Any], *args) -> Any:
 
     Reports progress every HEARTBEAT_INTERVAL so a long computation keeps the
     connection alive. Returns fn's value or re-raises its exception. Never calls
-    fn outside the lock and never starts a kernel itself.
+    fn outside the lock and never starts a kernel itself. Used by the notebook
+    run only; exec and run_file go through `_start_job`.
     """
     async with _kernel_lock:
         task = asyncio.ensure_future(asyncio.to_thread(fn, *args))
@@ -217,6 +229,113 @@ async def _locked(ctx: Context, fn: Callable[..., Any], *args) -> Any:
             if not task.done():
                 task.cancel()
                 task.add_done_callback(_consume)
+
+
+# --- jobs --------------------------------------------------------------------
+
+# A job is one asyncio task that owns `_kernel_lock` for its whole run: the lock
+# outlives the request that started it, so a call that outlasts its wait keeps
+# the kernel. A job runs `work(outputs)` in a thread and records the envelope
+# `failure(exc, outputs)` maps an exception to. Jobs never queue: `_claim` is
+# checked synchronously before a job is created, so a second call is refused
+# with `KernelBusy` while the first holds the kernel.
+
+
+def _claim(state: dict) -> None:
+    """Raise `KernelBusy` unless no job or other holder has the kernel.
+
+    Synchronous, and the caller starts its work with no `await` in between, so
+    the check and the start cannot interleave with another call.
+    """
+    active = state.get("active")
+    if active is not None:
+        raise KernelBusy(active.job_id)
+    if _kernel_lock.locked():
+        raise KernelBusy(None)
+
+
+def _start_job(state: dict, work: Callable[[list], dict],
+               failure: Callable[[BaseException, list], dict]) -> Job:
+    """Start `work` as a job and return its record at once. Never waits.
+
+    Raises `KernelBusy` when another call holds the kernel. The job record is
+    registered before the task starts, so a call made right after sees it.
+    """
+    _claim(state)
+    job = new_job()
+    state["active"] = job
+    remember(state, job)
+    job.task = asyncio.ensure_future(_run_job(state, job, work, failure))
+    return job
+
+
+def _execute(work: Callable[[list], dict],
+             failure: Callable[[BaseException, list], dict],
+             outs: list) -> dict:
+    """Run `work` on the job's outputs in a thread; map a failure to its envelope."""
+    try:
+        return work(outs)
+    except Exception as e:
+        return failure(e, outs)
+
+
+async def _run_job(state: dict, job: Job,
+                   work: Callable[[list], dict],
+                   failure: Callable[[BaseException, list], dict]) -> None:
+    """The job's task: hold the kernel lock, run the work, record the envelope.
+
+    A restart that reaches the job first (`_restart` sets `interrupted`) means the
+    work never starts or its result is discarded; either way the record ends as a
+    `kernel_died` envelope. The record is final before the lock is released, so
+    a restart that waits for the lock sees it finished.
+    """
+    try:
+        async with _kernel_lock:
+            try:
+                value = None
+                if job.status == "running":
+                    value = await asyncio.to_thread(_execute, work, failure,
+                                                    job.outputs)
+                if job.status == "interrupted":
+                    value = failure(KernelDied("the kernel was restarted"),
+                                    job.outputs)
+                else:
+                    job.status = "error" if value["error"] else "done"
+                job.result = value
+            finally:
+                if job.result is None:      # cancelled before it could settle
+                    job.status = "error"
+                    job.result = failure(KernelDied("the job was cancelled"),
+                                         job.outputs)
+                if state.get("active") is job:
+                    state["active"] = None
+    finally:
+        job.finished = time.monotonic()
+        trim(state)
+
+
+async def _wait_job(ctx: Context, job: Job, timeout: float) -> bool:
+    """Wait up to `timeout` seconds for `job`; True once it has finished.
+
+    Reports progress every HEARTBEAT_INTERVAL while it waits. Never cancels the
+    job: on False the job keeps the kernel, and the caller polls `job_status`.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        if job.task.done():
+            return True
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return False
+        await asyncio.wait({job.task},
+                           timeout=min(remaining, constants.HEARTBEAT_INTERVAL))
+        if not job.task.done():
+            try:
+                await ctx.report_progress(progress=0, total=None,
+                                          message="Sage kernel still running...")
+            except Exception:
+                pass
 
 
 # --- execution ---------------------------------------------------------------
@@ -280,7 +399,8 @@ def _died(state: dict, message: str) -> None:
 
 def _run_source(state: dict, source: str, filename: str, *,
                 prepared: str | None = None,
-                timeout: float | None = None) -> list[dict]:
+                timeout: float | None = None,
+                outs: list[dict] | None = None) -> list[dict]:
     """Run one source in the shared namespace and return its outputs in order.
 
     The single execution path. Marks the state busy for the whole read loop,
@@ -289,6 +409,9 @@ def _run_source(state: dict, source: str, filename: str, *,
     Raises `SourceError`, `ExecTimeout`, `KernelDied`, or `GapCrashLoop`; on a
     timeout the kernel keeps computing (busy stays set so `interrupt` works).
     A dead kernel is stopped and forgotten before `KernelDied` is raised.
+    `outs`, when given, is the list the outputs are appended to as they arrive,
+    so a job can read them while it runs. `timeout=math.inf` means no budget:
+    the read loop runs until the kernel is idle, which is what a job needs.
     Assumes the lock is held; starts no kernel.
     """
     if prepared is None:
@@ -298,7 +421,7 @@ def _run_source(state: dict, source: str, filename: str, *,
     if km is None or kc is None or not km.is_alive():
         _died(state, "the kernel is not running")
     deadline = time.monotonic() + budget
-    outs: list[dict] = []
+    outs = [] if outs is None else outs
     gap_crashes = 0
     timed_out = False
     state["busy"] = True

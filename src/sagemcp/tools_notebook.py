@@ -18,9 +18,10 @@ from . import constants
 from .app import mcp
 from .envelope import (OUTPUT_SCHEMA_NB_EDIT, OUTPUT_SCHEMA_NB_READ,
                        OUTPUT_SCHEMA_NB_RUN, OUTPUT_SCHEMA_NB_WRITE, _err,
-                       _nb_edit_out, _nb_read_out, _nb_run_out, _nb_write_out)
-from .errors import KernelDied, NotebookError, SageNotFound, SourceError
-from .kernel import _locked, _nb_lock
+                       _kernel_busy_err, _nb_edit_out, _nb_read_out,
+                       _nb_run_out, _nb_write_out)
+from .errors import KernelBusy, KernelDied, NotebookError, SageNotFound, SourceError
+from .kernel import _claim, _locked, _nb_lock
 from .notebook_io import (_apply_ops, _fresh_id, _load_nb, _new_cell,
                           _nb_read_cells, _prefix_validation_error, _save_nb,
                           _validate_cells)
@@ -54,10 +55,15 @@ async def sage_nb_run(
     with `nb_read`.
     Plots: end the cell with `P.save('p.png')` (relative to the kernel cwd) + `display(Image(filename='p.png'))`; a bare `Graphics` reprs as a PGF/LaTeX blob, not an image.
     Errors: invalid_source, cell_execution_failed, kernel_died, sage_not_found,
-    not_found, invalid_notebook, unsupported_magic, write_failed, internal.
+    not_found, invalid_notebook, unsupported_magic, write_failed, internal,
+    kernel_busy.
     """
     state = ctx.lifespan_context
     async with _nb_lock:
+        try:
+            _claim(state)
+        except KernelBusy as e:
+            return _nb_run_out(error=_kernel_busy_err(e.job_id))
         try:
             nb, _, _ = _load_nb(path)
             _validate_cells(nb)
@@ -126,10 +132,11 @@ async def sage_nb_write(
     an existing file returns `exists` and is left byte-identical; with
     `overwrite:true` the cells are rewritten and get fresh ids.
     Errors: invalid_source, exists, invalid_notebook, unsupported_magic,
-    write_failed, internal.
+    write_failed, internal, kernel_busy.
     """
     async with _nb_lock:
         try:
+            _claim(ctx.lifespan_context)
             if Path(path).exists() and not overwrite:
                 return _nb_write_out(error=_err(
                     "exists", "The notebook already exists; pass overwrite to "
@@ -168,6 +175,8 @@ async def sage_nb_write(
             _save_nb(nb, path)
             return _nb_write_out(cell_ids=[cell["id"] for cell in nb.cells],
                                  saved=True)
+        except KernelBusy as e:
+            return _nb_write_out(error=_kernel_busy_err(e.job_id))
         except NotebookError as e:
             return _nb_write_out(error=_err(e.code, e.message, e.details))
         except SageNotFound as e:
@@ -198,13 +207,16 @@ async def sage_nb_read(
     Output: code cells carry their full on-disk `outputs`; use this to recover
     the outputs that an `nb_run` inline view truncated. A host may truncate a
     very large result and name a file that holds the full text.
-    Errors: not_found, invalid_notebook, unknown_cell_id, internal.
+    Errors: not_found, invalid_notebook, unknown_cell_id, internal, kernel_busy.
     """
     try:
+        _claim(ctx.lifespan_context)
         nb, disk_format, disk_minor = _load_nb(path)
         return _nb_read_out(nbformat=disk_format,
                             nbformat_minor=disk_minor,
                             cells=_nb_read_cells(nb, cell_ids))
+    except KernelBusy as e:
+        return _nb_read_out(error=_kernel_busy_err(e.job_id))
     except NotebookError as e:
         return _nb_read_out(error=_err(e.code, e.message, e.details))
     except Exception as e:
@@ -239,10 +251,11 @@ async def sage_nb_edit(
     error's `details` starts with `op <zero-based index> (<op>):` for an op that
     failed.
     Errors: invalid_source, not_found, invalid_notebook, unsupported_magic,
-    unknown_cell_id, invalid_op, write_failed, internal.
+    unknown_cell_id, invalid_op, write_failed, internal, kernel_busy.
     """
     async with _nb_lock:
         try:
+            _claim(ctx.lifespan_context)
             nb, _, _ = _load_nb(path)
             applied = _apply_ops(nb, ops)
             try:
@@ -258,6 +271,8 @@ async def sage_nb_edit(
                 raise _prefix_validation_error(e, applied) from None
             _save_nb(nb, path)
             return _nb_edit_out(applied=applied, saved=True)
+        except KernelBusy as e:
+            return _nb_edit_out(error=_kernel_busy_err(e.job_id))
         except NotebookError as e:
             return _nb_edit_out(error=_err(e.code, e.message, e.details))
         except SageNotFound as e:
