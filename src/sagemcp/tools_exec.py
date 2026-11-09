@@ -225,8 +225,8 @@ async def sage_job_status(
     and stderr are the output so far. Once finished, `result`, stdout, stderr,
     truncated and error are the final values, exactly as exec returns them.
     Never: it does not cancel the job; `interrupt` or `restart` do that.
-    Records of the most recent finished jobs are kept in memory and a server
-    restart drops them; an id that is unknown or dropped returns `unknown_job`.
+    The running job and the most recent finished job are kept in memory, and a
+    server restart drops them; any other id returns `unknown_job`.
     Errors: invalid_source, cell_execution_failed, gap_crash_loop, kernel_died,
     sage_not_found, internal, unknown_job.
     """

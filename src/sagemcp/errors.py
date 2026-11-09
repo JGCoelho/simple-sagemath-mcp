@@ -20,7 +20,6 @@ class ExecTimeout(Exception):
 
     def __init__(self, seconds: float):
         super().__init__(f"the call exceeded {seconds:g} s")
-        self.seconds = seconds
 
 
 class KernelDied(Exception):

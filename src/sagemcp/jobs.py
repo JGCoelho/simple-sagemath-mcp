@@ -7,13 +7,13 @@ they arrive, and the final envelope. It takes no lock and touches no kernel.
 The registry lives in the lifespan state: `state["jobs"]` maps job id to `Job`
 (insertion order, oldest first) and `state["active"]` is the job that holds the
 kernel, or None. Records are kept in memory only; a server restart drops them.
+
+Retention: the running job and the latest finished job; an older id is unknown.
 """
 
 import time
 import uuid
 from dataclasses import dataclass, field
-
-from . import constants
 
 
 # --- job records -------------------------------------------------------------
@@ -48,22 +48,19 @@ def new_job() -> Job:
 
 
 def remember(state: dict, job: Job) -> None:
-    """Register a job, then drop the oldest finished records over the bound."""
+    """Register a job. Its record stays until a later job finishes."""
     state["jobs"][job.job_id] = job
-    trim(state)
 
 
-def trim(state: dict) -> None:
-    """Drop the oldest finished records until the bound holds.
+def retire(state: dict, job: Job) -> None:
+    """Drop every finished record but `job`, which has just finished.
 
-    The running job has no `finished` time and is never dropped, so the bound
-    can be exceeded by one while a job runs. Never raises.
+    Called as a job ends, so only this record and the running job, if any, are
+    kept. Never raises.
     """
     jobs = state["jobs"]
-    for job_id in list(jobs):
-        if len(jobs) <= constants.JOB_RETENTION:
-            break
-        if jobs[job_id].finished is not None:
+    for job_id, other in list(jobs.items()):
+        if other is not job and other.finished is not None:
             del jobs[job_id]
 
 

@@ -21,5 +21,4 @@ KERNEL_READY_TIMEOUT = 60.0      # wait_for_ready on a new kernel
 SHUTDOWN_TIMEOUT = 30.0          # restart: wait this long for an in-flight call
 MAX_INLINE_CHARS = 20000         # inline budget per call
 GAP_CRASH_LIMIT = 3              # stderr matches of "Gap crashed" before abort
-JOB_RETENTION = 20               # finished job records kept for job_status; the running job is never dropped
 GAP_CRASH_PATTERN = re.compile(r"Gap crashed|Restarting Gap", re.IGNORECASE)

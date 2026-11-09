@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # Run from the repo root, with the python of your Sage: python test/test_jobs.py -v
 # A job is an exec (or run_file) call that outlives its wait. These tests cover
-# the running envelope, job_status, kernel_busy, unknown_job, and an interrupt or
-# a restart that reaches a running job. TestJobRetention needs no kernel.
+# the running envelope, job_status, kernel_busy, unknown_job, the retention rule
+# (the running job and the latest finished one), and an interrupt or a restart
+# that reaches a running job. TestJobRetention needs no kernel.
 
 import sys
 import time
@@ -14,42 +15,48 @@ sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE.parent / "src"))
 import _mcp
-from sagemcp import constants, jobs
+from sagemcp import jobs
 
 
 class TestJobRetention(unittest.TestCase):
-    """The bound on finished job records. No kernel, no server."""
+    """The retention rule: the running job and the latest finished job. No kernel."""
 
     def setUp(self):
         self.state = {"active": None, "jobs": {}}
 
-    def finish_one(self) -> str:
-        """Register a job the way `_start_job` does, then finish it the way `_run_job` does."""
+    def start(self):
+        """Register a running job the way `_start_job` does."""
         job = jobs.new_job()
         jobs.remember(self.state, job)
+        return job
+
+    def finish(self, job) -> None:
+        """Finish a job the way `_run_job` does: stamp it, then retire the others."""
         job.status = "done"
-        job.result = {"result": "", "stdout": "", "stderr": "",
-                      "truncated": False, "error": None}
         job.finished = time.monotonic()
-        jobs.trim(self.state)
-        return job.job_id
+        jobs.retire(self.state, job)
 
-    def test_bound_drops_the_oldest_finished_records(self):
-        ids = [self.finish_one() for _ in range(constants.JOB_RETENTION + 5)]
-        self.assertEqual(len(self.state["jobs"]), constants.JOB_RETENTION)
-        for dropped in ids[:5]:
+    def test_only_the_latest_finished_job_is_kept(self):
+        ids = []
+        for _ in range(3):
+            job = self.start()
+            self.finish(job)
+            ids.append(job.job_id)
+        self.assertEqual(list(self.state["jobs"]), ids[-1:])
+        for dropped in ids[:-1]:
             self.assertIsNone(jobs.find(self.state, dropped))
-        for kept in ids[5:]:
-            self.assertIsNotNone(jobs.find(self.state, kept))
 
-    def test_running_job_is_never_dropped(self):
-        for _ in range(constants.JOB_RETENTION):
-            self.finish_one()
-        running = jobs.new_job()
-        jobs.remember(self.state, running)        # over the bound by one, for now
+    def test_running_job_keeps_the_latest_finished_one(self):
+        done = self.start()
+        self.finish(done)
+        running = self.start()
+        self.assertIs(jobs.find(self.state, done.job_id), done)
         self.assertIs(jobs.find(self.state, running.job_id), running)
-        self.assertLessEqual(len(self.state["jobs"]), constants.JOB_RETENTION)
         self.assertEqual(running.status, "running")
+        # When the running job ends, the earlier record goes.
+        self.finish(running)
+        self.assertIsNone(jobs.find(self.state, done.job_id))
+        self.assertIs(jobs.find(self.state, running.job_id), running)
 
     def test_unknown_id_is_none(self):
         self.assertIsNone(jobs.find(self.state, "never-issued"))
@@ -107,6 +114,30 @@ class TestJobs(unittest.TestCase):
         finally:
             if job_id:
                 _mcp.settle(job_id)
+
+    def test_only_the_latest_finished_job_is_kept(self):
+        first_id = second_id = None
+        finished = False
+        try:
+            first = _mcp.call("exec", code="import time\ntime.sleep(1)\n1", timeout=0.1)
+            first_id = first.get("job_id")
+            self.assertEqual(first["status"], "running")
+            self.assertEqual(_mcp.wait_job(first_id)["status"], "done")
+            second = _mcp.call("exec", code="import time\ntime.sleep(1)\n2", timeout=0.1)
+            second_id = second.get("job_id")
+            self.assertEqual(second["status"], "running")
+            # While the second job runs, the first is still the latest finished one.
+            self.assertEqual(_mcp.call("job_status", job_id=first_id)["status"], "done")
+            self.assertEqual(_mcp.wait_job(second_id)["result"], "2")
+            # The second job's end drops the first record.
+            older = _mcp.call_raw("job_status", job_id=first_id)
+            self.assertEqual(older["error"]["code"], "unknown_job")
+            finished = True
+        finally:
+            if not finished:
+                for job_id in (first_id, second_id):
+                    if job_id:
+                        _mcp.settle(job_id)
 
     def test_unknown_job(self):
         r = _mcp.call("job_status", job_id="does-not-exist")

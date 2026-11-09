@@ -16,9 +16,8 @@ from jupyter_client.kernelspec import KernelSpec
 from jupyter_client.blocking import BlockingKernelClient
 
 from . import constants
-from .errors import (ExecTimeout, GapCrashLoop, KernelBusy, KernelDied,
-                     SageNotFound, SourceError)
-from .jobs import Job, new_job, remember, trim
+from .errors import ExecTimeout, GapCrashLoop, KernelBusy, KernelDied, SageNotFound
+from .jobs import Job, new_job, remember, retire
 from .sageresolve import _kernel_env, resolve_kernel_python
 from .shaping import _summarise
 from .source import _prepare, _wrapper
@@ -267,7 +266,7 @@ async def _run_job(state: dict, job: Job,
                     state["active"] = None
     finally:
         job.finished = time.monotonic()
-        trim(state)
+        retire(state, job)
 
 
 async def _wait_job(ctx: Context, job: Job, timeout: float) -> bool:

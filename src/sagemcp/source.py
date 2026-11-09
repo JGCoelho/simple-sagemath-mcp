@@ -50,7 +50,6 @@ def _wrapper(prepared: str, filename: str) -> str:
 if "__mcp_ns__" not in globals():
     _mcp_seed = {{"__name__": "__main__"}}
     exec("from sage.all import *", _mcp_seed)
-    exec("from IPython.display import Image", _mcp_seed)
     globals()["__mcp_ns__"] = _mcp_seed
 _mcp_ns = globals()["__mcp_ns__"]
 import ast as _mcp_ast
