@@ -90,14 +90,14 @@ class TestBuildersMatchSchemas(unittest.TestCase):
 class TestErrorCodes(unittest.TestCase):
 
     def test_code_enums(self):
-        self.assertEqual(codes(EXEC), ["invalid_source", "cell_execution_failed",
+        self.assertEqual(codes(EXEC), ["invalid_source", "execution_failed",
                                        "gap_crash_loop", "kernel_died",
                                        "sage_not_found", "internal", "kernel_busy"])
         self.assertEqual(codes(RUN_FILE), ["invalid_source", "file_not_found",
-                                           "cell_execution_failed", "gap_crash_loop",
+                                           "execution_failed", "gap_crash_loop",
                                            "kernel_died", "sage_not_found", "internal",
                                            "kernel_busy"])
-        self.assertEqual(codes(JOB_STATUS), ["invalid_source", "cell_execution_failed",
+        self.assertEqual(codes(JOB_STATUS), ["invalid_source", "execution_failed",
                                              "gap_crash_loop", "kernel_died",
                                              "sage_not_found", "internal", "unknown_job"])
         self.assertEqual(codes(INTERRUPT), ["internal"])

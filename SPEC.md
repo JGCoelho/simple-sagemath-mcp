@@ -279,7 +279,7 @@ itself has no budget.
 
 ## 10. Concurrency
 
-Two `asyncio.Lock`s, and a strict order between them.
+One `asyncio.Lock`. It is held for a whole job, not just for one call.
 
 **`_kernel_lock`** serializes *computations*. An `exec` or `run_file` job holds it
 from `_run_job` until the job ends, which can be after the call that started it has
@@ -341,7 +341,7 @@ timeouts. Fixing it properly needs a supervisor task that outlives the call.
 | kernel cannot start | `wait_for_ready` / start exception | `kernel_died` ("did not start") | kernel stopped and forgotten |
 | kernel cannot import Sage | seed outputs contain an `error` | `sage_not_found` with the last traceback line | kernel stopped |
 | no `sage` at all | `resolve_kernel_python` | `sage_not_found` | unchanged |
-| code raises | `error` output | `cell_execution_failed` | namespace mutated as Python left it |
+| code raises | `error` output | `execution_failed` | namespace mutated as Python left it |
 | code is invalid Sage/Python | `_prepare` | `invalid_source` | kernel untouched |
 | a call outlives its wait | `timeout` expires | `status: running` with `job_id` | the job keeps the kernel; poll `job_status`, or `interrupt` or `restart` |
 | a call while a job holds the kernel | `_claim` | `kernel_busy`, `details` names the job | refused, not queued; the job runs on |
@@ -385,7 +385,7 @@ fails at development time instead of surprising a client.
 |------|---------|
 | `invalid_source` | preparse, parse, or compile failed; for `run_file`, also a suffix other than `.py` or `.sage`, or bytes that are not UTF-8 (`exec`, `run_file`, `job_status`) |
 | `file_not_found` | the `run_file` path is not a file (`run_file`) |
-| `cell_execution_failed` | the code raised, including `KeyboardInterrupt` and a GAP abort (`exec`, `run_file`, `job_status`) |
+| `execution_failed` | the code raised, including `KeyboardInterrupt` and a GAP abort (`exec`, `run_file`, `job_status`) |
 | `gap_crash_loop` | GAP crashed three times in one call; the call was interrupted (`exec`, `run_file`, `job_status`) |
 | `kernel_busy` | another job or a restart holds the kernel; the call is refused, not queued, and `details` names the job (`exec`, `run_file`) |
 | `unknown_job` | no job has this id: it never existed, its record was dropped, or the server restarted (`job_status`) |
@@ -438,7 +438,7 @@ the running job and the latest finished job have records.
 ### `interrupt()`
 Sends the interrupt request. `interrupted` is true when a computation may be running and the request
 was sent, otherwise it is a no-op returning false. The namespace survives; the interrupted job ends
-with `cell_execution_failed` and `KeyboardInterrupt` in `details`. While a call's wait has expired the
+with `execution_failed` and `KeyboardInterrupt` in `details`. While a call's wait has expired the
 flag is approximate: it stays true until the job ends, so a repeated interrupt is harmless.
 
 ### `restart()`
@@ -544,7 +544,11 @@ Kernel-free where possible: anything that needs an interpreter is mocked. Every 
 Name-only index; the values live in `src/sagemcp/constants.py` next to the
 comment that explains them.
 
-- `KERNEL_READ_TIMEOUT`
-- `MAX_INLINE_CHARS`
 - `GAP_CRASH_LIMIT`
+- `GAP_CRASH_PATTERN`
+- `HEARTBEAT_INTERVAL`
+- `KERNEL_READ_TIMEOUT`
+- `KERNEL_READY_TIMEOUT`
+- `MAX_INLINE_CHARS`
+- `SHELL_DRAIN_TIMEOUT`
 - `SHUTDOWN_TIMEOUT`

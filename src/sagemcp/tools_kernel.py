@@ -21,7 +21,7 @@ async def sage_interrupt(ctx: Context) -> dict:
 
     State: the namespace is untouched, so variables defined before the
     interrupted call are still available; the interrupted call returns
-    `cell_execution_failed` with `KeyboardInterrupt` in `details`.
+    `execution_failed` with `KeyboardInterrupt` in `details`.
     Never: it does not restart the kernel, wipe variables, or wait for the call
     to finish. `interrupted` is true only if the kernel is alive and a call is
     running; on an idle kernel this is a no-op returning false.

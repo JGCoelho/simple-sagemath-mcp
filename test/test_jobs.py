@@ -156,7 +156,7 @@ class TestJobs(unittest.TestCase):
             self.assertTrue(i["interrupted"])
             done = _mcp.wait_job(job_id)
             self.assertEqual(done["status"], "error")
-            self.assertEqual(done["error"]["code"], "cell_execution_failed")
+            self.assertEqual(done["error"]["code"], "execution_failed")
             self.assertIn("KeyboardInterrupt", done["error"]["details"])
             self.assertEqual(_mcp.call("exec", code="2 + 2")["result"], "4")
         finally:

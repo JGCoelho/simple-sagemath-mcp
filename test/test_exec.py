@@ -96,7 +96,7 @@ class TestExec(unittest.TestCase):
             # A failed assertion above must not leave the job holding the kernel.
             if busy is None:
                 _mcp.settle_call(fut)
-        self.assertEqual(busy["error"]["code"], "cell_execution_failed")
+        self.assertEqual(busy["error"]["code"], "execution_failed")
         self.assertIn("KeyboardInterrupt", busy["error"]["details"])
         # The interrupt keeps the namespace.
         self.assertEqual(_mcp.call("exec", code="survivor + 1")["result"], "42")
@@ -167,7 +167,7 @@ class TestExec(unittest.TestCase):
             if busy is None:
                 _mcp.settle_call(fut)
         self.assertIn(busy["error"]["code"],
-                      ("kernel_died", "cell_execution_failed"))
+                      ("kernel_died", "execution_failed"))
 
     def test_first_call_after_restart_is_interruptible(self):
         # The namespace is seeded when the kernel starts, so a runaway call made
@@ -188,7 +188,7 @@ class TestExec(unittest.TestCase):
             if busy is None:
                 _mcp.settle_call(fut)
         self.assertLess(time.monotonic() - started, constants.SHUTDOWN_TIMEOUT)
-        self.assertEqual(busy["error"]["code"], "cell_execution_failed")
+        self.assertEqual(busy["error"]["code"], "execution_failed")
         self.assertIn("KeyboardInterrupt", busy["error"]["details"])
 
     def test_restart_wipes(self):
@@ -197,12 +197,12 @@ class TestExec(unittest.TestCase):
         self.assertIsNone(r["error"])
         self.assertTrue(r["restarted"])
         after = _mcp.call("exec", code="wiped")
-        self.assertEqual(after["error"]["code"], "cell_execution_failed")
+        self.assertEqual(after["error"]["code"], "execution_failed")
         self.assertIn("NameError", after["error"]["details"])
 
     def test_runtime_error(self):
         r = _mcp.call("exec", code="1/0")
-        self.assertEqual(r["error"]["code"], "cell_execution_failed")
+        self.assertEqual(r["error"]["code"], "execution_failed")
         self.assertIn("ZeroDivisionError", r["error"]["details"])
         self.assertEqual(r["stdout"], "")
         self.assertEqual(r["stderr"], "")
@@ -242,7 +242,7 @@ class TestExec(unittest.TestCase):
             if done is None:
                 _mcp.settle(r["job_id"])
         self.assertEqual(done["status"], "error")
-        self.assertEqual(done["error"]["code"], "cell_execution_failed")
+        self.assertEqual(done["error"]["code"], "execution_failed")
         self.assertIn("KeyboardInterrupt", done["error"]["details"])
         # The namespace survived the interrupt.
         self.assertEqual(_mcp.call("exec", code="timeout_kept * 2")["result"], "10")
@@ -273,7 +273,7 @@ class TestExecSchema(unittest.TestCase):
                          {"status", "job_id", "elapsed"})
         self.assertIn("error", schema["required"])
         codes = schema["properties"]["error"]["properties"]["code"]["enum"]
-        self.assertIn("cell_execution_failed", codes)
+        self.assertIn("execution_failed", codes)
         self.assertIn("kernel_busy", codes)
         self.assertNotIn("timeout", codes)
 

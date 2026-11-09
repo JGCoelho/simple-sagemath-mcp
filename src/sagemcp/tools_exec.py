@@ -31,7 +31,7 @@ def _run_locked(state: dict, code: str, filename: str, outs: list, *,
                 full_traceback: bool) -> dict:
     """The job body, kernel lock held: ensure a kernel, run `code`, shape the envelope.
 
-    A user exception becomes `cell_execution_failed`. `full_traceback` picks its
+    A user exception becomes `execution_failed`. `full_traceback` picks its
     details: the `Ename: evalue` line (exec), or the cleaned traceback, which
     names the file (run_file). The other failures are raised for `_failure_out`.
     """
@@ -46,7 +46,7 @@ def _run_locked(state: dict, code: str, filename: str, outs: list, *,
     if full_traceback:
         detail = _traceback_text(outs, detail)
     return _exec_out(**view, error=_err(
-        "cell_execution_failed", "The source raised an exception.", detail))
+        "execution_failed", "The source raised an exception.", detail))
 
 
 def _traceback_text(outs: list[dict], fallback: str) -> str:
@@ -132,7 +132,7 @@ async def sage_exec(
     job holds the kernel, exec and run_file calls return `kernel_busy`.
     Plots: a Sage `Graphics` reprs as PGF/LaTeX, not an image; save with
     `P.save('p.png')`, which writes relative to the kernel's working directory.
-    Errors: invalid_source, cell_execution_failed, gap_crash_loop, kernel_died,
+    Errors: invalid_source, execution_failed, gap_crash_loop, kernel_died,
     sage_not_found, internal, kernel_busy.
     """
     work = functools.partial(_run_locked, ctx.lifespan_context, code,
@@ -194,11 +194,11 @@ async def sage_run_file(
     preparsed, as exec preparses its source. Only the exact suffixes .py and .sage
     are accepted.
     Output: as exec: `result`, `stdout` and `stderr`. An uncaught exception is
-    `cell_execution_failed`, and its `details` is the traceback, which names the file.
+    `execution_failed`, and its `details` is the traceback, which names the file.
     Jobs: the call runs as a job, with the same timeout, `running` and `job_status`
     behaviour as exec. While a job holds the kernel, exec and run_file calls
     return `kernel_busy`.
-    Errors: invalid_source, file_not_found, cell_execution_failed, gap_crash_loop,
+    Errors: invalid_source, file_not_found, execution_failed, gap_crash_loop,
     kernel_died, sage_not_found, internal, kernel_busy.
     """
     source, error = _read_run_file(path)
@@ -227,7 +227,7 @@ async def sage_job_status(
     Never: it does not cancel the job; `interrupt` or `restart` do that.
     The running job and the most recent finished job are kept in memory, and a
     server restart drops them; any other id returns `unknown_job`.
-    Errors: invalid_source, cell_execution_failed, gap_crash_loop, kernel_died,
+    Errors: invalid_source, execution_failed, gap_crash_loop, kernel_died,
     sage_not_found, internal, unknown_job.
     """
     try:

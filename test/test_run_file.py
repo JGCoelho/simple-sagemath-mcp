@@ -89,7 +89,7 @@ class TestRunFile(unittest.TestCase):
     def test_traceback_names_the_file(self):
         p = self.write("boom.py", "a = 1\n\n1/0\n")
         r = _mcp.call("run_file", path=p)
-        self.assertEqual(r["error"]["code"], "cell_execution_failed")
+        self.assertEqual(r["error"]["code"], "execution_failed")
         details = r["error"]["details"]
         self.assertIn(p, details)
         self.assertIn(f"{p}:3", details)     # IPython writes "File <path>:<line>"
@@ -125,7 +125,7 @@ class TestRunFile(unittest.TestCase):
             self.assertEqual(_mcp.wait_job(job_id)["status"], "done")
             # The refused file never ran.
             after = _mcp.call("exec", code="busy_never")
-            self.assertEqual(after["error"]["code"], "cell_execution_failed")
+            self.assertEqual(after["error"]["code"], "execution_failed")
         finally:
             if job_id:
                 _mcp.settle(job_id)

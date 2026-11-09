@@ -77,7 +77,7 @@ _ELAPSED = {
 
 # The codes a job can end with. exec and run_file return all of them; job_status
 # returns them for a finished job, and adds `unknown_job` for an id it does not know.
-_JOB_FAILURES = ["cell_execution_failed", "gap_crash_loop", "kernel_died",
+_JOB_FAILURES = ["execution_failed", "gap_crash_loop", "kernel_died",
                  "sage_not_found", "internal"]
 
 

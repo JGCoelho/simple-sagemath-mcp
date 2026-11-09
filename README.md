@@ -129,7 +129,7 @@ The server keeps the running job and the latest finished job. An older job id re
 and a server restart drops every record.
 
 `interrupt` stops the running computation and keeps the namespace; the job it stopped ends with
-`cell_execution_failed` and `KeyboardInterrupt`. `restart` ends a running job as `interrupted`, with
+`execution_failed` and `KeyboardInterrupt`. `restart` ends a running job as `interrupted`, with
 `kernel_died` as its error, and starts a new kernel with an empty namespace.
 
 `run_file` takes a path to a `.py` or `.sage` file, and a relative path is resolved against
