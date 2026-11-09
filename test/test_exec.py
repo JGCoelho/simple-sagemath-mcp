@@ -14,7 +14,7 @@ sys.path.insert(0, str(HERE.parent / "src"))
 import _mcp
 import server
 from sagemcp import constants
-from server import _exec_view, _summarise, _truncate
+from sagemcp.shaping import _exec_view, _summarise, _truncate
 
 MARKER_SLACK = 60          # room for "\n… [truncated N characters]"
 

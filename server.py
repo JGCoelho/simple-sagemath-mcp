@@ -38,7 +38,7 @@ from sagemcp.errors import (ExecTimeout, GapCrashLoop, KernelDied,
 from sagemcp.kernel import (_ensure_kernel, _interrupt, _locked, _nb_lock,
                             _restart, _restart_locked, _run_source,
                             _stop_kernel)
-from sagemcp.shaping import _summarise
+from sagemcp.shaping import _exec_view, _summarise, _truncate
 from sagemcp.source import _prepare
 
 import argparse
@@ -58,42 +58,6 @@ from pydantic import Field
 
 
 # --- output shaping ----------------------------------------------------------
-
-
-def _truncate(text: str, budget: int) -> tuple[str, bool]:
-    """Cut `text` to `budget` characters and mark the cut. Pure.
-
-    Returns `(text, cut)`; a cut text keeps the first `budget` characters and
-    appends a marker naming how many were dropped. The marker is not counted in
-    the budget. Never touches the source of the text (a file, a notebook).
-    """
-    if len(text) <= budget:
-        return text, False
-    if budget < 0:
-        budget = 0
-    cut = len(text) - budget
-    return text[:budget] + f"\n… [truncated {cut} characters]", True
-
-
-def _exec_view(outs: list[dict]) -> dict:
-    """Shape a call's outputs into `{result, stdout, stderr, truncated}`. Pure.
-
-    One MAX_INLINE_CHARS budget shared by `result`, then `stdout`, then
-    `stderr`, in that order; a later field is cut when the earlier ones already
-    used the budget. `truncated` is true iff anything was cut. The untruncated
-    text is not kept anywhere.
-    """
-    stdout, stderr, result, _ = _summarise(outs)
-    result = result or ""
-    budget = constants.MAX_INLINE_CHARS
-    result, cut_result = _truncate(result, budget)
-    # The cut marker is not content: charge only the characters that were kept.
-    budget = max(0, budget - (budget if cut_result else len(result)))
-    stdout, cut_stdout = _truncate(stdout, budget)
-    budget = max(0, budget - (budget if cut_stdout else len(stdout)))
-    stderr, cut_stderr = _truncate(stderr, budget)
-    return {"result": result, "stdout": stdout, "stderr": stderr,
-            "truncated": cut_result or cut_stdout or cut_stderr}
 
 
 def _exec_locked(state: dict, code: str, timeout: float | None) -> dict:
