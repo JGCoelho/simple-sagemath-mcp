@@ -213,18 +213,25 @@ class TestExec(unittest.TestCase):
     def test_timeout_then_interrupt(self):
         self.assertIsNone(_mcp.call("exec", code="timeout_kept = 5")["error"])
         r = _mcp.call("exec", code="while True: pass", timeout=1)
-        # The wait expired, not the job: it is still running and can be polled.
-        self.assertIsNone(r["error"])
-        self.assertEqual(r["status"], "running")
-        self.assertTrue(r["job_id"])
-        self.assertGreater(r["elapsed"], 0)
-        self.assertFalse(r["truncated"])
-        self.assertEqual(_mcp.call("job_status", job_id=r["job_id"])["status"],
-                         "running")
-        i = _mcp.call("interrupt")
-        self.assertIsNone(i["error"])
-        self.assertTrue(i["interrupted"])
-        done = _mcp.wait_job(r["job_id"])
+        done = None
+        try:
+            # The wait expired, not the job: it is still running and can be polled.
+            self.assertIsNone(r["error"])
+            self.assertEqual(r["status"], "running")
+            self.assertTrue(r["job_id"])
+            self.assertGreater(r["elapsed"], 0)
+            self.assertFalse(r["truncated"])
+            self.assertEqual(_mcp.call("job_status", job_id=r["job_id"])["status"],
+                             "running")
+            i = _mcp.call("interrupt")
+            self.assertIsNone(i["error"])
+            self.assertTrue(i["interrupted"])
+            done = _mcp.wait_job(r["job_id"])
+        finally:
+            # A failed assertion above must not leave the job holding the kernel.
+            # settle re-sends interrupt, so it is only for the failure path.
+            if done is None:
+                _mcp.settle(r["job_id"])
         self.assertEqual(done["status"], "error")
         self.assertEqual(done["error"]["code"], "cell_execution_failed")
         self.assertIn("KeyboardInterrupt", done["error"]["details"])
