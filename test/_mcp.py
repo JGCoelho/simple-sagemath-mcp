@@ -3,6 +3,13 @@
 The kernel starts on the first call and stays for the whole file. Each test file
 pays the kernel start time only one time.
 
+`Server` starts a second process with its own argv (for a flag the shared client
+does not pass, such as `--directory`). It has its own kernel and namespace.
+
+A test that starts a job must reach the job's end on every path, pass or fail:
+use `settle(job_id)` in a `finally`. A job left holding the kernel makes every
+later call `kernel_busy`.
+
 Do not import this module from server.py.
 """
 
@@ -16,6 +23,7 @@ import time
 from pathlib import Path
 
 from fastmcp import Client
+from fastmcp.client.transports import PythonStdioTransport
 
 SERVER = str(Path(__file__).resolve().parent.parent / "server.py")
 
@@ -23,6 +31,7 @@ _loop = asyncio.new_event_loop()
 threading.Thread(target=_loop.run_forever, daemon=True).start()
 _client = None
 _stack = None
+_servers: list["Server"] = []
 
 
 def _start() -> None:
@@ -30,6 +39,34 @@ def _start() -> None:
     _stack = contextlib.AsyncExitStack()
     _client = asyncio.run_coroutine_threadsafe(
         _stack.enter_async_context(Client(Path(SERVER))), _loop).result(120)
+
+
+class Server:
+    """A second server process with its own argv, its own kernel and namespace.
+
+    Call `close()` when done; the module closes any left open at exit.
+    """
+
+    def __init__(self, *args: str):
+        self._stack = contextlib.AsyncExitStack()
+        transport = PythonStdioTransport(SERVER, args=list(args))
+        self._client = asyncio.run_coroutine_threadsafe(
+            self._stack.enter_async_context(Client(transport)), _loop).result(120)
+        _servers.append(self)
+
+    def call(self, name: str, **args) -> dict:
+        future = asyncio.run_coroutine_threadsafe(
+            self._client.call_tool(name, args), _loop)
+        return unwrap(future.result(300))
+
+    def tool_names(self) -> list[str]:
+        future = asyncio.run_coroutine_threadsafe(self._client.list_tools(), _loop)
+        return [tool.name for tool in future.result(120)]
+
+    def close(self) -> None:
+        if self in _servers:
+            _servers.remove(self)
+        asyncio.run_coroutine_threadsafe(self._stack.aclose(), _loop).result(60)
 
 
 def unwrap(result) -> dict:
@@ -83,8 +120,31 @@ def wait_job(job_id: str, limit: float = 120.0) -> dict:
         time.sleep(0.2)
 
 
+def settle(job_id: str, limit: float = 120.0) -> dict:
+    """Make sure a job has ended, for a `finally` block; return its last reply.
+
+    A running job is interrupted, and the interrupt is sent again until the job
+    ends: the job may not have reached the kernel yet, and `interrupt` does
+    nothing on an idle kernel, so repeating it is safe. Safe on a finished job.
+    """
+    deadline = time.monotonic() + limit
+    while True:
+        reply = call("job_status", job_id=job_id)
+        if reply.get("status") != "running":
+            return reply
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"job {job_id} still running after {limit:g} s")
+        call("interrupt")
+        time.sleep(0.2)
+
+
 @atexit.register
 def _stop() -> None:
+    for server in list(_servers):
+        try:
+            server.close()
+        except Exception:
+            pass
     if _stack is not None:
         asyncio.run_coroutine_threadsafe(_stack.aclose(), _loop).result(60)
         _loop.call_soon_threadsafe(_loop.stop)

@@ -22,7 +22,8 @@ from sagemcp.envelope import (OUTPUT_SCHEMA_NB_EDIT, OUTPUT_SCHEMA_NB_READ,
                               _nb_write_out)
 from sagemcp.errors import NotebookError
 from sagemcp.notebook_io import _apply_ops, _load_nb, _save_nb, _validate_cells
-from sagemcp.notebook_run import _cell_error_detail, _clean_traceback
+from sagemcp.notebook_run import _cell_error_detail
+from sagemcp.shaping import _clean_traceback
 
 
 def digest(path) -> str:

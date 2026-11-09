@@ -1,4 +1,6 @@
-"""Shape a call's outputs into the short text view the tools return. Pure."""
+"""Shape a call's outputs and tracebacks into the text the tools return. Pure."""
+
+import re
 
 from . import constants
 
@@ -61,3 +63,34 @@ def _exec_view(outs: list[dict]) -> dict:
     return {"result": result, "stdout": stdout, "stderr": stderr,
             "truncated": cut_result or cut_stdout or cut_stderr}
 
+
+# --- tracebacks --------------------------------------------------------------
+
+# IPython colours its tracebacks, and the frames it shows for the generated
+# wrapper (`Cell In[n], line k`) contain the server's source, not the user's.
+# Both are noise in `error.details`, which an agent has to read as plain text.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+_WRAPPER_FRAME_MARKERS = ("_mcp_last", "_mcp_value", "_mcp_tree", "_mcp_ns",
+                          "_mcp_seed", "_mcp_display", "__mcp_ns__")
+
+
+def _clean_traceback(lines: list) -> str:
+    """Return a traceback as plain text, without the wrapper's own frames.
+
+    Drops the ANSI escapes and every traceback entry that mentions a name from
+    the generated wrapper, keeping the exception header, the frames in the
+    user's file and the library frames, and the final `Ename: evalue` line.
+    The notebook's on-disk outputs are untouched: only `error.details` is
+    cleaned. Pure, and never raises.
+    """
+    kept: list[str] = []
+    for line in lines:
+        text = _ANSI_RE.sub("", str(line))
+        if any(marker in text for marker in _WRAPPER_FRAME_MARKERS):
+            continue
+        kept.append(text.rstrip())
+    # The header separator is decoration once the colours are gone.
+    while kept and (not kept[0].strip() or set(kept[0].strip()) == {"-"}):
+        kept.pop(0)
+    return "\n".join(kept).strip()

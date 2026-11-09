@@ -1,13 +1,15 @@
-"""The job tools: `exec` runs Sage code as a job, `job_status` reads a job.
+"""The job tools: `exec` runs Sage code as a job, `run_file` runs a file, `job_status` reads a job.
 
-`exec` (and `run_file`, next) start a job with `kernel._start_job` and wait at
-most their `timeout`. A finished job returns the envelope it recorded; a job
-still running at the wait returns the `running` envelope and keeps the kernel.
+`exec` and `run_file` start a job with `kernel._start_job` and wait at most
+their `timeout`. A finished job returns the envelope it recorded; a job still
+running at the wait returns the `running` envelope and keeps the kernel.
 `_failure_out` maps every failure of a job onto the shared error codes.
 """
 
 import functools
 import math
+import os
+from pathlib import Path
 from typing import Annotated
 
 from fastmcp import Context
@@ -15,13 +17,12 @@ from pydantic import Field
 
 from . import constants, jobs, kernel
 from .app import mcp
-from .envelope import (OUTPUT_SCHEMA_EXEC, OUTPUT_SCHEMA_JOB_STATUS, _err,
-                       _exec_out, _exec_running_out, _job_status_out,
-                       _kernel_busy_err)
+from .envelope import (OUTPUT_SCHEMA_EXEC, OUTPUT_SCHEMA_JOB_STATUS,
+                       OUTPUT_SCHEMA_RUN_FILE, _err, _exec_out,
+                       _exec_running_out, _job_status_out, _kernel_busy_err)
 from .errors import (GapCrashLoop, KernelBusy, KernelDied, SageNotFound,
                      SourceError)
-from .notebook_run import _clean_traceback
-from .shaping import _exec_view, _summarise
+from .shaping import _clean_traceback, _exec_view, _summarise
 
 
 # --- jobs --------------------------------------------------------------------
@@ -137,6 +138,75 @@ async def sage_exec(
     """
     work = functools.partial(_run_locked, ctx.lifespan_context, code,
                              "<exec>", full_traceback=False)
+    return await _job_call(ctx, work, timeout)
+
+
+# --- run_file ----------------------------------------------------------------
+
+# Exact, lower-case suffixes. Both are preparsed; only the name differs.
+_RUN_FILE_SUFFIXES = (".py", ".sage")
+
+
+def _read_run_file(path: str) -> tuple[str | None, dict | None]:
+    """Read a run_file source: `(source, None)`, or `(None, error envelope)`.
+
+    The suffix is checked first, so a wrong suffix is `invalid_source` even when
+    the file is missing. The file is read as UTF-8 with a leading BOM dropped
+    (`utf-8-sig`); bytes that are not UTF-8 are `invalid_source`. A missing file
+    is `file_not_found`; any other read failure is `internal`.
+    """
+    if Path(path).suffix not in _RUN_FILE_SUFFIXES:
+        return None, _err("invalid_source",
+                          "run_file takes a .py or .sage file.", path)
+    if not os.path.isfile(path):
+        return None, _err("file_not_found", "No file at this path.", path)
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            return fh.read(), None
+    except FileNotFoundError:
+        return None, _err("file_not_found", "No file at this path.", path)
+    except UnicodeDecodeError as e:
+        return None, _err("invalid_source", "The file is not valid UTF-8.", e)
+    except OSError as e:
+        return None, _err("internal", "Unexpected failure inside the server.",
+                          f"{type(e).__name__}: {e}")
+
+
+@mcp.tool(name="run_file", output_schema=OUTPUT_SCHEMA_RUN_FILE)
+async def sage_run_file(
+        ctx: Context,
+        path: Annotated[str, Field(
+            description="Path to a .py or .sage file. A relative path is resolved "
+                        "against the server's working directory (--directory).")],
+        timeout: Annotated[float | None, Field(
+            gt=0,
+            description="Seconds to wait for this call. null uses the server's "
+                        "2400 s default. On expiry the call returns status "
+                        "`running` and a job_id; the job keeps running."),
+        ] = None) -> dict:
+    """Run a .py or .sage file in the agent's single kernel namespace and return its output.
+
+    State: the file runs in the same namespace as exec, so its names persist for
+    later calls until `restart` or kernel death. The kernel starts on the first call.
+    Never: it does not run a subprocess, start a second kernel, or sandbox the file
+    (it runs with the user's permissions). The file is read once, when the call is
+    made; a later edit does not change what is running.
+    Input: the file is read as UTF-8; a leading BOM is dropped. Both suffixes are
+    preparsed, as exec preparses its source. Only the exact suffixes .py and .sage
+    are accepted.
+    Output: as exec: `result`, `stdout` and `stderr`. An uncaught exception is
+    `cell_execution_failed`, and its `details` is the traceback, which names the file.
+    Jobs: the call runs as a job, with the same timeout, `running` and `job_status`
+    behaviour as exec. While a job holds the kernel, exec, run_file and nb_* calls
+    return `kernel_busy`.
+    Errors: invalid_source, file_not_found, cell_execution_failed, gap_crash_loop,
+    kernel_died, sage_not_found, internal, kernel_busy.
+    """
+    source, error = _read_run_file(path)
+    if error is not None:
+        return _exec_out(error=error)
+    work = functools.partial(_run_locked, ctx.lifespan_context, source, path,
+                             full_traceback=True)
     return await _job_call(ctx, work, timeout)
 
 

@@ -56,7 +56,11 @@ class TestJobRetention(unittest.TestCase):
 
 
 class TestJobs(unittest.TestCase):
-    """Jobs against the live kernel. The first call warms the kernel up."""
+    """Jobs against the live kernel. The first call warms the kernel up.
+
+    Every test that starts a job settles it in a `finally`, so a failed assertion
+    cannot leave a job holding the kernel for the tests after it.
+    """
 
     @classmethod
     def setUpClass(cls):
@@ -65,38 +69,47 @@ class TestJobs(unittest.TestCase):
     def test_running_envelope_and_partial_output(self):
         r = _mcp.call("exec", code="print('first', flush=True)\n"
                       "import time\ntime.sleep(3)\nprint('second')", timeout=1)
-        self.assertIsNone(r["error"])
-        self.assertEqual(r["status"], "running")
-        self.assertTrue(r["job_id"])
-        self.assertGreater(r["elapsed"], 0)
-        # The job is still in its sleep, and its first print is already readable.
-        polled = _mcp.call_raw("job_status", job_id=r["job_id"])
-        self.assertEqual(polled["status"], "running")
-        self.assertIsNone(polled["error"])
-        self.assertEqual(polled["stdout"], "first\n")
-        self.assertNotIn("result", polled)     # wire dict: the key is absent
-        final = _mcp.wait_job(r["job_id"])
-        self.assertEqual(final["status"], "done")
-        self.assertIsNone(final["error"])
-        self.assertEqual(final["stdout"], "first\nsecond\n")
-        self.assertEqual(final["result"], "")
-        self.assertFalse(final["truncated"])
-        self.assertGreater(final["elapsed"], 2.5)
+        job_id = r.get("job_id")
+        try:
+            self.assertIsNone(r["error"])
+            self.assertEqual(r["status"], "running")
+            self.assertTrue(job_id)
+            self.assertGreater(r["elapsed"], 0)
+            # The job is still in its sleep, and its first print is already readable.
+            polled = _mcp.call_raw("job_status", job_id=job_id)
+            self.assertEqual(polled["status"], "running")
+            self.assertIsNone(polled["error"])
+            self.assertEqual(polled["stdout"], "first\n")
+            self.assertNotIn("result", polled)     # wire dict: the key is absent
+            final = _mcp.wait_job(job_id)
+            self.assertEqual(final["status"], "done")
+            self.assertIsNone(final["error"])
+            self.assertEqual(final["stdout"], "first\nsecond\n")
+            self.assertEqual(final["result"], "")
+            self.assertFalse(final["truncated"])
+            self.assertGreater(final["elapsed"], 2.5)
+        finally:
+            if job_id:
+                _mcp.settle(job_id)
 
     def test_kernel_busy_refuses_other_calls_without_queueing(self):
         r = _mcp.call("exec", code="import time\ntime.sleep(2)\nbusy_done = 7",
                       timeout=0.2)
-        self.assertEqual(r["status"], "running")
-        job_id = r["job_id"]
-        refused = _mcp.call_raw("exec", code="1 + 1")
-        self.assertEqual(refused["error"]["code"], "kernel_busy")
-        self.assertEqual(refused["error"]["details"], job_id)
-        self.assertNotIn("status", refused)     # a refusal is not a running job
-        nb = _mcp.call("nb_read", path="/nonexistent/none.ipynb")
-        self.assertEqual(nb["error"]["code"], "kernel_busy")
-        self.assertEqual(nb["error"]["details"], job_id)
-        self.assertEqual(_mcp.wait_job(job_id)["status"], "done")
-        self.assertIsNone(_mcp.call("exec", code="busy_done")["error"])
+        job_id = r.get("job_id")
+        try:
+            self.assertEqual(r["status"], "running")
+            refused = _mcp.call_raw("exec", code="1 + 1")
+            self.assertEqual(refused["error"]["code"], "kernel_busy")
+            self.assertEqual(refused["error"]["details"], job_id)
+            self.assertNotIn("status", refused)     # a refusal is not a running job
+            nb = _mcp.call("nb_read", path="/nonexistent/none.ipynb")
+            self.assertEqual(nb["error"]["code"], "kernel_busy")
+            self.assertEqual(nb["error"]["details"], job_id)
+            self.assertEqual(_mcp.wait_job(job_id)["status"], "done")
+            self.assertIsNone(_mcp.call("exec", code="busy_done")["error"])
+        finally:
+            if job_id:
+                _mcp.settle(job_id)
 
     def test_unknown_job(self):
         r = _mcp.call("job_status", job_id="does-not-exist")
@@ -107,27 +120,37 @@ class TestJobs(unittest.TestCase):
 
     def test_interrupt_reaches_the_job(self):
         r = _mcp.call("exec", code="while True: pass", timeout=0.5)
-        self.assertEqual(r["status"], "running")
-        i = _mcp.call("interrupt")
-        self.assertIsNone(i["error"])
-        self.assertTrue(i["interrupted"])
-        done = _mcp.wait_job(r["job_id"])
-        self.assertEqual(done["status"], "error")
-        self.assertEqual(done["error"]["code"], "cell_execution_failed")
-        self.assertIn("KeyboardInterrupt", done["error"]["details"])
-        self.assertEqual(_mcp.call("exec", code="2 + 2")["result"], "4")
+        job_id = r.get("job_id")
+        try:
+            self.assertEqual(r["status"], "running")
+            i = _mcp.call("interrupt")
+            self.assertIsNone(i["error"])
+            self.assertTrue(i["interrupted"])
+            done = _mcp.wait_job(job_id)
+            self.assertEqual(done["status"], "error")
+            self.assertEqual(done["error"]["code"], "cell_execution_failed")
+            self.assertIn("KeyboardInterrupt", done["error"]["details"])
+            self.assertEqual(_mcp.call("exec", code="2 + 2")["result"], "4")
+        finally:
+            if job_id:
+                _mcp.settle(job_id)
 
     def test_restart_kills_the_job(self):
         r = _mcp.call("exec", code="while True: pass", timeout=0.5)
-        self.assertEqual(r["status"], "running")
-        restarted = _mcp.call("restart")
-        self.assertIsNone(restarted["error"])
-        self.assertTrue(restarted["restarted"])
-        # restart waits for the job to let go of the kernel, so the record is final.
-        done = _mcp.call("job_status", job_id=r["job_id"])
-        self.assertEqual(done["status"], "interrupted")
-        self.assertEqual(done["error"]["code"], "kernel_died")
-        self.assertEqual(_mcp.call("exec", code="3 * 3")["result"], "9")
+        job_id = r.get("job_id")
+        try:
+            self.assertEqual(r["status"], "running")
+            restarted = _mcp.call("restart")
+            self.assertIsNone(restarted["error"])
+            self.assertTrue(restarted["restarted"])
+            # restart waits for the job to let go of the kernel, so the record is final.
+            done = _mcp.call("job_status", job_id=job_id)
+            self.assertEqual(done["status"], "interrupted")
+            self.assertEqual(done["error"]["code"], "kernel_died")
+            self.assertEqual(_mcp.call("exec", code="3 * 3")["result"], "9")
+        finally:
+            if job_id:
+                _mcp.settle(job_id)
 
 
 if __name__ == "__main__":

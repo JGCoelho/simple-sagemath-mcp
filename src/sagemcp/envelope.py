@@ -86,6 +86,12 @@ OUTPUT_SCHEMA_EXEC = _exec_schema(["invalid_source", "cell_execution_failed",
                                    "gap_crash_loop", "kernel_died",
                                    "sage_not_found", "internal", "kernel_busy"])
 
+# run_file reads a file first, so it alone can answer file_not_found. exec never does.
+OUTPUT_SCHEMA_RUN_FILE = _exec_schema(["invalid_source", "file_not_found",
+                                       "cell_execution_failed", "gap_crash_loop",
+                                       "kernel_died", "sage_not_found", "internal",
+                                       "kernel_busy"])
+
 OUTPUT_SCHEMA_JOB_STATUS = {
     "type": "object",
     "properties": {
