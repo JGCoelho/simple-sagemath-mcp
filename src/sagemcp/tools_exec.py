@@ -125,6 +125,9 @@ async def sage_exec(
     Truncation: the inline payload (`result` + `stdout` + `stderr`) is cut at the
     server's per-call budget of 20000 characters; the untruncated text is not
     recoverable, so keep individual calls small.
+    Preparse: the source is preparsed, so `^` is power, not XOR (`2^3` is 8;
+    `2^^3` is 1). On numpy arrays `a ^ b` silently becomes elementwise power —
+    use `np.bitwise_xor` there.
     Jobs: the call runs as a job. `timeout` (seconds, default 2400) bounds how
     long this call waits, not the job. On expiry it returns status `running`, a
     `job_id`, `elapsed` and the output so far, and the job keeps running. Poll
@@ -193,6 +196,7 @@ async def sage_run_file(
     Input: the file is read as UTF-8; a leading BOM is dropped. Both suffixes are
     preparsed, as exec preparses its source. Only the exact suffixes .py and .sage
     are accepted.
+    Preparse: as for exec, `^` is power, not XOR (`2^3` is 8; `2^^3` is 1).
     Output: as exec: `result`, `stdout` and `stderr`. An uncaught exception is
     `execution_failed`, and its `details` is the traceback, which names the file.
     Jobs: the call runs as a job, with the same timeout, `running` and `job_status`
